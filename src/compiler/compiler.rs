@@ -27,10 +27,10 @@ use crate::compiler::nvcc::Nvcc;
 use crate::compiler::nvcc::NvccHostCompiler;
 use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
-#[cfg(feature = "dist-client")]
-use crate::compiler::remote::dist_or_local_compile;
+use crate::compiler::remote::execute_compile;
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
+use crate::compiler::{CompileExecutor, CompileOutcome, CompileRequest, HashKeyOptions};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 use crate::mock_command::{CommandChild, CommandCreatorSync, RunCommand, exit_status};
@@ -576,7 +576,7 @@ where
     async fn get_cached_or_compile(
         &mut self,
         service: &server::SccacheService<T>,
-        dist_client: Option<Arc<dyn dist::Client>>,
+        executor: Option<Arc<dyn CompileExecutor<T>>>,
         creator: T,
         storage: Arc<dyn Storage>,
         arguments: Vec<OsString>,
@@ -588,11 +588,13 @@ where
         let out_pretty = self.output_pretty().into_owned();
         debug!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
         let start = Instant::now();
-        let may_dist = dist_client.is_some();
-        let rewrite_includes_only = match dist_client {
-            Some(ref client) => client.rewrite_includes_only(),
-            _ => false,
-        };
+        let hash_key_options = executor
+            .as_ref()
+            .map_or_else(HashKeyOptions::default, |executor| {
+                executor.hash_key_options()
+            });
+        let may_dist = hash_key_options.may_distribute;
+        let rewrite_includes_only = hash_key_options.rewrite_includes_only;
         let result = self
             .generate_hash_key(
                 &creator,
@@ -766,7 +768,7 @@ where
                     return self
                         .get_cached_or_compile(
                             service,
-                            dist_client,
+                            executor,
                             creator,
                             storage,
                             arguments,
@@ -778,14 +780,21 @@ where
                         .await;
                 }
 
-                let (cacheable, dist_type, compiler_result) = dist_or_local_compile(
-                    service,
-                    dist_client,
-                    creator,
-                    cwd,
-                    compilation,
-                    weak_toolchain_key,
-                    out_pretty.clone(),
+                let CompileOutcome {
+                    cacheable,
+                    execution: dist_type,
+                    output: compiler_result,
+                } = execute_compile(
+                    executor,
+                    CompileRequest {
+                        service,
+                        creator: &creator,
+                        compilation,
+                        cwd,
+                        weak_toolchain_key,
+                        output_name: out_pretty.clone(),
+                        hash_key_options,
+                    },
                 )
                 .await?;
                 let duration_compilation = start.elapsed();
@@ -877,31 +886,6 @@ where
     fn box_clone(&self) -> Box<dyn CompilerHasher<T>>;
 
     fn language(&self) -> Language;
-}
-
-#[cfg(not(feature = "dist-client"))]
-async fn dist_or_local_compile<T>(
-    service: &server::SccacheService<T>,
-    _dist_client: Option<Arc<dyn dist::Client>>,
-    creator: T,
-    _cwd: PathBuf,
-    compilation: Box<dyn Compilation<T>>,
-    _weak_toolchain_key: String,
-    out_pretty: String,
-) -> Result<(Cacheable, DistType, process::Output)>
-where
-    T: CommandCreatorSync,
-{
-    let mut path_transformer = dist::PathTransformer::new();
-    let (compile_cmd, _dist_compile_cmd, cacheable) = compilation
-        .generate_compile_commands(&mut path_transformer, true)
-        .context("Failed to generate compile commands")?;
-
-    debug!("[{}]: Compiling locally", out_pretty);
-    compile_cmd
-        .execute(&service, &creator)
-        .await
-        .map(move |o| (cacheable, DistType::NoDist, o))
 }
 
 impl<T: CommandCreatorSync> Clone for Box<dyn CompilerHasher<T>> {
@@ -1870,6 +1854,8 @@ mod test {
     use super::*;
     use crate::cache::disk::DiskCache;
     use crate::cache::{CacheMode, CacheRead};
+    #[cfg(feature = "dist-client")]
+    use crate::compiler::DistExecutor;
     use crate::config::PreprocessorCacheModeConfig;
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
@@ -1877,6 +1863,7 @@ mod test {
     use fs::File;
     use std::io::{Cursor, Write};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use test_case::test_case;
     use tokio::runtime::Runtime;
@@ -2965,7 +2952,7 @@ LLVM version: 6.0",
                 hasher
                     .get_cached_or_compile(
                         &service,
-                        Some(dist_client.clone()),
+                        Some(Arc::new(DistExecutor::new(dist_client.clone()))),
                         creator.clone(),
                         storage.clone(),
                         arguments.clone(),
@@ -3002,7 +2989,7 @@ LLVM version: 6.0",
                 hasher
                     .get_cached_or_compile(
                         &service,
-                        Some(dist_client.clone()),
+                        Some(Arc::new(DistExecutor::new(dist_client.clone()))),
                         creator,
                         storage,
                         arguments,
@@ -3479,7 +3466,7 @@ LLVM version: 6.0",
                 hasher
                     .get_cached_or_compile(
                         &service,
-                        Some(dist_client.clone()),
+                        Some(Arc::new(DistExecutor::new(dist_client.clone()))),
                         creator.clone(),
                         storage.clone(),
                         arguments.clone(),
@@ -3597,7 +3584,7 @@ LLVM version: 6.0",
             let (cached, res) = hasher
                 .get_cached_or_compile(
                     &service,
-                    Some(dist_client.clone()),
+                    Some(Arc::new(DistExecutor::new(dist_client.clone()))),
                     creator.clone(),
                     storage.clone(),
                     arguments.clone(),
@@ -3621,6 +3608,221 @@ LLVM version: 6.0",
             assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
             assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
         }
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_compiler_get_cached_or_compile_preserves_dist_http_client_error() {
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let gcc = f.mk_bin("gcc").unwrap();
+        let runtime = Runtime::new().unwrap();
+        let pool = runtime.handle().clone();
+        let dist_client = test_dist::ErrorAllocJobClient::with_error(|| {
+            HttpClientError("MOCK: unauthorized".to_owned()).into()
+        });
+        let storage = Arc::new(DiskCache::new(
+            f.tempdir.path().join("cache"),
+            u64::MAX,
+            &pool,
+            PreprocessorCacheModeConfig::default(),
+            CacheMode::ReadWrite,
+            vec![],
+        ));
+        let service = server::SccacheService::mock_with_dist_client(
+            dist_client.clone(),
+            storage.clone(),
+            pool.clone(),
+        );
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+        let c = get_compiler_info(
+            creator.clone(),
+            &gcc,
+            f.tempdir.path(),
+            &[],
+            &[],
+            &pool,
+            None,
+        )
+        .wait()
+        .unwrap()
+        .0;
+        // Only the preprocessor runs: the compile fails before any local compile.
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+            CompilerArguments::Ok(h) => h,
+            o => panic!("Bad result from parse_arguments: {:?}", o),
+        };
+        let error = hasher
+            .get_cached_or_compile(
+                &service,
+                Some(Arc::new(DistExecutor::new(dist_client))),
+                creator.clone(),
+                storage,
+                arguments,
+                f.tempdir.path().to_path_buf(),
+                vec![],
+                CacheControl::ForceRecache,
+                pool,
+            )
+            .wait()
+            .expect_err("an HttpClientError fails the compile");
+        // Preserve the concrete error so `SccacheService` can recognize it and reset the client.
+        assert!(
+            error.downcast_ref::<HttpClientError>().is_some(),
+            "expected an HttpClientError, got {error:#}"
+        );
+    }
+
+    struct LocalTestExecutor {
+        options: HashKeyOptions,
+        hash_key_options_calls: Arc<AtomicUsize>,
+        execute_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl<T: CommandCreatorSync> CompileExecutor<T> for LocalTestExecutor {
+        fn hash_key_options(&self) -> HashKeyOptions {
+            self.hash_key_options_calls.fetch_add(1, Ordering::Relaxed);
+            self.options
+        }
+
+        async fn execute(&self, request: CompileRequest<'_, T>) -> Result<CompileOutcome> {
+            self.execute_calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(self.options, request.hash_key_options);
+            request.execute_locally().await
+        }
+    }
+
+    #[test_case(false, false)]
+    #[test_case(false, true)]
+    #[test_case(true, false)]
+    #[test_case(true, true)]
+    fn test_compile_executor_options_and_local_execution(
+        may_distribute: bool,
+        rewrite_includes_only: bool,
+    ) {
+        let creator = new_creator();
+        let fixture = TestFixture::new();
+        let gcc = fixture.mk_bin("gcc").unwrap();
+        let runtime = Runtime::new().unwrap();
+        let pool = runtime.handle().clone();
+        let storage = Arc::new(DiskCache::new(
+            fixture.tempdir.path().join("cache"),
+            u64::MAX,
+            &pool,
+            PreprocessorCacheModeConfig {
+                use_preprocessor_cache_mode: false,
+                ..Default::default()
+            },
+            CacheMode::ReadWrite,
+            vec![],
+        ));
+        let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
+        fs::write(fixture.tempdir.path().join("foo.c"), "whatever").unwrap();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+        let compiler = get_compiler_info(
+            creator.clone(),
+            &gcc,
+            fixture.tempdir.path(),
+            &[],
+            &[],
+            &pool,
+            None,
+        )
+        .wait()
+        .unwrap()
+        .0;
+        next_command_calls(&creator, move |args| {
+            assert_eq!(!may_distribute, args.contains(&OsString::from("-P")));
+            assert_eq!(
+                rewrite_includes_only,
+                args.contains(&OsString::from("-fdirectives-only"))
+            );
+            Ok(MockChild::new(exit_status(0), "preprocessor output", ""))
+        });
+        let object = fixture.tempdir.path().join("foo.o");
+        let compiled_object = object.clone();
+        next_command_calls(&creator, move |_| {
+            File::create(&compiled_object)?.write_all(b"file contents")?;
+            Ok(MockChild::new(exit_status(0), "compiler stdout", ""))
+        });
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let mut hasher = match compiler.parse_arguments(&arguments, ".".as_ref(), &[]) {
+            CompilerArguments::Ok(hasher) => hasher,
+            other => panic!("Bad result from parse_arguments: {other:?}"),
+        };
+        let hash_key_options_calls = Arc::new(AtomicUsize::new(0));
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let executor = Arc::new(LocalTestExecutor {
+            options: HashKeyOptions {
+                may_distribute,
+                rewrite_includes_only,
+            },
+            hash_key_options_calls: hash_key_options_calls.clone(),
+            execute_calls: execute_calls.clone(),
+        });
+        let (result, output) = runtime
+            .block_on(hasher.get_cached_or_compile(
+                &service,
+                Some(executor.clone()),
+                creator.clone(),
+                storage.clone(),
+                arguments.clone(),
+                fixture.tempdir.path().to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool.clone(),
+            ))
+            .unwrap();
+        let CompileResult::CacheMiss(_, DistType::NoDist, _, write) = result else {
+            panic!("Unexpected compile result: {result:?}");
+        };
+        write.wait().unwrap();
+        assert!(output.status.success());
+        assert_eq!(1, hash_key_options_calls.load(Ordering::Relaxed));
+        assert_eq!(1, execute_calls.load(Ordering::Relaxed));
+
+        fs::remove_file(&object).unwrap();
+        next_command_calls(&creator, move |args| {
+            assert_eq!(!may_distribute, args.contains(&OsString::from("-P")));
+            assert_eq!(
+                rewrite_includes_only,
+                args.contains(&OsString::from("-fdirectives-only"))
+            );
+            Ok(MockChild::new(exit_status(0), "preprocessor output", ""))
+        });
+        let (result, cached_output) = runtime
+            .block_on(hasher.get_cached_or_compile(
+                &service,
+                Some(executor),
+                creator,
+                storage,
+                arguments,
+                fixture.tempdir.path().to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool,
+            ))
+            .unwrap();
+        assert_eq!(CompileResult::CacheHit(Duration::ZERO), result);
+        assert_eq!(b"file contents", fs::read(&object).unwrap().as_slice());
+        assert_eq!(output.stdout, cached_output.stdout);
+        assert_eq!(2, hash_key_options_calls.load(Ordering::Relaxed));
+        assert_eq!(1, execute_calls.load(Ordering::Relaxed));
     }
 }
 
@@ -3688,14 +3890,20 @@ mod test_dist {
 
     pub struct ErrorAllocJobClient {
         tc: Toolchain,
+        error: fn() -> Error,
     }
     impl ErrorAllocJobClient {
         #[allow(clippy::new_ret_no_self)]
         pub fn new() -> Arc<dyn dist::Client> {
+            Self::with_error(|| anyhow!("MOCK: alloc job failure"))
+        }
+
+        pub fn with_error(error: fn() -> Error) -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 tc: Toolchain {
                     archive_id: "somearchiveid".to_owned(),
                 },
+                error,
             })
         }
     }
@@ -3703,7 +3911,7 @@ mod test_dist {
     impl dist::Client for ErrorAllocJobClient {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             assert_eq!(self.tc, tc);
-            Err(anyhow!("MOCK: alloc job failure"))
+            Err((self.error)())
         }
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             unreachable!()
