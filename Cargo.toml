@@ -46,6 +46,7 @@ backon = { version = "1", default-features = false, features = [
   "std-blocking-sleep",
 ] }
 base64 = "0.21"
+bazel-remote-apis = { version = "0.30", optional = true }
 bincode = "1"
 blake3 = "1"
 byteorder = "1.5"
@@ -84,6 +85,7 @@ opendal = { version = "0.58.1", optional = true, default-features = false }
 opendal-http-transport-reqwest = { version = "0.58.1", optional = true }
 opendal-layer-logging = { version = "0.58.1", optional = true }
 openssl = { version = "0.10.75", optional = true }
+prost = { version = "0.14", optional = true }
 rand = "0.8.4"
 regex = "1.10.3"
 reqwest = { version = "0.13", features = [
@@ -112,6 +114,12 @@ tokio = { version = "1", features = [
 tokio-serde = "0.9"
 tokio-util = { version = "0.7.18", features = ["codec", "io", "rt"] }
 toml = "0.9"
+tonic = { version = "0.14", optional = true, default-features = false, features = [
+  "channel",
+  "codegen",
+  "tls-aws-lc",
+  "tls-native-roots",
+] }
 tower-service = "0.3"
 typed-path = "0.13.0"
 url = { version = "2", optional = true }
@@ -151,6 +159,8 @@ serial_test = "3.1"
 temp-env = "0.3.6"
 test-case = "3.3.1"
 thirtyfour = "0.36"
+tokio = { version = "1", features = ["test-util"] }
+tonic = { version = "0.14", default-features = false, features = ["server"] }
 
 [target.'cfg(unix)'.dependencies]
 daemonix = "0.1"
@@ -261,6 +271,8 @@ dist-server = [
 ]
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
+# Enables a Remote Execution API (REAPI) support.
+reapi = ["dep:bazel-remote-apis", "dep:prost", "dep:tonic"]
 
 [workspace]
 exclude = ["tests/test-crate"]
