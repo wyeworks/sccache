@@ -17,4 +17,7 @@
 #[allow(dead_code)]
 mod client;
 
+#[allow(dead_code)]
+mod digest;
+
 pub(crate) use bazel_remote_apis as proto;
