@@ -20,4 +20,10 @@ mod client;
 #[allow(dead_code)]
 mod digest;
 
+#[allow(dead_code)]
+mod input_root;
+
+#[allow(dead_code)]
+mod mapping;
+
 pub(crate) use bazel_remote_apis as proto;
