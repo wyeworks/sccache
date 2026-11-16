@@ -160,7 +160,10 @@ temp-env = "0.3.6"
 test-case = "3.3.1"
 thirtyfour = "0.36"
 tokio = { version = "1", features = ["test-util"] }
-tonic = { version = "0.14", default-features = false, features = ["server"] }
+tonic = { version = "0.14", default-features = false, features = [
+  "router",
+  "server",
+] }
 
 [target.'cfg(unix)'.dependencies]
 daemonix = "0.1"

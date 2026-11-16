@@ -15,6 +15,9 @@
 //! Remote Execution API (REAPI) support.
 
 #[allow(dead_code)]
+mod action_cache;
+
+#[allow(dead_code)]
 mod client;
 
 #[allow(dead_code)]
@@ -25,5 +28,8 @@ mod input_root;
 
 #[allow(dead_code)]
 mod mapping;
+
+#[cfg(test)]
+mod test;
 
 pub(crate) use bazel_remote_apis as proto;

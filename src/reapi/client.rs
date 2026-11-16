@@ -21,7 +21,7 @@ use tonic::service::{Interceptor, interceptor::InterceptedService};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
