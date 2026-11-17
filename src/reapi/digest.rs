@@ -38,6 +38,19 @@ pub(crate) fn of_bytes(bytes: &[u8]) -> remexec::Digest {
     }
 }
 
+/// Validates SHA-256 digests before use in ByteStream resource names.
+/// Malformed hashes are omitted from errors to avoid echoing untrusted server data.
+pub(crate) fn check(digest: &remexec::Digest) -> Result<()> {
+    let is_lower_hex = |c: char| c.is_ascii_digit() || ('a'..='f').contains(&c);
+    if digest.hash.len() != 64 || !digest.hash.chars().all(is_lower_hex) {
+        bail!("invalid REAPI digest: the hash isn't 64 lowercase hex digits");
+    }
+    if digest.size_bytes < 0 || (digest.size_bytes == 0 && *digest != of_bytes(b"")) {
+        bail!("invalid REAPI digest {}/{}", digest.hash, digest.size_bytes);
+    }
+    Ok(())
+}
+
 pub(crate) fn of_file(path: &Path) -> Result<remexec::Digest> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -232,6 +245,7 @@ impl DigestCache {
 #[cfg(test)]
 mod test {
     use super::*;
+    use test_case::test_case;
 
     fn load_without_min_age(save_file: PathBuf) -> DigestCache {
         let mut cache = DigestCache::load(save_file);
@@ -246,6 +260,29 @@ mod test {
 
     fn read_saved_entries(save_file: &Path) -> HashMap<PathBuf, DigestCacheEntry> {
         serde_json::from_slice(&std::fs::read(save_file).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_check_accepts_sha256_digests() {
+        check(&of_bytes(b"")).unwrap();
+        check(&of_bytes(b"x")).unwrap();
+    }
+
+    #[test_case("../../etc/passwd", 5 ; "not a sha256 hash")]
+    #[test_case(&of_bytes(b"x").hash.to_uppercase(), 1 ; "uppercase hash")]
+    #[test_case(&of_bytes(b"x").hash, -1 ; "negative size")]
+    #[test_case(&of_bytes(b"x").hash, 0 ; "empty size with a non-empty hash")]
+    fn test_check_refuses_invalid_digests(hash: &str, size_bytes: i64) {
+        let invalid = remexec::Digest {
+            hash: hash.to_owned(),
+            size_bytes,
+        };
+        let error = check(&invalid).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid REAPI digest"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("passwd"), "{error}");
     }
 
     #[test]

@@ -18,6 +18,9 @@
 mod action_cache;
 
 #[allow(dead_code)]
+mod cas;
+
+#[allow(dead_code)]
 mod client;
 
 #[allow(dead_code)]
