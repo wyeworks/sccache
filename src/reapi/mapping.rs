@@ -86,6 +86,7 @@ pub(crate) enum CompileLocallyReason {
     RemapPathPrefix,
     NonUtf8EnvVar,
     UnsupportedEnvVarName,
+    UnreadableDependencies,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -105,6 +106,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::RemapPathPrefix => "--remap-path-prefix",
             Self::NonUtf8EnvVar => "non-UTF-8 env var",
             Self::UnsupportedEnvVarName => "env var the REAPI command can't pass to rustc",
+            Self::UnreadableDependencies => "unreadable dependencies",
         })
     }
 }

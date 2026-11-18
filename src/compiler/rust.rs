@@ -23,7 +23,7 @@ use crate::compiler::{
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 use crate::lru_disk_cache::{LruCache, Meter};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 #[cfg(feature = "reapi")]
@@ -35,12 +35,12 @@ use async_trait::async_trait;
 use filetime::FileTime;
 use fs_err as fs;
 use log::Level::Trace;
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 use semver::Version;
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 use std::borrow::Borrow;
 use std::borrow::Cow;
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
@@ -59,7 +59,7 @@ use std::pin::Pin;
 use std::process;
 #[cfg(feature = "reapi")]
 use std::result::Result as StdResult;
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 use std::sync::Mutex;
 use std::sync::{Arc, LazyLock};
 use std::time;
@@ -68,12 +68,12 @@ use crate::errors::*;
 
 pub(crate) const NO_CRATE_TYPE_PASSED: &str = "No crate-type passed";
 
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 const RLIB_PREFIX: &str = "lib";
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 const RLIB_EXTENSION: &str = "rlib";
 
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 const RMETA_EXTENSION: &str = "rmeta";
 
 /// Directory in the sysroot containing binary to which rustc is linked.
@@ -304,7 +304,7 @@ pub struct Rust {
     /// The custom dist toolchain archive for this rustc, if configured.
     dist_archive: Option<PathBuf>,
     /// A shared, caching reader for rlib dependencies
-    #[cfg(feature = "dist-client")]
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
 }
 
@@ -327,7 +327,7 @@ pub struct RustHasher {
     /// The custom dist toolchain archive for this rustc, if configured.
     dist_archive: Option<PathBuf>,
     /// A shared, caching reader for rlib dependencies
-    #[cfg(feature = "dist-client")]
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
     /// Parsed arguments from the rustc invocation
     parsed_args: ParsedArguments,
@@ -403,7 +403,7 @@ pub struct RustCompilation {
     #[cfg(feature = "dist-client")]
     target_libdir: PathBuf,
     /// A shared, caching reader for rlib dependencies
-    #[cfg(feature = "dist-client")]
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
     /// All arguments passed to rustc
     arguments: Vec<Argument<ArgData>>,
@@ -764,7 +764,7 @@ impl Rust {
             Result::Ok((sysroot, target_libdir, libs))
         };
 
-        #[cfg(feature = "dist-client")]
+        #[cfg(any(feature = "dist-client", feature = "reapi"))]
         {
             use futures::TryFutureExt;
             let rlib_dep_reader = {
@@ -776,14 +776,13 @@ impl Rust {
 
             let ((sysroot, target_libdir, libs), rlib_dep_reader) =
                 futures::future::try_join(sysroot_and_libs, rlib_dep_reader).await?;
+            #[cfg(not(feature = "dist-client"))]
+            let _ = target_libdir;
 
             let rlib_dep_reader = match rlib_dep_reader {
                 Ok(r) => Some(Arc::new(r)),
                 Err(e) => {
-                    warn!(
-                        "Failed to initialise RlibDepDecoder, distributed compiles will be inefficient: {}",
-                        e
-                    );
+                    warn!("Failed to initialise Rust dependency reader: {}", e);
                     None
                 }
             };
@@ -792,6 +791,7 @@ impl Rust {
                 host,
                 version: rustc_verbose_version.to_string(),
                 sysroot,
+                #[cfg(feature = "dist-client")]
                 target_libdir,
                 compiler_shlibs_digests: digests,
                 dist_archive,
@@ -799,7 +799,7 @@ impl Rust {
             })
         }
 
-        #[cfg(not(feature = "dist-client"))]
+        #[cfg(not(any(feature = "dist-client", feature = "reapi")))]
         {
             let (sysroot, _target_libdir, libs) = sysroot_and_libs.await?;
             hash_all(&libs, &pool).await.map(move |digests| Rust {
@@ -855,7 +855,7 @@ where
                 target_libdir: self.target_libdir.clone(),
                 compiler_shlibs_digests: self.compiler_shlibs_digests.clone(),
                 dist_archive: self.dist_archive.clone(),
-                #[cfg(feature = "dist-client")]
+                #[cfg(any(feature = "dist-client", feature = "reapi"))]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
                 parsed_args: args,
             })),
@@ -2097,7 +2097,7 @@ where
                 crate_types: self.parsed_args.crate_types.clone(),
                 cwd,
                 env_vars,
-                #[cfg(feature = "dist-client")]
+                #[cfg(any(feature = "dist-client", feature = "reapi"))]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
             }),
             weak_toolchain_key,
@@ -2330,6 +2330,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 mod reapi_mapping {
     use super::*;
     use crate::reapi::{ActionEnv, CompileLocallyReason, PathMapper, normalize_absolute};
+    use std::io::ErrorKind;
 
     pub(super) fn map_for_reapi(
         compilation: &RustCompilation,
@@ -2578,6 +2579,7 @@ mod reapi_mapping {
 
         let env = action_env(compilation, &path_mapper, &target_triple)?;
 
+        input_root_files.extend(dependency_files(compilation, &path_mapper)?);
         input_root_files.sort();
         input_root_files.dedup();
         let mut outputs: Vec<_> = compilation
@@ -2604,6 +2606,151 @@ mod reapi_mapping {
             outputs,
         })
     }
+    fn dependency_files(
+        compilation: &RustCompilation,
+        path_mapper: &PathMapper,
+    ) -> StdResult<Vec<PathBuf>, NotEligible> {
+        let cwd = &compilation.cwd;
+        let externs: Vec<_> = compilation
+            .arguments
+            .iter()
+            .filter_map(|argument| match argument.get_data() {
+                Some(Extern(ArgExtern { path, .. })) => Some(cwd.join(path)),
+                _ => None,
+            })
+            .map(|path| dependency_path(&path, path_mapper))
+            .collect::<StdResult<_, _>>()?;
+        // rustc lists the full dependency graph. Toolchain crates aren't in the -L dirs.
+        let mut dep_stems = HashSet::new();
+        for extern_lib in externs
+            .iter()
+            .filter(|path| has_extension(path, &[RLIB_EXTENSION, RMETA_EXTENSION]))
+        {
+            let reader = compilation.rlib_dep_reader.as_ref().ok_or_else(|| {
+                NotEligible::new(
+                    CompileLocallyReason::UnreadableDependencies,
+                    anyhow!("no rlib dependency reader"),
+                )
+            })?;
+            dep_stems.extend(
+                reader
+                    .discover_rlib_dep_stems(&compilation.env_vars, extern_lib)
+                    .map_err(|e| {
+                        NotEligible::new(CompileLocallyReason::UnreadableDependencies, e)
+                    })?,
+            );
+        }
+        // Unrelated files in -L dirs must not affect action identity.
+        let mut dep_libs = externs;
+        for dir in &compilation.crate_link_paths {
+            let dir = dependency_path(&cwd.join(dir), path_mapper)?;
+            // Prefer metadata: cdylibs can lack it, while proc macros have only a dylib.
+            for stem in &dep_stems {
+                for ext in [RMETA_EXTENSION, RLIB_EXTENSION, DLL_EXTENSION] {
+                    let lib = dependency_path(
+                        &dir.join(format!("{RLIB_PREFIX}{stem}.{ext}")),
+                        path_mapper,
+                    )?;
+                    match fs::metadata(&lib) {
+                        Ok(metadata) if metadata.is_file() => {
+                            dep_libs.push(lib);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(NotEligible::new(
+                                CompileLocallyReason::UnreadableDependencies,
+                                e.into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        dep_libs.sort();
+        dep_libs.dedup();
+
+        // rustc 1.94+ records whether dependency sources exist and match their contents
+        // (rust-lang/rust#149709). Include sources reachable in the worker layout.
+        let mut dep_sources = vec![];
+        let mut dep_infos_read = HashSet::new();
+        for lib in &dep_libs {
+            let Some(stem) = lib
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix(RLIB_PREFIX))
+                .filter(|_| has_extension(lib, &[RLIB_EXTENSION, RMETA_EXTENSION, DLL_EXTENSION]))
+            else {
+                continue;
+            };
+            let dep_info = lib.with_file_name(format!("{stem}.d"));
+            if !dep_infos_read.insert(dep_info.clone()) {
+                continue;
+            }
+            let dep_info_text = fs::read_to_string(&dep_info).map_err(|e| {
+                NotEligible::new(CompileLocallyReason::UnreadableDependencies, e.into())
+            })?;
+            if !dep_info_text
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains(": "))
+            {
+                return Err(NotEligible::new(
+                    CompileLocallyReason::UnreadableDependencies,
+                    anyhow!("invalid dependency file {}", dep_info.display()),
+                ));
+            }
+            for path in parse_dep_info(&dep_info_text, cwd) {
+                let path = normalize_absolute(&path).ok_or_else(|| {
+                    NotEligible::new(
+                        CompileLocallyReason::SourceOutsideInputRoot,
+                        anyhow!(
+                            "dependency source contains parent components: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                if path_mapper.to_input_root(&path).is_none() {
+                    debug!(
+                        "REAPI: dependency source outside the input root: {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                match fs::metadata(&path) {
+                    Ok(metadata) if metadata.is_file() => dep_sources.push(path),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(NotEligible::new(
+                            CompileLocallyReason::UnreadableDependencies,
+                            e.into(),
+                        ));
+                    }
+                }
+            }
+        }
+        dep_libs.extend(dep_sources);
+        Ok(dep_libs)
+    }
+
+    fn dependency_path(path: &Path, path_mapper: &PathMapper) -> StdResult<PathBuf, NotEligible> {
+        normalize_absolute(path)
+            .filter(|path| path_mapper.to_input_root(path).is_some())
+            .ok_or_else(|| {
+                NotEligible::new(
+                    CompileLocallyReason::PathOutsideInputRoot,
+                    anyhow!("dependency path {}", path.display()),
+                )
+            })
+    }
+
+    fn has_extension(path: &Path, extensions: &[&str]) -> bool {
+        path.extension()
+            .is_some_and(|e| extensions.iter().any(|ext| e == *ext))
+    }
+
     // Cargo path variables need worker-absolute values, not client paths.
     const CARGO_PATH_VARS: [&str; 4] = [
         "CARGO_MANIFEST_DIR",
@@ -3185,16 +3332,17 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
     }
 }
 
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 #[derive(Debug)]
 struct RlibDepsDetail {
-    deps: Vec<String>,
+    // Keep hashes to distinguish dependencies that share a crate name.
+    stems: Vec<String>,
     mtime: time::SystemTime,
 }
 
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 struct DepsSize;
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 impl Meter<PathBuf, RlibDepsDetail> for DepsSize {
     type Measure = usize;
     fn measure<Q: ?Sized>(&self, _k: &Q, v: &RlibDepsDetail) -> usize
@@ -3208,16 +3356,16 @@ impl Meter<PathBuf, RlibDepsDetail> for DepsSize {
         //let k_size = mem::size_of::<PathBuf>() + k.capacity();
         let k_size = 3 * 8 + 100;
 
-        let crate_names_size: usize = v.deps.iter().map(|s| s.capacity()).sum();
+        let stems_size: usize = v.stems.iter().map(|s| s.capacity()).sum();
         let v_size: usize = mem::size_of::<RlibDepsDetail>() + // Systemtime and vec itself
-            v.deps.capacity() * mem::size_of::<String>() + // Each string in the vec
-            crate_names_size; // Contents of all strings
+            v.stems.capacity() * mem::size_of::<String>() + // Each string in the vec
+            stems_size; // Contents of all strings
 
         k_size + v_size
     }
 }
 
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 #[derive(Debug)]
 struct RlibDepReader {
     cache: Mutex<LruCache<PathBuf, RlibDepsDetail, RandomState, DepsSize>>,
@@ -3225,7 +3373,7 @@ struct RlibDepReader {
     ls_arg: String,
 }
 
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 impl RlibDepReader {
     fn new_with_check(executable: PathBuf, env_vars: &[(OsString, OsString)]) -> Result<Self> {
         let temp_dir = tempfile::Builder::new()
@@ -3267,13 +3415,7 @@ impl RlibDepReader {
             )
         }
 
-        // The goal of this cache is to avoid repeated lookups when building a single project. Let's budget 3MB.
-        // Allowing for a 100 byte path, 50 dependencies per rlib and 20 characters per crate name, this roughly
-        // approximates to `path_size + path + vec_size + num_deps * (systemtime_size + string_size + crate_name_len)`
-        //                 `   3*8    +  100 +   3*8    +    50    * (      8         +     3*8     +       20      )`
-        //                 `2748` bytes per crate
-        // Allowing for possible overhead of up to double (for unused space in allocated memory), this means we
-        // can cache information from about 570 rlibs - easily enough for a single project.
+        // Bound memory while avoiding repeated rustc lookups during a build.
         const CACHE_SIZE: u64 = 3 * 1024 * 1024;
         let cache = LruCache::with_meter(CACHE_SIZE, DepsSize);
         let rustc_version = Self::get_rustc_version(&executable, env_vars)?;
@@ -3283,7 +3425,7 @@ impl RlibDepReader {
             executable,
             ls_arg: Self::get_correct_ls_arg(rustc_version),
         };
-        if let Err(e) = rlib_dep_reader.discover_rlib_deps(env_vars, &temp_rlib) {
+        if let Err(e) = rlib_dep_reader.discover_rlib_dep_stems(env_vars, &temp_rlib) {
             bail!("Failed to read deps from minimal rlib: {}", e)
         }
 
@@ -3340,7 +3482,23 @@ impl RlibDepReader {
         }
     }
 
+    #[cfg(feature = "dist-client")]
     fn discover_rlib_deps(
+        &self,
+        env_vars: &[(OsString, OsString)],
+        rlib: &Path,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .discover_rlib_dep_stems(env_vars, rlib)?
+            .into_iter()
+            .map(|mut stem| {
+                stem.truncate(crate_name(&stem).len());
+                stem
+            })
+            .collect())
+    }
+
+    fn discover_rlib_dep_stems(
         &self,
         env_vars: &[(OsString, OsString)],
         rlib: &Path,
@@ -3354,7 +3512,7 @@ impl RlibDepReader {
             if let Some(deps_detail) = cache.get(rlib)
                 && rlib_mtime == deps_detail.mtime
             {
-                return Ok(deps_detail.deps.clone());
+                return Ok(deps_detail.stems.clone());
             }
         }
 
@@ -3384,8 +3542,10 @@ impl RlibDepReader {
         }
 
         let stdout = String::from_utf8(stdout).context("Error parsing rustc -Z ls output")?;
-        let deps: Vec<_> = parse_rustc_z_ls(&stdout)
-            .map(|deps| deps.into_iter().map(|dep| dep.to_owned()).collect())?;
+        let stems: Vec<_> = parse_rustc_z_ls(&stdout)?
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
 
         {
             // This will behave poorly if the rlib is changing under our feet, but in that case rustc
@@ -3394,16 +3554,21 @@ impl RlibDepReader {
             cache.insert(
                 rlib.to_owned(),
                 RlibDepsDetail {
-                    deps: deps.clone(),
+                    stems: stems.clone(),
                     mtime: rlib_mtime,
                 },
             );
         }
-        Ok(deps)
+        Ok(stems)
     }
 }
 
-// Parse output like the following:
+#[cfg(feature = "dist-client")]
+fn crate_name(stem: &str) -> &str {
+    stem.rsplit_once('-').map_or(stem, |(name, _)| name)
+}
+
+// Parse dependency stems, retaining hashes when present:
 //
 // ```
 // =External Dependencies=
@@ -3419,7 +3584,7 @@ impl RlibDepReader {
 // 10 bitflags-f482823cbc05f4d7
 // 11 cfg_if-cf72e166fff77ced
 // ```
-#[cfg(feature = "dist-client")]
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
 fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
     let mut lines = stdout.lines();
     loop {
@@ -3430,7 +3595,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
         }
     }
 
-    let mut dep_names = vec![];
+    let mut dep_stems = vec![];
 
     for line in &mut lines {
         if line.is_empty() {
@@ -3451,7 +3616,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
             .split_whitespace()
             .next()
             .context("No lib string on line from rustc -Z ls")?;
-        if num != dep_names.len() + 1 {
+        if num != dep_stems.len() + 1 {
             bail!(
                 "Unexpected numbering of {} in rustc -Z ls output",
                 libstring
@@ -3459,22 +3624,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
         }
         assert!(line_splits.next().is_none());
 
-        let mut libstring_splits = libstring.rsplitn(2, '-');
-        // Most things get printed as ${LIBNAME}-${HASH} but for some things
-        // (native code-only libraries?), ${LIBNAME} is all you get.
-        let libname = {
-            let maybe_hash = libstring_splits
-                .next()
-                .context("Nothing in lib string from `rustc -Z ls`")?;
-            if let Some(name) = libstring_splits.next() {
-                name
-            } else {
-                maybe_hash
-            }
-        };
-        assert!(libstring_splits.next().is_none());
-
-        dep_names.push(libname);
+        dep_stems.push(libstring);
     }
 
     for line in lines {
@@ -3483,7 +3633,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
         }
     }
 
-    Ok(dep_names)
+    Ok(dep_stems)
 }
 
 /// Whether `line` is rustc's `--json=artifacts` notification for a `.rmeta`.
@@ -4254,7 +4404,7 @@ c:/foo/bar.rs:
         );
     }
 
-    #[cfg(feature = "dist-client")]
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
     #[test]
     fn test_parse_rustc_z_ls_pre_1_55() {
         let output = "=External Dependencies=
@@ -4264,16 +4414,17 @@ c:/foo/bar.rs:
 
 
 ";
-        let res = parse_rustc_z_ls(output);
-        assert!(res.is_ok());
-        let res = res.unwrap();
-        assert_eq!(res.len(), 3);
-        assert_eq!(res[0], "lucet_runtime");
-        assert_eq!(res[1], "lucet_runtime_internals");
-        assert_eq!(res[2], "lucet_runtime_macros");
+        assert_eq!(
+            parse_rustc_z_ls(output).unwrap(),
+            [
+                "lucet_runtime",
+                "lucet_runtime_internals-1ff6232b6940e924",
+                "lucet_runtime_macros-c18e1952b835769e",
+            ]
+        );
     }
 
-    #[cfg(feature = "dist-client")]
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
     #[test]
     fn test_parse_rustc_z_ls_post_1_55() {
         // This was introduced in rust 1.55 by
@@ -4289,25 +4440,20 @@ proc_macro false
 
 
 ";
-        let res = parse_rustc_z_ls(output);
-        assert!(res.is_ok());
-        let res = res.unwrap();
-        assert_eq!(res.len(), 3);
-        assert_eq!(res[0], "lucet_runtime");
-        assert_eq!(res[1], "lucet_runtime_internals");
-        assert_eq!(res[2], "lucet_runtime_macros");
+        assert_eq!(
+            parse_rustc_z_ls(output).unwrap(),
+            [
+                "lucet_runtime",
+                "lucet_runtime_internals-1ff6232b6940e924",
+                "lucet_runtime_macros-c18e1952b835769e",
+            ]
+        );
     }
 
-    #[cfg(feature = "dist-client")]
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
     #[test]
     fn test_parse_rustc_z_ls_modern_no_hash_suffix() {
-        // Modern rustc (1.75+) prints extended metadata per dep line:
-        //   N libname[-hash] hash HASH host_hash ... kind ... public
-        // Crates without a -HASH suffix (as observed for crc_fast) appear as:
-        //   N crc_fast hash 05bce6... host_hash None kind Unconditional public
-        // The parser must extract just "crc_fast", not the entire trailing
-        // metadata, so that RustInputsPackager can match it against rmeta
-        // files in crate_link_paths.
+        // Modern rustc appends metadata even when a dependency has no hash suffix.
         let output = "Crate info:
 name xai_file_utils
 hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
@@ -4319,16 +4465,85 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 5 aws_sdk_s3-c49a342c963fe6e9 hash 119191ef3d4a8059aee3abebc4c4b5bf host_hash None kind Unconditional public
 
 ";
-        let res = parse_rustc_z_ls(output).expect("modern rustc -Z ls output should parse");
-        assert_eq!(res.len(), 5);
-        assert_eq!(res[0], "std");
-        assert_eq!(res[1], "core");
-        assert_eq!(res[2], "crc_fast");
-        assert_eq!(res[3], "crc");
-        assert_eq!(res[4], "aws_sdk_s3");
+        assert_eq!(
+            parse_rustc_z_ls(output).unwrap(),
+            [
+                "std-453218b5e9634890",
+                "core-5f5c0031517c19c4",
+                "crc_fast",
+                "crc-8c7d86e779319534",
+                "aws_sdk_s3-c49a342c963fe6e9",
+            ]
+        );
+    }
+
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
+    #[test]
+    fn test_parse_rustc_z_ls_preserves_same_named_dependencies() {
+        let output = "=External Dependencies=
+1 libc-e47c8f2666a97726 hash abc host_hash None kind Unconditional public
+2 libc-fb97b8e8c331f065 hash def host_hash None kind Unconditional public
+3 native_only
+
+";
+        assert_eq!(
+            parse_rustc_z_ls(output).unwrap(),
+            [
+                "libc-e47c8f2666a97726",
+                "libc-fb97b8e8c331f065",
+                "native_only"
+            ]
+        );
     }
 
     #[cfg(feature = "dist-client")]
+    #[test_case("libc-e47c8f2666a97726", "libc" ; "hashed")]
+    #[test_case("native_only", "native_only" ; "no hash")]
+    #[test_case("café-1234", "café" ; "utf8")]
+    fn test_rlib_dep_crate_name(stem: &str, expected: &str) {
+        assert_eq!(crate_name(stem), expected);
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_rlib_dep_reader_keeps_stems_after_name_lookup() {
+        let rlib = tempfile::NamedTempFile::new().unwrap();
+        let stems: Vec<String> = [
+            "libc-e47c8f2666a97726",
+            "libc-fb97b8e8c331f065",
+            "native_only",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut cache = LruCache::with_meter(1 << 20, DepsSize);
+        cache.insert(
+            rlib.path().to_owned(),
+            RlibDepsDetail {
+                stems: stems.clone(),
+                mtime: rlib.as_file().metadata().unwrap().modified().unwrap(),
+            },
+        );
+        let reader = RlibDepReader {
+            cache: Mutex::new(cache),
+            executable: rlib.path().with_file_name("missing-rustc"),
+            ls_arg: "ls=root".to_owned(),
+        };
+        assert_eq!(
+            reader.discover_rlib_dep_stems(&[], rlib.path()).unwrap(),
+            stems
+        );
+        assert_eq!(
+            reader.discover_rlib_deps(&[], rlib.path()).unwrap(),
+            ["libc", "libc", "native_only"]
+        );
+        assert_eq!(
+            reader.discover_rlib_dep_stems(&[], rlib.path()).unwrap(),
+            stems
+        );
+    }
+
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
     #[test]
     fn test_rlib_dep_reader_call() {
         let mut env_vars = vec![];
@@ -4354,7 +4569,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         assert!(is_ok);
     }
 
-    #[cfg(feature = "dist-client")]
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
     #[test]
     fn test_rlib_dep_reader_parse_rustc_version() {
         let v0 = RlibDepReader::parse_rustc_version("rustc 1.2.3 aaaa".as_bytes());
@@ -4368,7 +4583,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         assert!(RlibDepReader::parse_rustc_version("1.2.3".as_bytes()).is_err());
     }
 
-    #[cfg(feature = "dist-client")]
+    #[cfg(any(feature = "dist-client", feature = "reapi"))]
     #[test]
     fn test_rlib_dep_reader_get_correct_ls_arg() {
         assert_eq!(
@@ -4505,7 +4720,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![FAKE_DIGEST.to_owned()],
             dist_archive: None,
-            #[cfg(feature = "dist-client")]
+            #[cfg(any(feature = "dist-client", feature = "reapi"))]
             rlib_dep_reader: None,
             parsed_args: ParsedArguments {
                 arguments: vec![
@@ -4624,7 +4839,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![],
             dist_archive: Some("/toolchains/rust.tar.gz".into()),
-            #[cfg(feature = "dist-client")]
+            #[cfg(any(feature = "dist-client", feature = "reapi"))]
             rlib_dep_reader: None,
             parsed_args: ParsedArguments {
                 arguments: vec![],
@@ -4749,7 +4964,7 @@ foo.rs:
             target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![],
             dist_archive: None,
-            #[cfg(feature = "dist-client")]
+            #[cfg(any(feature = "dist-client", feature = "reapi"))]
             rlib_dep_reader: None,
             parsed_args,
         });
@@ -5326,6 +5541,7 @@ foo.rs:
         use crate::compiler::rust::reapi_mapping::{deps_dir_base, map_for_reapi};
         use crate::reapi::{ActionEnv, CompileLocallyReason, ReapiCompile};
         use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
         use test_case::test_case;
 
         const CWD: &str = "/ws/app";
@@ -5367,7 +5583,7 @@ foo.rs:
                 sysroot: "/toolchain".into(),
                 #[cfg(feature = "dist-client")]
                 target_libdir: format!("/toolchain/lib/rustlib/{HOST}/lib").into(),
-                #[cfg(feature = "dist-client")]
+                #[cfg(any(feature = "dist-client", feature = "reapi"))]
                 rlib_dep_reader: None,
                 arguments: parsed.arguments,
                 inputs: vec![crate_root.into()],
@@ -5416,6 +5632,48 @@ foo.rs:
 
         fn env(vars: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
             vars.iter().map(|(k, v)| (k.into(), v.into())).collect()
+        }
+
+        fn rlib_dep_reader(rlibs: &[(&Path, Vec<String>)]) -> Arc<RlibDepReader> {
+            let reader = RlibDepReader {
+                cache: Mutex::new(LruCache::with_meter(1 << 20, DepsSize)),
+                executable: "/toolchain/bin/rustc".into(),
+                ls_arg: "ls=root".to_owned(),
+            };
+            for (rlib, stems) in rlibs {
+                reader.cache.lock().unwrap().insert(
+                    rlib.to_path_buf(),
+                    RlibDepsDetail {
+                        stems: stems.clone(),
+                        mtime: fs::metadata(rlib).unwrap().modified().unwrap(),
+                    },
+                );
+            }
+            Arc::new(reader)
+        }
+
+        fn compilation_with_externs(root: &Path, externs: &[&Path]) -> RustCompilation {
+            let mut extra = vec![];
+            for (i, extern_lib) in externs.iter().enumerate() {
+                extra.push("--extern".to_owned());
+                extra.push(format!("dep{i}={}", extern_lib.display()));
+            }
+            let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+            compilation_in(root.to_str().unwrap(), "src/lib.rs", &extra)
+        }
+
+        fn deps_dir_with(files: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+            let tempdir = tempfile::tempdir().unwrap();
+            // Canonical, like the paths create_file returns.
+            let root = tempdir.path().canonicalize().unwrap();
+            let deps = root.join("target/debug/deps");
+            for file in files {
+                let path = create_file(&deps, file, |_| Ok(())).unwrap();
+                if path.extension().is_some_and(|ext| ext == "d") {
+                    fs::write(path, format!("{file}: \n")).unwrap();
+                }
+            }
+            (tempdir, root, deps)
         }
 
         fn owned(vars: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -5848,7 +6106,7 @@ foo.rs:
                     .join("sysroot/lib/rustlib/fake-target/lib"),
                 compiler_shlibs_digests: vec![],
                 dist_archive: None,
-                #[cfg(feature = "dist-client")]
+                #[cfg(any(feature = "dist-client", feature = "reapi"))]
                 rlib_dep_reader: None,
                 parsed_args,
             };
@@ -5929,6 +6187,223 @@ foo.rs:
             );
             let env = map_for_reapi(&compilation).unwrap().env;
             assert_eq!(passed, !env.vars.is_empty(), "{env:?}");
+        }
+
+        #[test]
+        fn test_the_crates_in_the_externs_graphs_go_into_the_input_root() {
+            let proc_macro = format!("libpm-2.{DLL_EXTENSION}");
+            let cdylib = format!("libbar-1.{DLL_EXTENSION}");
+            let (_tempdir, root, deps) = deps_dir_with(&[
+                "libfoo-0.rmeta",
+                "foo-0.d",
+                "libbar-1.rmeta",
+                "libbar-1.rlib",
+                &cdylib,
+                "bar-1.d",
+                "libbaz-3.rlib",
+                "baz-3.d",
+                &proc_macro,
+                "pm-2.d",
+                "liblibc-other.rmeta",
+            ]);
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(
+                &foo,
+                vec![
+                    "bar-1".into(),
+                    "baz-3".into(),
+                    "pm-2".into(),
+                    "libc-e47c".into(),
+                ],
+            )]));
+            let files = map_for_reapi(&compilation).unwrap().input_root_files;
+            let mut expected = vec![
+                root.join("src/lib.rs"),
+                foo,
+                deps.join("libbar-1.rmeta"),
+                deps.join("libbaz-3.rlib"),
+                deps.join(&proc_macro),
+            ];
+            expected.sort();
+            assert_eq!(files, expected);
+        }
+
+        #[test]
+        fn test_dependency_sources_inside_the_roots_go_into_the_input_root() {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta"]);
+            let outside_dir = tempfile::tempdir().unwrap();
+            let outside_source = create_file(outside_dir.path(), "x.rs", |_| Ok(())).unwrap();
+            fs::write(
+                deps.join("foo-0.d"),
+                format!(
+                    "{}: src/foo.rs {}\n",
+                    deps.join("foo-0.d").display(),
+                    outside_source.display()
+                ),
+            )
+            .unwrap();
+            create_file(&root, "src/foo.rs", |_| Ok(())).unwrap();
+            // A file the crate reads with `include_bytes!`, named like a lib but without dep-info.
+            let lib_named_source =
+                create_file(&root, &format!("src/libdata.{DLL_EXTENSION}"), |_| Ok(())).unwrap();
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.inputs.push(lib_named_source.clone());
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![])]));
+            let files = map_for_reapi(&compilation).unwrap().input_root_files;
+            for file in [root.join("src/foo.rs"), lib_named_source] {
+                assert!(files.contains(&file), "{file:?} not in {files:?}");
+            }
+            assert!(!files.contains(&outside_source), "{files:?}");
+        }
+
+        #[test]
+        fn test_a_dependency_without_dep_info_compiles_locally() {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta"]);
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![])]));
+            assert_eq!(
+                CompileLocallyReason::UnreadableDependencies,
+                map_for_reapi(&compilation).unwrap_err().reason
+            );
+        }
+
+        #[test]
+        fn test_externs_without_an_rlib_dependency_reader_compile_locally() {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta", "foo-0.d"]);
+            let compilation = compilation_with_externs(&root, &[&deps.join("libfoo-0.rmeta")]);
+            assert_eq!(
+                CompileLocallyReason::UnreadableDependencies,
+                map_for_reapi(&compilation).unwrap_err().reason
+            );
+        }
+
+        #[test]
+        fn test_a_crate_without_externs_needs_no_rlib_dependency_reader() {
+            let (_tempdir, root, _deps) = deps_dir_with(&[]);
+            map_for_reapi(&compilation_with_externs(&root, &[])).unwrap();
+        }
+
+        #[test_case(b"" ; "empty")]
+        #[test_case(b"not dep-info\n" ; "malformed")]
+        #[test_case(b"output: \xff\n" ; "non utf8")]
+        fn test_invalid_dependency_info_compiles_locally(contents: &[u8]) {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta", "foo-0.d"]);
+            let foo = deps.join("libfoo-0.rmeta");
+            fs::write(deps.join("foo-0.d"), contents).unwrap();
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![])]));
+            assert_eq!(
+                map_for_reapi(&compilation).unwrap_err().reason,
+                CompileLocallyReason::UnreadableDependencies
+            );
+        }
+
+        #[test]
+        fn test_dependency_reader_errors_compile_locally() {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta", "foo-0.d"]);
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[]));
+            assert_eq!(
+                map_for_reapi(&compilation).unwrap_err().reason,
+                CompileLocallyReason::UnreadableDependencies
+            );
+        }
+
+        #[test]
+        fn test_dependency_paths_are_normalized_and_deduplicated() {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta", "foo-0.d"]);
+            let source = create_file(&root, "src/foo.rs", |_| Ok(())).unwrap();
+            fs::write(deps.join("foo-0.d"), "output: ./src/foo.rs src/foo.rs\n").unwrap();
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation =
+                compilation_with_externs(&root, &[&deps.join("./libfoo-0.rmeta")]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![])]));
+            compilation.inputs.push(source.clone());
+            let mut expected = vec![root.join("src/lib.rs"), source, foo];
+            expected.sort();
+            assert_eq!(
+                map_for_reapi(&compilation).unwrap().input_root_files,
+                expected
+            );
+        }
+
+        #[test]
+        fn test_dependency_sources_with_parent_components_compile_locally() {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta", "foo-0.d"]);
+            fs::write(deps.join("foo-0.d"), "output: src/../lib.rs\n").unwrap();
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![])]));
+            assert_eq!(
+                map_for_reapi(&compilation).unwrap_err().reason,
+                CompileLocallyReason::SourceOutsideInputRoot
+            );
+        }
+
+        #[test]
+        fn test_dependency_sources_include_generated_and_escaped_paths() {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta", "foo-0.d"]);
+            let source = create_file(&root, "src/foo bar.rs", |_| Ok(())).unwrap();
+            let generated =
+                create_file(&root, "target/debug/build/generated.rs", |_| Ok(())).unwrap();
+            fs::write(
+                deps.join("foo-0.d"),
+                "output: src/foo\\ bar.rs target/debug/build/generated.rs missing.rs\n",
+            )
+            .unwrap();
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![])]));
+            let files = map_for_reapi(&compilation).unwrap().input_root_files;
+            assert!(files.contains(&source));
+            assert!(files.contains(&generated));
+            assert!(!files.contains(&root.join("missing.rs")));
+        }
+
+        #[test]
+        fn test_dependency_library_access_errors_compile_locally() {
+            let (_tempdir, root, deps) =
+                deps_dir_with(&["libfoo-0.rmeta", "foo-0.d", "libbar-1.rlib", "bar-1.d"]);
+            symlink("libbar-1.rmeta", deps.join("libbar-1.rmeta")).unwrap();
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec!["bar-1".into()])]));
+            assert_eq!(
+                map_for_reapi(&compilation).unwrap_err().reason,
+                CompileLocallyReason::UnreadableDependencies
+            );
+        }
+
+        #[test]
+        fn test_dependency_source_access_errors_compile_locally() {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta", "foo-0.d"]);
+            symlink("loop.rs", root.join("loop.rs")).unwrap();
+            fs::write(deps.join("foo-0.d"), "output: loop.rs\n").unwrap();
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![])]));
+            assert_eq!(
+                map_for_reapi(&compilation).unwrap_err().reason,
+                CompileLocallyReason::UnreadableDependencies
+            );
+        }
+
+        #[test]
+        fn test_input_root_files_are_sorted_and_deduplicated() {
+            let (_tempdir, root, deps) =
+                deps_dir_with(&["libbar-1.rmeta", "libfoo-0.rmeta", "bar-1.d", "foo-0.d"]);
+            let (bar, foo) = (deps.join("libbar-1.rmeta"), deps.join("libfoo-0.rmeta"));
+            let mut compilation = compilation_with_externs(&root, &[&foo, &bar]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![]), (&bar, vec![])]));
+            compilation.inputs.extend([bar.clone(), foo.clone()]);
+            assert_eq!(
+                vec![root.join("src/lib.rs"), bar, foo],
+                map_for_reapi(&compilation).unwrap().input_root_files
+            );
         }
 
         #[test]
