@@ -34,6 +34,8 @@ use crate::compiler::{CompileExecutor, CompileOutcome, CompileRequest, HashKeyOp
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 use crate::mock_command::{CommandChild, CommandCreatorSync, RunCommand, exit_status};
+#[cfg(feature = "reapi")]
+use crate::reapi::{CompileLocallyReason, NotEligible, ReapiCompile};
 use crate::server;
 use crate::util::{
     Digest, StderrLineObserver, fmt_duration_as_secs, resolve_compiler_avoiding_wrapper,
@@ -55,6 +57,8 @@ use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{self, Stdio};
+#[cfg(feature = "reapi")]
+use std::result::Result as StdResult;
 use std::str;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -910,6 +914,12 @@ where
         Option<dist::CompileCommand>,
         Cacheable,
     )>;
+
+    /// Maps compilation paths for REAPI, or returns why the compile must stay local.
+    #[cfg(feature = "reapi")]
+    fn map_for_reapi(&self) -> StdResult<ReapiCompile, NotEligible> {
+        Err(CompileLocallyReason::NotRust.into())
+    }
 
     /// Create a function that will create the inputs used to perform a distributed compilation
     #[cfg(feature = "dist-client")]
@@ -3699,6 +3709,12 @@ LLVM version: 6.0",
         async fn execute(&self, request: CompileRequest<'_, T>) -> Result<CompileOutcome> {
             self.execute_calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(self.options, request.hash_key_options);
+            #[cfg(feature = "reapi")]
+            {
+                let error = request.compilation.map_for_reapi().unwrap_err();
+                assert_eq!(CompileLocallyReason::NotRust, error.reason);
+                assert!(error.detail.is_none());
+            }
             request.execute_locally().await
         }
     }

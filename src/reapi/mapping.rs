@@ -18,10 +18,82 @@
 //! Paths under a compile's cwd keep their relative path in the input root, and paths
 //! under its build root (cargo's target dir) go under [`BUILD_ROOT_DIR`].
 
+use crate::errors::*;
 use std::path::{Component, Path, PathBuf};
 
 /// The input root's directory for files under the local build root.
 const BUILD_ROOT_DIR: &str = ".sccache-build";
+
+#[derive(Debug)]
+pub struct ReapiCompile {
+    pub(crate) path_mapper: PathMapper,
+    pub(crate) arguments: Vec<String>,
+    /// Absolute crate-root arguments must remain absolute on the worker: rustc
+    /// preserves their spelling in its outputs. These are passed separately.
+    pub(crate) mapped_crate_root: Option<String>,
+    pub(crate) target_triple: String,
+    pub(crate) input_root_files: Vec<PathBuf>,
+    pub(crate) outputs: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct NotEligible {
+    pub(crate) reason: CompileLocallyReason,
+    pub(crate) detail: Option<Error>,
+}
+
+impl NotEligible {
+    pub(crate) fn new(reason: CompileLocallyReason, detail: Error) -> Self {
+        NotEligible {
+            reason,
+            detail: Some(detail),
+        }
+    }
+}
+
+impl From<CompileLocallyReason> for NotEligible {
+    fn from(reason: CompileLocallyReason) -> Self {
+        NotEligible {
+            reason,
+            detail: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompileLocallyReason {
+    NotRust,
+    RustcDriver,
+    WindowsClient,
+    Staticlib,
+    UnexpectedCargoLayout,
+    PathOutsideInputRoot,
+    SourceOutsideInputRoot,
+    AbsolutePathInOption,
+    CustomTargetSpec,
+    NativeCpu,
+    ProfileUse,
+    RemapPathPrefix,
+}
+
+impl std::fmt::Display for CompileLocallyReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotRust => "not a Rust compile",
+            Self::RustcDriver => "not rustc",
+            Self::WindowsClient => "Windows client",
+            Self::Staticlib => "staticlib crate type",
+            Self::UnexpectedCargoLayout => "unexpected cargo dir layout",
+            Self::PathOutsideInputRoot => "path outside the cwd and build root",
+            Self::SourceOutsideInputRoot => "source file outside the cwd and build root",
+            Self::AbsolutePathInOption => "absolute path in a -C or -Z option",
+            Self::CustomTargetSpec => "custom target spec",
+            Self::NativeCpu => "-C target-cpu=native or -Z tune-cpu=native",
+            Self::ProfileUse => "-C profile-use or -C profile-sample-use",
+            Self::RemapPathPrefix => "--remap-path-prefix",
+        })
+    }
+}
 
 /// Maps local paths under the cwd and build root to input-root-relative paths.
 #[derive(Debug)]
@@ -66,7 +138,7 @@ impl PathMapper {
     }
 }
 
-fn normalize_absolute(path: &Path) -> Option<PathBuf> {
+pub(crate) fn normalize_absolute(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }

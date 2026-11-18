@@ -26,6 +26,8 @@ use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
 use crate::lru_disk_cache::{LruCache, Meter};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
+#[cfg(feature = "reapi")]
+use crate::reapi::{NotEligible, ReapiCompile};
 use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
 use crate::util::{HashToDigest, OsStrExt, strip_basedirs_from_arg};
 use crate::{counted_array, dist};
@@ -55,6 +57,8 @@ use std::iter;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process;
+#[cfg(feature = "reapi")]
+use std::result::Result as StdResult;
 #[cfg(feature = "dist-client")]
 use std::sync::Mutex;
 use std::sync::{Arc, LazyLock};
@@ -2310,6 +2314,277 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             path: v.path.clone(),
             optional: v.optional,
         }))
+    }
+
+    #[cfg(feature = "reapi")]
+    fn map_for_reapi(&self) -> StdResult<ReapiCompile, NotEligible> {
+        reapi_mapping::map_for_reapi(self)
+    }
+}
+
+#[cfg(feature = "reapi")]
+mod reapi_mapping {
+    use super::*;
+    use crate::reapi::{CompileLocallyReason, PathMapper, normalize_absolute};
+
+    pub(super) fn map_for_reapi(
+        compilation: &RustCompilation,
+    ) -> StdResult<ReapiCompile, NotEligible> {
+        // Remote Rust compilation from Windows is outside the initial scope.
+        if cfg!(windows) {
+            return Err(CompileLocallyReason::WindowsClient.into());
+        }
+        // Drivers can report rustc's commit hash; keep their results separate from rustc's.
+        if compilation
+            .executable
+            .file_stem()
+            .is_none_or(|stem| stem != "rustc")
+        {
+            return Err(NotEligible::new(
+                CompileLocallyReason::RustcDriver,
+                anyhow!("{}", compilation.executable.display()),
+            ));
+        }
+        mapped_compile(compilation, path_mapper(compilation)?)
+    }
+
+    /// `dir` without its trailing `<profile>/deps`, or `None` if it doesn't end in `deps`.
+    pub(super) fn deps_dir_base(dir: &Path) -> Option<&Path> {
+        if dir.file_name()? != "deps" {
+            return None;
+        }
+        dir.ancestors().nth(2)
+    }
+
+    // Infer the build root from Cargo's output and dependency directories.
+    fn path_mapper(compilation: &RustCompilation) -> StdResult<PathMapper, NotEligible> {
+        let cwd = normalize_absolute(&compilation.cwd).ok_or_else(|| {
+            NotEligible::new(
+                CompileLocallyReason::UnexpectedCargoLayout,
+                anyhow!("cwd must be absolute and contain no parent components"),
+            )
+        })?;
+        let mut output_dirs: Vec<_> = compilation
+            .outputs
+            .values()
+            .map(|output| {
+                normalize_absolute(&cwd.join(&output.path))
+                    .and_then(|path| path.parent().map(Path::to_owned))
+                    .ok_or_else(|| {
+                        NotEligible::new(
+                            CompileLocallyReason::UnexpectedCargoLayout,
+                            anyhow!("invalid output path {}", output.path.display()),
+                        )
+                    })
+            })
+            .collect::<StdResult<_, _>>()?;
+        output_dirs.sort();
+        output_dirs.dedup();
+        let [output_dir] = output_dirs.as_slice() else {
+            return Err(NotEligible::new(
+                CompileLocallyReason::UnexpectedCargoLayout,
+                anyhow!("expected outputs in one Cargo <profile>/deps directory"),
+            ));
+        };
+        let mut build_root = deps_dir_base(output_dir)
+            .map(Path::to_owned)
+            .ok_or_else(|| {
+                NotEligible::new(
+                    CompileLocallyReason::UnexpectedCargoLayout,
+                    anyhow!("{} isn't a <profile>/deps dir", output_dir.display()),
+                )
+            })?;
+        // Other -L directories are handled by argument mapping below.
+        let link_dirs: Vec<_> = compilation
+            .crate_link_paths
+            .iter()
+            .map(|dir| {
+                normalize_absolute(&cwd.join(dir)).ok_or_else(|| {
+                    NotEligible::new(
+                        CompileLocallyReason::PathOutsideInputRoot,
+                        anyhow!(
+                            "link directory {} contains parent components",
+                            dir.display()
+                        ),
+                    )
+                })
+            })
+            .collect::<StdResult<_, _>>()?;
+        for link_dir_base in link_dirs.iter().filter_map(|dir| deps_dir_base(dir)) {
+            build_root = build_root
+                .components()
+                .zip(link_dir_base.components())
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a)
+                .collect();
+        }
+        // Build roots containing the cwd would retain checkout paths in the worker layout.
+        if cwd.starts_with(&build_root) {
+            return Err(NotEligible::new(
+                CompileLocallyReason::UnexpectedCargoLayout,
+                anyhow!("build root {} holds the cwd", build_root.display()),
+            ));
+        }
+        Ok(PathMapper::new(cwd, build_root))
+    }
+
+    fn mapped_compile(
+        compilation: &RustCompilation,
+        path_mapper: PathMapper,
+    ) -> StdResult<ReapiCompile, NotEligible> {
+        // Staticlibs bundle dependency and std object code absent from the input root.
+        if compilation.crate_types.staticlib {
+            return Err(CompileLocallyReason::Staticlib.into());
+        }
+        let cwd = &compilation.cwd;
+        let absolute_inputs: Vec<PathBuf> =
+            compilation.inputs.iter().map(|p| cwd.join(p)).collect();
+
+        let mut arguments = vec![];
+        let mut mapped_crate_root = None;
+        let mut target_triple = None;
+        for argument in &compilation.arguments {
+            if let Argument::Raw(crate_root) = argument {
+                let mapped = path_mapper
+                    .to_input_root(Path::new(crate_root))
+                    .ok_or_else(|| {
+                        NotEligible::new(
+                            CompileLocallyReason::PathOutsideInputRoot,
+                            anyhow!("crate root {crate_root:?}"),
+                        )
+                    })?;
+                if Path::new(crate_root).is_absolute() {
+                    mapped_crate_root = Some(mapped);
+                } else {
+                    arguments.push(mapped);
+                }
+                continue;
+            }
+            // Terminal width only affects diagnostic wrapping; keep it out of action identity.
+            if argument.flag_str() == Some("--diagnostic-width") {
+                continue;
+            }
+            // User path remapping would conflict with worker/local output equivalence.
+            if argument.flag_str() == Some("--remap-path-prefix") {
+                return Err(NotEligible::new(
+                    CompileLocallyReason::RemapPathPrefix,
+                    anyhow!("{argument:?}"),
+                ));
+            }
+            match argument.get_data() {
+                Some(Target(ArgTarget::Name(name))) => target_triple = Some(name.clone()),
+                Some(Target(_)) => {
+                    return Err(NotEligible::new(
+                        CompileLocallyReason::CustomTargetSpec,
+                        anyhow!("{argument:?}"),
+                    ));
+                }
+                // Native CPU settings differ between client and worker.
+                Some(CodeGen(ArgCodegen {
+                    opt,
+                    value: Some(value),
+                })) if opt == "target-cpu" && value == "native" => {
+                    return Err(NotEligible::new(
+                        CompileLocallyReason::NativeCpu,
+                        anyhow!("{argument:?}"),
+                    ));
+                }
+                Some(Unstable(ArgUnstable {
+                    opt,
+                    value: Some(value),
+                })) if opt == "tune-cpu" && value == "native" => {
+                    return Err(NotEligible::new(
+                        CompileLocallyReason::NativeCpu,
+                        anyhow!("{argument:?}"),
+                    ));
+                }
+                // The PGO profile isn't mapped or added to the input root.
+                Some(CodeGen(ArgCodegen { opt, .. }))
+                    if opt == "profile-use" || opt == "profile-sample-use" =>
+                {
+                    return Err(NotEligible::new(
+                        CompileLocallyReason::ProfileUse,
+                        anyhow!("{argument:?}"),
+                    ));
+                }
+                Some(Unstable(ArgUnstable { opt, .. })) if opt == "profile-sample-use" => {
+                    return Err(NotEligible::new(
+                        CompileLocallyReason::ProfileUse,
+                        anyhow!("{argument:?}"),
+                    ));
+                }
+                // Linker paths are unused for rlibs. Other option paths need mapped inputs.
+                Some(CodeGen(ArgCodegen {
+                    opt,
+                    value: Some(value),
+                }))
+                | Some(Unstable(ArgUnstable {
+                    opt,
+                    value: Some(value),
+                })) if Path::new(value).is_absolute()
+                    && !matches!(opt.as_str(), "linker" | "link-arg" | "link-args") =>
+                {
+                    return Err(NotEligible::new(
+                        CompileLocallyReason::AbsolutePathInOption,
+                        anyhow!("{argument:?}"),
+                    ));
+                }
+                _ => {}
+            }
+            for arg in argument.iter_strings(|p: &Path| path_mapper.to_input_root(p)) {
+                arguments.push(arg.map_err(|e| {
+                    NotEligible::new(
+                        CompileLocallyReason::PathOutsideInputRoot,
+                        anyhow!("argument {argument:?}: {e}"),
+                    )
+                })?);
+            }
+        }
+        let mut input_root_files = Vec::with_capacity(absolute_inputs.len());
+        for path in absolute_inputs {
+            let normalized = normalize_absolute(&path)
+                .filter(|path| path_mapper.to_input_root(path).is_some())
+                .ok_or_else(|| {
+                    NotEligible::new(
+                        CompileLocallyReason::SourceOutsideInputRoot,
+                        anyhow!("{}", path.display()),
+                    )
+                })?;
+            input_root_files.push(normalized);
+        }
+        // Always pass the target explicitly; the worker's host triple may differ.
+        let target_triple = match target_triple {
+            Some(target_triple) => target_triple,
+            None => {
+                arguments.push(format!("--target={}", compilation.host));
+                compilation.host.clone()
+            }
+        };
+
+        input_root_files.sort();
+        input_root_files.dedup();
+        let mut outputs: Vec<_> = compilation
+            .outputs
+            .values()
+            .map(|output| {
+                normalize_absolute(&cwd.join(&output.path)).ok_or_else(|| {
+                    NotEligible::new(
+                        CompileLocallyReason::UnexpectedCargoLayout,
+                        anyhow!("invalid output path {}", output.path.display()),
+                    )
+                })
+            })
+            .collect::<StdResult<_, _>>()?;
+        outputs.sort();
+        outputs.dedup();
+        Ok(ReapiCompile {
+            path_mapper,
+            arguments,
+            mapped_crate_root,
+            target_triple,
+            input_root_files,
+            outputs,
+        })
     }
 }
 
@@ -4883,5 +5158,503 @@ foo.rs:
         ));
         assert!(!is_rmeta_artifact_notification(b"not json\n"));
         assert!(!is_rmeta_artifact_notification(b""));
+    }
+
+    #[cfg(all(feature = "reapi", unix))]
+    mod reapi_mapping {
+        use super::*;
+        use crate::compiler::rust::reapi_mapping::{deps_dir_base, map_for_reapi};
+        use crate::reapi::{CompileLocallyReason, ReapiCompile};
+        use test_case::test_case;
+
+        const CWD: &str = "/ws/app";
+        const HOST: &str = "x86_64-unknown-linux-gnu";
+
+        fn compilation_with_target_dir(
+            cwd: &str,
+            target_dir: &str,
+            crate_root: &str,
+            extra: &[&str],
+        ) -> RustCompilation {
+            let deps = format!("{target_dir}/debug/deps");
+            let dependency = format!("dependency={deps}");
+            let mut args = vec![
+                "--crate-name",
+                "foo",
+                "--edition=2021",
+                crate_root,
+                "--crate-type",
+                "lib",
+                "--emit=dep-info,metadata,link",
+                "-C",
+                "metadata=abc",
+                "--out-dir",
+                &deps,
+                "-L",
+                &dependency,
+            ];
+            args.extend(extra);
+            let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+            let parsed = match parse_arguments(&args, Path::new(cwd)) {
+                CompilerArguments::Ok(parsed) => parsed,
+                o => panic!("unexpected parse result: {o:?}"),
+            };
+            RustCompilation {
+                executable: "/toolchain/bin/rustc".into(),
+                host: HOST.to_owned(),
+                sysroot: "/toolchain".into(),
+                #[cfg(feature = "dist-client")]
+                target_libdir: format!("/toolchain/lib/rustlib/{HOST}/lib").into(),
+                #[cfg(feature = "dist-client")]
+                rlib_dep_reader: None,
+                arguments: parsed.arguments,
+                inputs: vec![crate_root.into()],
+                outputs: [(
+                    "link".to_owned(),
+                    ArtifactDescriptor {
+                        path: format!("{deps}/libfoo-abc.rlib").into(),
+                        optional: false,
+                    },
+                )]
+                .into(),
+                crate_link_paths: parsed.crate_link_paths,
+                crate_name: "foo".to_owned(),
+                crate_types: parsed.crate_types,
+                cwd: cwd.into(),
+                env_vars: vec![],
+            }
+        }
+
+        fn compilation_in(cwd: &str, crate_root: &str, extra: &[&str]) -> RustCompilation {
+            compilation_with_target_dir(cwd, &format!("{cwd}/target"), crate_root, extra)
+        }
+
+        fn compilation(extra: &[&str]) -> RustCompilation {
+            compilation_in(CWD, "src/lib.rs", extra)
+        }
+
+        fn with(
+            mut compilation: RustCompilation,
+            change: impl FnOnce(&mut RustCompilation),
+        ) -> RustCompilation {
+            change(&mut compilation);
+            compilation
+        }
+
+        #[test]
+        fn test_deps_dir_base() {
+            let base =
+                |d: &str| deps_dir_base(Path::new(d)).map(|p| p.to_str().unwrap().to_owned());
+            assert_eq!(Some("/w/target"), base("/w/target/debug/deps").as_deref());
+            assert_eq!(
+                Some("/w/target/aarch64-apple-darwin"),
+                base("/w/target/aarch64-apple-darwin/release/deps").as_deref()
+            );
+            assert_eq!(None, base("/w/target/debug/examples"));
+            assert_eq!(
+                None,
+                base("/w/target/debug/build/memchr-1a6535e85f000ff2/out")
+            );
+        }
+
+        #[test]
+        fn test_maps_paths_into_the_input_root() {
+            let compile = map_for_reapi(&compilation(&[])).unwrap();
+            assert!(
+                compile
+                    .arguments
+                    .iter()
+                    .any(|a| a == "dependency=.sccache-build/debug/deps"),
+                "{:?}",
+                compile.arguments
+            );
+            assert!(
+                !compile.arguments.iter().any(|a| a.contains("/ws/app")),
+                "{:?}",
+                compile.arguments
+            );
+            assert_eq!(
+                vec![PathBuf::from(format!("{CWD}/src/lib.rs"))],
+                compile.input_root_files
+            );
+            assert_eq!(
+                vec![PathBuf::from(format!(
+                    "{CWD}/target/debug/deps/libfoo-abc.rlib"
+                ))],
+                compile.outputs
+            );
+        }
+
+        #[test]
+        fn test_mapping_through_the_compilation_interface() {
+            let compilation: Box<dyn Compilation<Arc<Mutex<MockCommandCreator>>>> =
+                Box::new(compilation(&[]));
+            let mapped = compilation.map_for_reapi().unwrap();
+            assert_eq!(HOST, mapped.target_triple);
+            assert!(mapped.arguments.contains(&"src/lib.rs".to_owned()));
+        }
+
+        #[test]
+        fn test_inputs_and_outputs_are_normalized_sorted_and_deduplicated() {
+            let mut compilation = compilation_in("/ws/./app", "src/./lib.rs", &[]);
+            compilation.inputs.extend([
+                "src/lib.rs".into(),
+                "/ws/app/src/lib.rs".into(),
+                "src/z.rs".into(),
+                "src/a.rs".into(),
+            ]);
+            for (key, path) in [
+                ("metadata", "/ws/app/target/debug/deps/libfoo-abc.rmeta"),
+                ("duplicate", "/ws/app/target/debug/deps/libfoo-abc.rlib"),
+            ] {
+                compilation.outputs.insert(
+                    key.to_owned(),
+                    ArtifactDescriptor {
+                        path: path.into(),
+                        optional: false,
+                    },
+                );
+            }
+            let mapped = map_for_reapi(&compilation).unwrap();
+            assert_eq!(
+                vec![
+                    PathBuf::from("/ws/app/src/a.rs"),
+                    PathBuf::from("/ws/app/src/lib.rs"),
+                    PathBuf::from("/ws/app/src/z.rs"),
+                ],
+                mapped.input_root_files
+            );
+            assert_eq!(
+                vec![
+                    PathBuf::from("/ws/app/target/debug/deps/libfoo-abc.rlib"),
+                    PathBuf::from("/ws/app/target/debug/deps/libfoo-abc.rmeta"),
+                ],
+                mapped.outputs
+            );
+            assert!(mapped.arguments.contains(&"src/lib.rs".to_owned()));
+        }
+
+        #[test_case("metadata", "link")]
+        #[test_case("link", "metadata")]
+        fn test_outputs_in_different_directories_are_rejected(first: &str, second: &str) {
+            let mut compilation = compilation(&[]);
+            compilation.outputs = [
+                (first, "/ws/app/target/debug/deps/foo.rlib"),
+                (second, "/outside/target/debug/deps/foo.rmeta"),
+            ]
+            .into_iter()
+            .map(|(name, path)| {
+                (
+                    name.to_owned(),
+                    ArtifactDescriptor {
+                        path: path.into(),
+                        optional: false,
+                    },
+                )
+            })
+            .collect();
+            let error = map_for_reapi(&compilation).unwrap_err();
+            assert_eq!(CompileLocallyReason::UnexpectedCargoLayout, error.reason);
+            assert!(error.detail.unwrap().to_string().contains("one Cargo"));
+        }
+
+        #[test]
+        fn test_symlink_parent_traversal_in_outputs_is_rejected() {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let cwd = root.join("ws");
+            let outside = root.join("outside");
+            std::fs::create_dir(&cwd).unwrap();
+            std::fs::create_dir_all(outside.join("nested")).unwrap();
+            std::fs::create_dir_all(outside.join("target/debug/deps")).unwrap();
+            let output = outside.join("target/debug/deps/libfoo-abc.rlib");
+            std::fs::write(&output, b"outside").unwrap();
+            symlink(outside.join("nested"), cwd.join("link")).unwrap();
+            let compilation = compilation_with_target_dir(
+                cwd.to_str().unwrap(),
+                cwd.join("link/../target").to_str().unwrap(),
+                "src/lib.rs",
+                &[],
+            );
+            assert_eq!(
+                output,
+                compilation.outputs["link"].path.canonicalize().unwrap()
+            );
+            let error = map_for_reapi(&compilation).unwrap_err();
+            assert_eq!(CompileLocallyReason::UnexpectedCargoLayout, error.reason);
+        }
+
+        #[test_case(
+            compilation_in("/a/app", "src/lib.rs", &[]),
+            compilation_in("/b/app", "src/lib.rs", &[]) ;
+            "target dir in the cwd"
+        )]
+        #[test_case(
+            compilation_with_target_dir("/a/ws/member", "/a/ws/target", "src/lib.rs", &[]),
+            compilation_with_target_dir("/b/ws/member", "/b/ws/target", "src/lib.rs", &[]) ;
+            "workspace member with the target dir in the workspace root"
+        )]
+        fn test_two_checkouts_give_the_same_arguments(a: RustCompilation, b: RustCompilation) {
+            let (a, b) = (map_for_reapi(&a).unwrap(), map_for_reapi(&b).unwrap());
+            assert_eq!(a.arguments, b.arguments);
+            let mapped_inputs = |compile: &ReapiCompile| -> Vec<String> {
+                compile
+                    .input_root_files
+                    .iter()
+                    .map(|p| compile.path_mapper.to_input_root(p).unwrap())
+                    .collect()
+            };
+            assert_eq!(mapped_inputs(&a), mapped_inputs(&b));
+        }
+
+        #[test]
+        fn test_the_diagnostic_width_isnt_sent() {
+            let without = map_for_reapi(&compilation(&[])).unwrap();
+            for args in [
+                &["--diagnostic-width=120"][..],
+                &["--diagnostic-width", "211"],
+            ] {
+                let with = map_for_reapi(&compilation(args)).unwrap();
+                assert_eq!(without.arguments, with.arguments);
+            }
+        }
+
+        #[test_case("/ws/target/debug/deps" ; "absolute")]
+        #[test_case("/ws/target/./debug/deps" ; "normalized absolute")]
+        fn test_a_target_dir_outside_the_cwd_is_the_build_root(deps: &str) {
+            let mut compilation = compilation_with_target_dir(
+                "/ws/member",
+                "/ws/target",
+                "src/lib.rs",
+                &["-L", &format!("dependency={deps}")],
+            );
+            compilation.outputs.get_mut("link").unwrap().path =
+                format!("{deps}/libfoo-abc.rlib").into();
+            let compile = map_for_reapi(&compilation).unwrap();
+            assert_eq!(
+                Some(".sccache-build/debug/deps".to_owned()),
+                compile
+                    .path_mapper
+                    .to_input_root(Path::new("/ws/target/debug/deps"))
+            );
+            assert_eq!(
+                Some("src/lib.rs".to_owned()),
+                compile
+                    .path_mapper
+                    .to_input_root(Path::new("/ws/member/src/lib.rs"))
+            );
+        }
+
+        #[test]
+        fn test_passes_the_target_triple() {
+            let compile = map_for_reapi(&compilation(&[])).unwrap();
+            assert_eq!(HOST, compile.target_triple);
+            assert!(compile.arguments.contains(&format!("--target={HOST}")));
+
+            let compile =
+                map_for_reapi(&compilation(&["--target", "aarch64-unknown-linux-gnu"])).unwrap();
+            assert_eq!("aarch64-unknown-linux-gnu", compile.target_triple);
+            assert!(!compile.arguments.contains(&format!("--target={HOST}")));
+            assert!(
+                compile
+                    .arguments
+                    .windows(2)
+                    .any(|w| w == ["--target", "aarch64-unknown-linux-gnu"]),
+                "{:?}",
+                compile.arguments
+            );
+        }
+
+        #[test]
+        fn test_an_absolute_crate_root_is_left_out_of_the_arguments() {
+            let compilation = compilation_in(CWD, "/ws/app/src/lib.rs", &[]);
+            let compile = map_for_reapi(&compilation).unwrap();
+            assert_eq!(Some("src/lib.rs".to_owned()), compile.mapped_crate_root);
+            assert!(
+                !compile.arguments.iter().any(|a| a.contains("lib.rs")),
+                "{:?}",
+                compile.arguments
+            );
+        }
+
+        #[test]
+        fn test_build_root_holds_the_target_and_host_deps_dirs() {
+            let target_deps = "/ws/app/target/aarch64-unknown-linux-gnu/debug/deps";
+            let mut compilation = compilation(&[
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "-L",
+                &format!("dependency={target_deps}"),
+            ]);
+            compilation.outputs.get_mut("link").unwrap().path =
+                format!("{target_deps}/libfoo-abc.rlib").into();
+            let compile = map_for_reapi(&compilation).unwrap();
+            assert_eq!(
+                Some(".sccache-build/aarch64-unknown-linux-gnu/debug/deps".to_owned()),
+                compile.path_mapper.to_input_root(Path::new(target_deps))
+            );
+            assert_eq!(
+                Some(".sccache-build/debug/deps".to_owned()),
+                compile
+                    .path_mapper
+                    .to_input_root(Path::new("/ws/app/target/debug/deps"))
+            );
+        }
+
+        #[test]
+        fn test_a_link_dir_outside_deps_is_mapped_as_an_argument() {
+            let out_dir = "/ws/app/target/debug/build/foo-123/out";
+            let compile = map_for_reapi(&compilation(&["-L", out_dir])).unwrap();
+            assert_eq!(
+                Some(".sccache-build".to_owned()),
+                compile
+                    .path_mapper
+                    .to_input_root(Path::new("/ws/app/target"))
+            );
+            assert!(
+                compile
+                    .arguments
+                    .contains(&"all=.sccache-build/debug/build/foo-123/out".to_owned()),
+                "{:?}",
+                compile.arguments
+            );
+        }
+
+        #[test_case(compilation(&["-C", "target-cpu=x86-64-v3"]) ; "named target cpu")]
+        #[test_case(compilation(&["-C", "linker=/usr/bin/clang"]) ; "absolute linker")]
+        #[test_case(compilation(&["-C", "link-arg=/opt/lib/crt0.o"]) ; "absolute link arg")]
+        fn test_eligible_compiles(compilation: RustCompilation) {
+            map_for_reapi(&compilation).unwrap();
+        }
+
+        #[test_case(
+            CompileLocallyReason::RustcDriver,
+            with(compilation(&[]), |c| c.executable = "/toolchain/bin/clippy-driver".into()) ;
+            "clippy driver"
+        )]
+        #[test_case(
+            CompileLocallyReason::Staticlib,
+            with(compilation(&[]), |c| c.crate_types.staticlib = true) ;
+            "staticlib"
+        )]
+        #[test_case(
+            CompileLocallyReason::CustomTargetSpec,
+            compilation(&["--target", "/ws/app/foo.json"]) ;
+            "target spec file"
+        )]
+        #[test_case(
+            CompileLocallyReason::NativeCpu,
+            compilation(&["-C", "target-cpu=native"]) ;
+            "native target cpu"
+        )]
+        #[test_case(
+            CompileLocallyReason::NativeCpu,
+            compilation(&["-Z", "tune-cpu=native"]) ;
+            "native tune cpu"
+        )]
+        #[test_case(
+            CompileLocallyReason::SourceOutsideInputRoot,
+            with(compilation(&[]), |c| c.inputs.push("/elsewhere/data.json".into())) ;
+            "source outside"
+        )]
+        #[test_case(
+            CompileLocallyReason::PathOutsideInputRoot,
+            compilation_in(CWD, "../other/src/lib.rs", &[]) ;
+            "crate root outside"
+        )]
+        #[test_case(
+            CompileLocallyReason::PathOutsideInputRoot,
+            compilation(&["-L", "/opt/lib"]) ;
+            "link dir outside"
+        )]
+        #[test_case(
+            CompileLocallyReason::ProfileUse,
+            compilation(&["-C", "profile-use=/ws/app/pgo.profdata"]) ;
+            "profile use"
+        )]
+        #[test_case(
+            CompileLocallyReason::ProfileUse,
+            compilation(&["-C", "profile-sample-use=/ws/app/perf.prof"]) ;
+            "profile sample use"
+        )]
+        #[test_case(
+            CompileLocallyReason::ProfileUse,
+            compilation(&["-Z", "profile-sample-use=/ws/app/perf.prof"]) ;
+            "unstable profile sample use"
+        )]
+        #[test_case(
+            CompileLocallyReason::AbsolutePathInOption,
+            compilation(&["-Z", "codegen-backend=/opt/cg.so"]) ;
+            "absolute path in a -Z option"
+        )]
+        #[test_case(
+            CompileLocallyReason::RemapPathPrefix,
+            compilation(&["--remap-path-prefix", "/ws/app=/build"]) ;
+            "remap path prefix"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnexpectedCargoLayout,
+            with(compilation(&[]), |c| c.outputs.clear()) ;
+            "no outputs"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnexpectedCargoLayout,
+            with(compilation(&[]), |c| {
+                c.outputs.get_mut("link").unwrap().path =
+                    "/ws/app/target/debug/examples/libfoo-abc.rlib".into();
+            }) ;
+            "output dir not deps"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnexpectedCargoLayout,
+            compilation(&["-L", "dependency=/ws/other/target/debug/deps"]) ;
+            "deps dirs in two target dirs"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnexpectedCargoLayout,
+            compilation(&["-L", "dependency=/other/debug/deps"]) ;
+            "build root holds the cwd"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnexpectedCargoLayout,
+            compilation_in("ws/app", "src/lib.rs", &[]) ;
+            "relative cwd"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnexpectedCargoLayout,
+            compilation_in("/ws/other/../app", "src/lib.rs", &[]) ;
+            "parent traversal in cwd"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnexpectedCargoLayout,
+            with(compilation(&[]), |c| {
+                c.outputs.get_mut("link").unwrap().path =
+                    "target/debug/deps/../deps/libfoo-abc.rlib".into();
+            }) ;
+            "parent traversal in output"
+        )]
+        #[test_case(
+            CompileLocallyReason::PathOutsideInputRoot,
+            compilation(&["-L", "dependency=target/../target/debug/deps"]) ;
+            "parent traversal in dependency directory"
+        )]
+        #[test_case(
+            CompileLocallyReason::PathOutsideInputRoot,
+            compilation_in(CWD, "src/../lib.rs", &[]) ;
+            "parent traversal in crate root"
+        )]
+        #[test_case(
+            CompileLocallyReason::SourceOutsideInputRoot,
+            with(compilation(&[]), |c| c.inputs.push("src/../data.json".into())) ;
+            "parent traversal in source input"
+        )]
+        fn test_not_eligible_compiles(reason: CompileLocallyReason, compilation: RustCompilation) {
+            match map_for_reapi(&compilation) {
+                Ok(compile) => panic!("eligible: {compile:?}"),
+                Err(e) => assert_eq!(reason, e.reason),
+            }
+        }
     }
 }

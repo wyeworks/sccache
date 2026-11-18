@@ -36,3 +36,7 @@ mod mapping;
 mod test;
 
 pub(crate) use bazel_remote_apis as proto;
+
+pub(crate) use mapping::{
+    CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, normalize_absolute,
+};
