@@ -393,6 +393,8 @@ pub struct ParsedArguments {
 pub struct RustCompilation {
     /// The path to the rustc executable, not the rustup proxy.
     executable: PathBuf,
+    #[cfg(feature = "reapi")]
+    env_deps: Vec<(OsString, OsString)>,
     /// The host triple for this rustc.
     host: String,
     /// The sysroot for this rustc
@@ -2081,6 +2083,8 @@ where
             key: m.finish(),
             compilation: Box::new(RustCompilation {
                 executable: self.executable.clone(),
+                #[cfg(feature = "reapi")]
+                env_deps,
                 host: self.host.clone(),
                 sysroot: self.sysroot.clone(),
                 #[cfg(feature = "dist-client")]
@@ -2325,7 +2329,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 #[cfg(feature = "reapi")]
 mod reapi_mapping {
     use super::*;
-    use crate::reapi::{CompileLocallyReason, PathMapper, normalize_absolute};
+    use crate::reapi::{ActionEnv, CompileLocallyReason, PathMapper, normalize_absolute};
 
     pub(super) fn map_for_reapi(
         compilation: &RustCompilation,
@@ -2552,6 +2556,17 @@ mod reapi_mapping {
                 })?;
             input_root_files.push(normalized);
         }
+        // Custom target files found through RUST_TARGET_PATH are absent from the input root.
+        if compilation
+            .env_vars
+            .iter()
+            .any(|(name, _)| name == "RUST_TARGET_PATH")
+        {
+            return Err(NotEligible::new(
+                CompileLocallyReason::CustomTargetSpec,
+                anyhow!("RUST_TARGET_PATH is set"),
+            ));
+        }
         // Always pass the target explicitly; the worker's host triple may differ.
         let target_triple = match target_triple {
             Some(target_triple) => target_triple,
@@ -2560,6 +2575,8 @@ mod reapi_mapping {
                 compilation.host.clone()
             }
         };
+
+        let env = action_env(compilation, &path_mapper, &target_triple)?;
 
         input_root_files.sort();
         input_root_files.dedup();
@@ -2582,9 +2599,152 @@ mod reapi_mapping {
             arguments,
             mapped_crate_root,
             target_triple,
+            env,
             input_root_files,
             outputs,
         })
+    }
+    // Cargo path variables need worker-absolute values, not client paths.
+    const CARGO_PATH_VARS: [&str; 4] = [
+        "CARGO_MANIFEST_DIR",
+        "CARGO_MANIFEST_PATH",
+        "OUT_DIR",
+        "CARGO_TARGET_TMPDIR",
+    ];
+
+    // Forward implicit compiler inputs and dependencies reported by rustc's dep-info.
+    fn action_env(
+        compilation: &RustCompilation,
+        path_mapper: &PathMapper,
+        target_triple: &str,
+    ) -> StdResult<ActionEnv, NotEligible> {
+        let mut env = ActionEnv::default();
+        let map_path_var = |name: &str, value: &str| {
+            let mapped = if value.is_empty() {
+                None
+            } else {
+                path_mapper.to_input_root(Path::new(value))
+            };
+            mapped
+                .map(|relative| (name.to_owned(), relative))
+                .ok_or_else(|| {
+                    NotEligible::new(
+                        CompileLocallyReason::PathOutsideInputRoot,
+                        anyhow!("unmappable path variable {name}"),
+                    )
+                })
+        };
+        for (name, value) in &compilation.env_vars {
+            let is_env_dep = compilation
+                .env_deps
+                .iter()
+                .any(|(dep_name, _)| dep_name == name);
+            let Some(name) = name.to_str() else {
+                if is_env_dep {
+                    return Err(NotEligible::new(
+                        CompileLocallyReason::NonUtf8EnvVar,
+                        anyhow!("{name:?}"),
+                    ));
+                }
+                continue;
+            };
+            let implicit = is_implicit_env_var(name, target_triple);
+            if !implicit && !is_env_dep {
+                continue;
+            }
+            let value = value.to_str().ok_or_else(|| {
+                NotEligible::new(CompileLocallyReason::NonUtf8EnvVar, anyhow!("{name}"))
+            })?;
+            match name {
+                name if CARGO_PATH_VARS.contains(&name) => {
+                    env.path_vars.push(map_path_var(name, value)?);
+                }
+                _ if implicit => {
+                    env.vars.push((name.to_owned(), value.to_owned()));
+                }
+                _ if Path::new(value).is_absolute() => {
+                    env.path_vars.push(map_path_var(name, value)?);
+                }
+                _ => env.vars.push((name.to_owned(), value.to_owned())),
+            }
+        }
+        // Preserve local option_env! absence even if the worker defines the variable.
+        env.unset_vars = compilation
+            .env_deps
+            .iter()
+            .filter(|(dep_name, _)| {
+                !compilation
+                    .env_vars
+                    .iter()
+                    .any(|(name, _)| name == dep_name)
+            })
+            .map(|(dep_name, _)| {
+                dep_name.to_str().map(str::to_owned).ok_or_else(|| {
+                    NotEligible::new(CompileLocallyReason::NonUtf8EnvVar, anyhow!("{dep_name:?}"))
+                })
+            })
+            .collect::<StdResult<_, _>>()?;
+        let mut names = env
+            .vars
+            .iter()
+            .chain(&env.path_vars)
+            .map(|(name, _)| name)
+            .chain(&env.unset_vars);
+        if let Some(name) = names.find(|name| !reaches_rustc_unchanged(name)) {
+            return Err(NotEligible::new(
+                CompileLocallyReason::UnsupportedEnvVarName,
+                anyhow!("{name}"),
+            ));
+        }
+        env.vars.sort();
+        env.vars.dedup();
+        env.path_vars.sort();
+        env.path_vars.dedup();
+        env.unset_vars.sort();
+        env.unset_vars.dedup();
+        Ok(env)
+    }
+
+    fn is_implicit_env_var(name: &str, target_triple: &str) -> bool {
+        match name {
+            "CARGO_CRATE_NAME"
+            | "CARGO_PRIMARY_PACKAGE"
+            | "CARGO_BIN_NAME"
+            | "RUSTC_BOOTSTRAP"
+            | "RUSTC_FORCE_RUSTC_VERSION" => true,
+            // Apple deployment targets affect rustc without appearing in dep-info.
+            "MACOSX_DEPLOYMENT_TARGET"
+            | "IPHONEOS_DEPLOYMENT_TARGET"
+            | "TVOS_DEPLOYMENT_TARGET"
+            | "WATCHOS_DEPLOYMENT_TARGET"
+            | "XROS_DEPLOYMENT_TARGET" => target_triple.contains("-apple-"),
+            _ => CARGO_PATH_VARS.contains(&name) || name.starts_with("CARGO_PKG_"),
+        }
+    }
+
+    // Shell-owned variables and invalid shell identifiers cannot be preserved by the wrapper.
+    fn reaches_rustc_unchanged(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !matches!(
+                name,
+                "PWD"
+                    | "OLDPWD"
+                    | "LD_LIBRARY_PATH"
+                    | "DYLD_LIBRARY_PATH"
+                    | "IFS"
+                    | "SHLVL"
+                    | "_"
+                    | "UID"
+                    | "EUID"
+                    | "PPID"
+                    | "SHELLOPTS"
+                    | "BASHOPTS"
+                    | "BASH_VERSINFO"
+            )
     }
 }
 
@@ -5164,7 +5324,8 @@ foo.rs:
     mod reapi_mapping {
         use super::*;
         use crate::compiler::rust::reapi_mapping::{deps_dir_base, map_for_reapi};
-        use crate::reapi::{CompileLocallyReason, ReapiCompile};
+        use crate::reapi::{ActionEnv, CompileLocallyReason, ReapiCompile};
+        use std::os::unix::ffi::OsStringExt;
         use test_case::test_case;
 
         const CWD: &str = "/ws/app";
@@ -5201,6 +5362,7 @@ foo.rs:
             };
             RustCompilation {
                 executable: "/toolchain/bin/rustc".into(),
+                env_deps: vec![],
                 host: HOST.to_owned(),
                 sysroot: "/toolchain".into(),
                 #[cfg(feature = "dist-client")]
@@ -5231,6 +5393,38 @@ foo.rs:
 
         fn compilation(extra: &[&str]) -> RustCompilation {
             compilation_in(CWD, "src/lib.rs", extra)
+        }
+
+        fn with_env(
+            mut compilation: RustCompilation,
+            vars: Vec<(OsString, OsString)>,
+            env_deps: &[&str],
+        ) -> RustCompilation {
+            compilation.env_deps = env_deps
+                .iter()
+                .map(|dep| {
+                    let value = vars.iter().find(|(name, _)| name == dep);
+                    (
+                        dep.into(),
+                        value.map_or_else(OsString::new, |(_, v)| v.clone()),
+                    )
+                })
+                .collect();
+            compilation.env_vars = vars;
+            compilation
+        }
+
+        fn env(vars: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+            vars.iter().map(|(k, v)| (k.into(), v.into())).collect()
+        }
+
+        fn owned(vars: &[(&str, &str)]) -> Vec<(String, String)> {
+            let mut vars: Vec<_> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            vars.sort();
+            vars
         }
 
         fn with(
@@ -5448,6 +5642,296 @@ foo.rs:
         }
 
         #[test]
+        fn test_passes_cargo_and_rustc_vars_and_the_vars_the_crate_reads() {
+            let compilation = with_env(
+                compilation(&[]),
+                env(&[
+                    ("CARGO_MANIFEST_DIR", CWD),
+                    ("OUT_DIR", "/ws/app/target/debug/build/foo-1/out"),
+                    ("CARGO_PKG_NAME", "foo"),
+                    ("CARGO_PKG_AUTHORS", "Ferris"),
+                    ("CARGO_CRATE_NAME", "foo"),
+                    ("CARGO_PRIMARY_PACKAGE", "1"),
+                    ("RUSTC_BOOTSTRAP", "1"),
+                    ("HOME", "/home/me"),
+                    ("FOO_LEVEL", "3"),
+                    ("FOO_DATA", "/ws/app/data"),
+                    ("UNREAD", "x"),
+                    ("GITHUB_TOKEN", "ghp_x"),
+                ]),
+                &["FOO_LEVEL", "FOO_DATA", "CARGO_PKG_AUTHORS"],
+            );
+            let env = map_for_reapi(&compilation).unwrap().env;
+            assert_eq!(
+                owned(&[
+                    ("CARGO_MANIFEST_DIR", "."),
+                    ("OUT_DIR", ".sccache-build/debug/build/foo-1/out"),
+                    ("FOO_DATA", "data"),
+                ]),
+                env.path_vars
+            );
+            assert_eq!(
+                owned(&[
+                    ("CARGO_PKG_NAME", "foo"),
+                    ("CARGO_PKG_AUTHORS", "Ferris"),
+                    ("CARGO_CRATE_NAME", "foo"),
+                    ("CARGO_PRIMARY_PACKAGE", "1"),
+                    ("RUSTC_BOOTSTRAP", "1"),
+                    ("FOO_LEVEL", "3"),
+                ]),
+                env.vars
+            );
+        }
+
+        #[test]
+        fn test_vars_the_crate_reads_that_are_unset_stay_unset() {
+            let compilation = with_env(compilation(&[]), env(&[("CI", "1")]), &["HOSTNAME"]);
+            let env = map_for_reapi(&compilation).unwrap().env;
+            assert_eq!(vec!["HOSTNAME".to_owned()], env.unset_vars);
+            assert!(env.vars.is_empty(), "{env:?}");
+        }
+
+        #[test_case("RUSTC_BOOTSTRAP", HOST ; "rustc setting")]
+        #[test_case("CARGO_PKG_NAME", HOST ; "cargo metadata")]
+        #[test_case("MACOSX_DEPLOYMENT_TARGET", "aarch64-apple-darwin" ; "apple deployment target")]
+        fn test_non_utf8_forwarded_environment_is_rejected(name: &str, target: &str) {
+            let compilation = with_env(
+                compilation(&["--target", target]),
+                vec![(name.into(), OsString::from_vec(vec![0xff]))],
+                &[],
+            );
+            let error = map_for_reapi(&compilation).unwrap_err();
+            assert_eq!(CompileLocallyReason::NonUtf8EnvVar, error.reason);
+        }
+
+        #[test]
+        fn test_missing_non_utf8_env_dependency_is_rejected() {
+            let mut compilation = compilation(&[]);
+            compilation
+                .env_deps
+                .push((OsString::from_vec(vec![0xff]), OsString::new()));
+            let error = map_for_reapi(&compilation).unwrap_err();
+            assert_eq!(CompileLocallyReason::NonUtf8EnvVar, error.reason);
+        }
+
+        #[test]
+        fn test_unread_non_utf8_variables_are_ignored() {
+            let compilation = with_env(
+                compilation(&[]),
+                vec![
+                    ("HOME".into(), OsString::from_vec(vec![0xff])),
+                    (OsString::from_vec(vec![0xff]), "unused".into()),
+                    (
+                        "MACOSX_DEPLOYMENT_TARGET".into(),
+                        OsString::from_vec(vec![0xff]),
+                    ),
+                ],
+                &[],
+            );
+            assert_eq!(
+                ActionEnv::default(),
+                map_for_reapi(&compilation).unwrap().env
+            );
+        }
+
+        #[test]
+        fn test_empty_and_missing_values_remain_distinct() {
+            let compilation = with_env(
+                compilation(&[]),
+                env(&[("PRESENT", "")]),
+                &["ABSENT", "PRESENT"],
+            );
+            let env = map_for_reapi(&compilation).unwrap().env;
+            assert_eq!(owned(&[("PRESENT", "")]), env.vars);
+            assert_eq!(vec!["ABSENT".to_owned()], env.unset_vars);
+        }
+
+        #[test]
+        fn test_environment_order_and_duplicate_entries_do_not_change_mapping() {
+            let vars = env(&[
+                ("CARGO_MANIFEST_DIR", CWD),
+                ("CARGO_MANIFEST_DIR", CWD),
+                ("OUT_DIR", "/ws/app/target/debug/build/foo/out"),
+                ("VALUE", "x"),
+                ("VALUE", "x"),
+                ("CARGO_PKG_NAME", "foo"),
+            ]);
+            let first = with_env(
+                compilation(&[]),
+                vars.clone(),
+                &["Z_UNSET", "VALUE", "A_UNSET", "VALUE", "A_UNSET"],
+            );
+            let mut reversed = vars;
+            reversed.reverse();
+            let second = with_env(compilation(&[]), reversed, &["A_UNSET", "Z_UNSET", "VALUE"]);
+            let first = map_for_reapi(&first).unwrap().env;
+            let second = map_for_reapi(&second).unwrap().env;
+            assert_eq!(first, second);
+            assert_eq!(
+                owned(&[("CARGO_PKG_NAME", "foo"), ("VALUE", "x")]),
+                first.vars
+            );
+            assert_eq!(2, first.path_vars.len());
+            assert_eq!(
+                vec!["A_UNSET".to_owned(), "Z_UNSET".to_owned()],
+                first.unset_vars
+            );
+        }
+
+        #[test]
+        fn test_two_checkouts_give_the_same_mapped_environment() {
+            let mapped: Vec<_> = ["/first/ws/member", "/second/ws/member"]
+                .into_iter()
+                .map(|cwd| {
+                    let target = Path::new(cwd).parent().unwrap().join("target");
+                    let compilation = with_env(
+                        compilation_with_target_dir(
+                            cwd,
+                            target.to_str().unwrap(),
+                            "src/lib.rs",
+                            &[],
+                        ),
+                        env(&[
+                            ("CARGO_MANIFEST_DIR", cwd),
+                            ("CARGO_MANIFEST_PATH", &format!("{cwd}/Cargo.toml")),
+                            (
+                                "OUT_DIR",
+                                target.join("debug/build/foo/out").to_str().unwrap(),
+                            ),
+                            ("DATA", &format!("{cwd}/data")),
+                        ]),
+                        &["DATA"],
+                    );
+                    map_for_reapi(&compilation).unwrap().env
+                })
+                .collect();
+            assert_eq!(mapped[0], mapped[1]);
+            assert_eq!(
+                owned(&[
+                    ("CARGO_MANIFEST_DIR", "."),
+                    ("CARGO_MANIFEST_PATH", "Cargo.toml"),
+                    ("OUT_DIR", ".sccache-build/debug/build/foo/out"),
+                    ("DATA", "data"),
+                ]),
+                mapped[0].path_vars
+            );
+        }
+
+        #[test]
+        fn test_dep_info_environment_reaches_the_mapped_compilation() {
+            let fixture = TestFixture::new();
+            fixture.touch("foo.rs").unwrap();
+            let args = ovec![
+                "foo.rs",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "rlib",
+                "--emit",
+                "link",
+                "--out-dir",
+                "target/debug/deps"
+            ];
+            let parsed_args = match parse_arguments(&args, fixture.tempdir.path()) {
+                CompilerArguments::Ok(parsed) => parsed,
+                other => panic!("unexpected parse result: {other:?}"),
+            };
+            let mut hasher = RustHasher {
+                executable: "rustc".into(),
+                host: HOST.to_owned(),
+                version: TEST_RUSTC_VERSION.to_owned(),
+                sysroot: fixture.tempdir.path().join("sysroot"),
+                #[cfg(feature = "dist-client")]
+                target_libdir: fixture
+                    .tempdir
+                    .path()
+                    .join("sysroot/lib/rustlib/fake-target/lib"),
+                compiler_shlibs_digests: vec![],
+                dist_archive: None,
+                #[cfg(feature = "dist-client")]
+                rlib_dep_reader: None,
+                parsed_args,
+            };
+            let creator = new_creator();
+            mock_dep_info_with_env(
+                &creator,
+                &["foo.rs"],
+                &[
+                    ("BUILD_MODE", "release".into()),
+                    ("OPTIONAL", OsString::new()),
+                ],
+            );
+            mock_file_names(&creator, &["libfoo.rlib"]);
+            let runtime = single_threaded_runtime();
+            let pool = runtime.handle().clone();
+            let hashed = hasher
+                .generate_hash_key(
+                    &creator,
+                    fixture.tempdir.path().to_owned(),
+                    env(&[("BUILD_MODE", "release"), ("UNREAD", "unused")]),
+                    false,
+                    &pool,
+                    false,
+                    Arc::new(MockStorage::new(None, false)),
+                    CacheControl::Default,
+                )
+                .wait()
+                .unwrap();
+            let mapped = hashed.compilation.map_for_reapi().unwrap();
+            assert_eq!(owned(&[("BUILD_MODE", "release")]), mapped.env.vars);
+            assert_eq!(vec!["OPTIONAL".to_owned()], mapped.env.unset_vars);
+        }
+
+        #[test_case("OUT_DIR", "target/../data", false ; "relative cargo path with parent traversal")]
+        #[test_case("OUT_DIR", "/ws/app/target/../data", false ; "absolute cargo path with parent traversal")]
+        #[test_case("DATA", "/ws/app/src/../data", true ; "tracked path with parent traversal")]
+        #[test_case("OUT_DIR", "", false ; "empty cargo path")]
+        #[test_case("DATA", "/elsewhere/private-value", true ; "outside input root")]
+        fn test_unmappable_environment_paths_are_rejected_without_values(
+            name: &str,
+            value: &str,
+            tracked: bool,
+        ) {
+            let deps = if tracked { vec![name] } else { vec![] };
+            let compilation = with_env(compilation(&[]), env(&[(name, value)]), &deps);
+            let error = map_for_reapi(&compilation).unwrap_err();
+            assert_eq!(CompileLocallyReason::PathOutsideInputRoot, error.reason);
+            assert_eq!(
+                format!("unmappable path variable {name}"),
+                error.detail.unwrap().to_string()
+            );
+        }
+
+        #[test_case("KEYBOARD_LAYOUT", "us" ; "ordinary key name")]
+        #[test_case("SENTRY_API_TOKEN", "test-token" ; "token name")]
+        #[test_case("AWS_ACCESS_KEY_ID", "test-key" ; "key name")]
+        #[test_case("SENTRY_DSN", "https://example.com/" ; "dsn name")]
+        #[test_case("DATABASE_URL", "postgres://app:test-password@db:5432/app" ; "credentialed URL")]
+        fn test_tracked_environment_values_are_preserved(name: &str, value: &str) {
+            let compilation = with_env(
+                compilation(&[]),
+                env(&[(name, value), ("UNREAD_TOKEN", "unused")]),
+                &[name],
+            );
+            let mapped = map_for_reapi(&compilation).unwrap().env;
+            assert_eq!(owned(&[(name, value)]), mapped.vars);
+            assert!(mapped.path_vars.is_empty());
+            assert!(mapped.unset_vars.is_empty());
+        }
+
+        #[test_case("x86_64-unknown-linux-gnu", false ; "linux")]
+        #[test_case("aarch64-apple-darwin", true ; "macos")]
+        fn test_apple_deployment_targets_are_passed_for_apple_targets(target: &str, passed: bool) {
+            let compilation = with_env(
+                compilation(&["--target", target]),
+                env(&[("MACOSX_DEPLOYMENT_TARGET", "11.0")]),
+                &[],
+            );
+            let env = map_for_reapi(&compilation).unwrap().env;
+            assert_eq!(passed, !env.vars.is_empty(), "{env:?}");
+        }
+
+        #[test]
         fn test_passes_the_target_triple() {
             let compile = map_for_reapi(&compilation(&[])).unwrap();
             assert_eq!(HOST, compile.target_triple);
@@ -5649,6 +6133,59 @@ foo.rs:
             CompileLocallyReason::SourceOutsideInputRoot,
             with(compilation(&[]), |c| c.inputs.push("src/../data.json".into())) ;
             "parent traversal in source input"
+        )]
+        #[test_case(
+            CompileLocallyReason::PathOutsideInputRoot,
+            with_env(compilation(&[]), env(&[("CARGO_MANIFEST_DIR", "/elsewhere")]), &[]) ;
+            "cargo path var outside"
+        )]
+        #[test_case(
+            CompileLocallyReason::PathOutsideInputRoot,
+            with_env(compilation(&[]), env(&[("FOO_DIR", "/elsewhere")]), &["FOO_DIR"]) ;
+            "path var the crate reads outside"
+        )]
+        #[test_case(
+            CompileLocallyReason::NonUtf8EnvVar,
+            with_env(
+                compilation(&[]),
+                vec![("FOO_LEVEL".into(), OsString::from_vec(vec![0xff]))],
+                &["FOO_LEVEL"],
+            ) ;
+            "non-UTF-8 var the crate reads"
+        )]
+        #[test_case(
+            CompileLocallyReason::NonUtf8EnvVar,
+            with_env(
+                compilation(&[]),
+                vec![("OUT_DIR".into(), OsString::from_vec(vec![0xff]))],
+                &[],
+            ) ;
+            "non-UTF-8 cargo path var"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnsupportedEnvVarName,
+            with_env(compilation(&[]), env(&[("FOO-LEVEL", "1")]), &["FOO-LEVEL"]) ;
+            "var name a shell drops"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnsupportedEnvVarName,
+            with_env(compilation(&[]), env(&[("PWD", "/ws/app")]), &["PWD"]) ;
+            "var the command sets"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnsupportedEnvVarName,
+            with_env(compilation(&[]), env(&[]), &["FOO-LEVEL"]) ;
+            "unset var name a shell can't unset"
+        )]
+        #[test_case(
+            CompileLocallyReason::UnsupportedEnvVarName,
+            with_env(compilation(&[]), env(&[]), &["UID"]) ;
+            "unset var bash can't unset"
+        )]
+        #[test_case(
+            CompileLocallyReason::CustomTargetSpec,
+            with_env(compilation(&[]), env(&[("RUST_TARGET_PATH", "/specs")]), &[]) ;
+            "target spec path"
         )]
         fn test_not_eligible_compiles(reason: CompileLocallyReason, compilation: RustCompilation) {
             match map_for_reapi(&compilation) {

@@ -32,8 +32,18 @@ pub struct ReapiCompile {
     /// preserves their spelling in its outputs. These are passed separately.
     pub(crate) mapped_crate_root: Option<String>,
     pub(crate) target_triple: String,
+    pub(crate) env: ActionEnv,
     pub(crate) input_root_files: Vec<PathBuf>,
     pub(crate) outputs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ActionEnv {
+    pub(crate) vars: Vec<(String, String)>,
+    /// Input-root-relative paths, expanded to absolute worker paths by the command.
+    pub(crate) path_vars: Vec<(String, String)>,
+    /// Preserve missing option_env! values even if the worker environment defines them.
+    pub(crate) unset_vars: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -74,6 +84,8 @@ pub(crate) enum CompileLocallyReason {
     NativeCpu,
     ProfileUse,
     RemapPathPrefix,
+    NonUtf8EnvVar,
+    UnsupportedEnvVarName,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -91,6 +103,8 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::NativeCpu => "-C target-cpu=native or -Z tune-cpu=native",
             Self::ProfileUse => "-C profile-use or -C profile-sample-use",
             Self::RemapPathPrefix => "--remap-path-prefix",
+            Self::NonUtf8EnvVar => "non-UTF-8 env var",
+            Self::UnsupportedEnvVarName => "env var the REAPI command can't pass to rustc",
         })
     }
 }
