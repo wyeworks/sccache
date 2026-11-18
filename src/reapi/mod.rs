@@ -32,6 +32,9 @@ mod input_root;
 #[allow(dead_code)]
 mod mapping;
 
+#[allow(dead_code)]
+mod remote_compile;
+
 #[cfg(test)]
 mod test;
 

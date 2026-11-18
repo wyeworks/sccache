@@ -22,7 +22,8 @@ use crate::errors::*;
 use std::path::{Component, Path, PathBuf};
 
 /// The input root's directory for files under the local build root.
-const BUILD_ROOT_DIR: &str = ".sccache-build";
+pub(super) const BUILD_ROOT_DIR: &str = ".sccache-build";
+pub(super) const TOOLCHAIN_DIR: &str = ".sccache-toolchain";
 
 #[derive(Debug)]
 pub struct ReapiCompile {
@@ -141,8 +142,8 @@ impl PathMapper {
             });
         }
         let relative = absolute.strip_prefix(&cwd).ok()?;
-        // It would land in the build root's directory in the input root.
-        if relative.starts_with(BUILD_ROOT_DIR) {
+        // These directories are reserved for mapped build outputs and toolchain files.
+        if relative.starts_with(BUILD_ROOT_DIR) || relative.starts_with(TOOLCHAIN_DIR) {
             return None;
         }
         let relative = input_root_path(relative)?;
@@ -172,7 +173,7 @@ pub(crate) fn normalize_absolute(path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-fn input_root_path(path: &Path) -> Option<String> {
+pub(super) fn input_root_path(path: &Path) -> Option<String> {
     path.components()
         .map(|component| match component {
             Component::Normal(name) => name.to_str(),
@@ -268,10 +269,20 @@ mod test {
             Some("target-other/lib.rlib".to_owned()),
             mapper.to_input_root(Path::new("target-other/lib.rlib"))
         );
-        for path in [".sccache-build", ".sccache-build/lib.rlib"] {
+        for path in [
+            ".sccache-build",
+            ".sccache-build/lib.rlib",
+            ".sccache-toolchain",
+            ".sccache-toolchain/bin/rustc",
+        ] {
             assert_eq!(None, mapper.to_input_root(Path::new(path)));
         }
-        for path in [".sccache-build-other/lib.rs", "src/.sccache-build/lib.rs"] {
+        for path in [
+            ".sccache-build-other/lib.rs",
+            "src/.sccache-build/lib.rs",
+            ".sccache-toolchain-other/lib.rs",
+            "src/.sccache-toolchain/lib.rs",
+        ] {
             assert_eq!(Some(path.to_owned()), mapper.to_input_root(Path::new(path)));
         }
     }
