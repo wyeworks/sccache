@@ -153,6 +153,85 @@ impl PathMapper {
             relative
         })
     }
+
+    /// Checks the inverse mapping before using a server-provided path locally.
+    pub(super) fn to_local(&self, path: &str) -> Option<PathBuf> {
+        let cwd = normalize_absolute(&self.cwd)?;
+        let build_root = normalize_absolute(&self.build_root)?;
+        let local = if path == BUILD_ROOT_DIR {
+            build_root
+        } else if let Some(relative) = path.strip_prefix(&format!("{BUILD_ROOT_DIR}/")) {
+            build_root.join(relative)
+        } else {
+            cwd.join(path)
+        };
+        let local = normalize_absolute(&local)?;
+        (self.to_input_root(&local).as_deref() == Some(path)).then_some(local)
+    }
+
+    /// Maps paths under `worker_root`, and input-root-relative paths under
+    /// [`BUILD_ROOT_DIR`], in an action's stdout or stderr to local paths. Only the start of
+    /// each path changes (the text around it doesn't matter).
+    pub(super) fn worker_paths_to_local(&self, text: &[u8], worker_root: &str) -> Vec<u8> {
+        if worker_root.is_empty() {
+            return text.to_vec();
+        }
+        let worker_root = worker_root.as_bytes();
+        let cwd = self.cwd.as_os_str().as_encoded_bytes();
+        let build_root = self.build_root.as_os_str().as_encoded_bytes();
+        let mut out = Vec::with_capacity(text.len());
+        let mut i = 0;
+        while i < text.len() {
+            if !starts_path(&text[..i]) {
+                out.push(text[i]);
+                i += 1;
+                continue;
+            }
+            let (in_worker_root, path) = match text[i..].strip_prefix(worker_root) {
+                Some([b'/', rest @ ..]) => (true, rest),
+                Some(rest) if rest.first().is_none_or(|&b| !is_path_byte(b)) => (true, rest),
+                Some(_) | None => (false, &text[i..]),
+            };
+            let skipped = text.len() - i - path.len();
+            if let Some(rest) = path.strip_prefix(BUILD_ROOT_DIR.as_bytes())
+                && rest.first().is_none_or(|&b| b == b'/' || !is_path_byte(b))
+            {
+                out.extend_from_slice(build_root);
+                i += skipped + BUILD_ROOT_DIR.len();
+            } else if in_worker_root {
+                out.extend_from_slice(cwd);
+                if skipped > worker_root.len() {
+                    out.push(b'/');
+                }
+                i += skipped;
+            } else {
+                out.push(text[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
+fn is_path_byte(b: u8) -> bool {
+    !b.is_ascii() || b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-')
+}
+
+/// Whether a path can start right after `before`: at the start, after a byte that can't be
+/// in a path, or after a terminal color code, which `--color=always` puts before paths.
+fn starts_path(before: &[u8]) -> bool {
+    match before.last() {
+        None => true,
+        Some(b'm') => {
+            let params = before[..before.len() - 1]
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_digit() || **b == b';')
+                .count();
+            before[..before.len() - 1 - params].ends_with(b"\x1b[")
+        }
+        Some(&b) => !is_path_byte(b),
+    }
 }
 
 pub(crate) fn normalize_absolute(path: &Path) -> Option<PathBuf> {
@@ -235,6 +314,54 @@ mod test {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_maps_input_root_paths_to_local() {
+        let mapper = path_mapper();
+        assert_eq!(
+            PathBuf::from("/ws/target/debug/deps/libfoo.rlib"),
+            mapper
+                .to_local(".sccache-build/debug/deps/libfoo.rlib")
+                .unwrap()
+        );
+        assert_eq!(
+            PathBuf::from("/ws/src/lib.rs"),
+            mapper.to_local("src/lib.rs").unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case(
+        "warning: in /up/src/lib.rs\n --> .sccache-build/debug/build/foo-2/out/gen.rs:3:5\n",
+        "warning: in /ws/src/lib.rs\n --> /ws/target/debug/build/foo-2/out/gen.rs:3:5\n" ;
+        "worker root and build root paths")]
+    #[test_case(
+        "/up/.sccache-build/debug/deps/libbar.rlib",
+        "/ws/target/debug/deps/libbar.rlib" ;
+        "build root under the worker root")]
+    #[test_case("cd /up: `/up` in /up", "cd /ws: `/ws` in /ws" ; "the worker root itself")]
+    #[test_case("\x1b[0m\x1b[1m/up/x", "\x1b[0m\x1b[1m/ws/x" ; "after a color code")]
+    #[test_case(
+        "/home/up/x /upper/x foo.sccache-build/x",
+        "/home/up/x /upper/x foo.sccache-build/x" ;
+        "only at the start of a path")]
+    fn test_worker_paths_map_to_local(worker_text: &str, local_text: &str) {
+        assert_eq!(
+            local_text,
+            String::from_utf8(path_mapper().worker_paths_to_local(worker_text.as_bytes(), "/up"))
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mapping_worker_paths_keeps_other_bytes() {
+        assert_eq!(
+            b"\xff /ws/x\xfe".as_slice(),
+            path_mapper().worker_paths_to_local(b"\xff /up/x\xfe", "/up")
+        );
+    }
+
     #[test]
     fn test_normalized_roots_and_external_build_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -312,6 +439,55 @@ mod test {
         ] {
             assert_eq!(None, mapper.to_input_root(Path::new("src/lib.rs")));
         }
+    }
+
+    #[test]
+    fn test_inverse_mapping_is_checked_and_uses_normalized_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("ws");
+        let build = dir.path().join("build");
+        let mapper = PathMapper::new(cwd.join("./"), build.join("./"));
+        for (remote, local) in [
+            (".", cwd.clone()),
+            ("src/lib.rs", cwd.join("src/lib.rs")),
+            (".sccache-build", build.clone()),
+            (
+                ".sccache-build/debug/lib.rlib",
+                build.join("debug/lib.rlib"),
+            ),
+        ] {
+            assert_eq!(mapper.to_local(remote), Some(local));
+        }
+        for path in [
+            "",
+            "../x",
+            "a/../x",
+            "a/./x",
+            "a//x",
+            "/outside/x",
+            ".sccache-toolchain/bin/rustc",
+            ".sccache-build/../x",
+            ".sccache-build//x",
+        ] {
+            assert_eq!(mapper.to_local(path), None, "{path}");
+        }
+        let mapper = PathMapper::new(cwd.clone(), cwd.join("target"));
+        assert_eq!(mapper.to_local("target/x"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_worker_text_mapping_preserves_unicode_boundaries_and_empty_roots() {
+        let mapper = path_mapper();
+        let text = "é/up/x /upé/x .sccache-buildé/x /up/日本語.rs";
+        assert_eq!(
+            mapper.worker_paths_to_local(text.as_bytes(), "/up"),
+            "é/up/x /upé/x .sccache-buildé/x /ws/日本語.rs".as_bytes()
+        );
+        assert_eq!(
+            mapper.worker_paths_to_local(b"unchanged /up/x", ""),
+            b"unchanged /up/x"
+        );
     }
 
     #[test]
