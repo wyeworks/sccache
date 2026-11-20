@@ -959,6 +959,15 @@ where
         Err(CompileLocallyReason::NotRust.into())
     }
 
+    /// May create a trimmed sysroot, call from a blocking thread.
+    #[cfg(feature = "reapi")]
+    fn reapi_local_compile_changes(
+        &self,
+        _sysroot_copies_dir: &Path,
+    ) -> Option<LocalCompileChanges> {
+        None
+    }
+
     /// Create a function that will create the inputs used to perform a distributed compilation
     #[cfg(feature = "dist-client")]
     fn into_dist_packagers(

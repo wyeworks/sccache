@@ -14,6 +14,8 @@
 
 use crate::cache::{FileObjectSource, Storage};
 use crate::compiler::args::*;
+#[cfg(feature = "reapi")]
+use crate::compiler::remote::LocalCompileChanges;
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
     CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
@@ -2324,13 +2326,25 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
     fn map_for_reapi(&self) -> StdResult<ReapiCompile, NotEligible> {
         reapi_mapping::map_for_reapi(self)
     }
+
+    #[cfg(feature = "reapi")]
+    fn reapi_local_compile_changes(
+        &self,
+        sysroot_copies_dir: &Path,
+    ) -> Option<LocalCompileChanges> {
+        reapi_mapping::reapi_local_compile_changes(self, sysroot_copies_dir)
+    }
 }
 
 #[cfg(feature = "reapi")]
 mod reapi_mapping {
     use super::*;
-    use crate::reapi::{ActionEnv, CompileLocallyReason, PathMapper, normalize_absolute};
+    use crate::compiler::remote::LocalArg;
+    use crate::reapi::{
+        ActionEnv, CompileLocallyReason, PathMapper, normalize_absolute, sysroot_copy,
+    };
     use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     pub(super) fn map_for_reapi(
         compilation: &RustCompilation,
@@ -2351,6 +2365,60 @@ mod reapi_mapping {
             ));
         }
         mapped_compile(compilation, path_mapper(compilation)?)
+    }
+
+    pub(super) fn reapi_local_compile_changes(
+        compilation: &RustCompilation,
+        sysroot_copies_dir: &Path,
+    ) -> Option<LocalCompileChanges> {
+        let is_rustc = compilation
+            .executable
+            .file_stem()
+            .is_some_and(|stem| stem == "rustc");
+        // Appended remaps would override user mappings. Drivers stay local too.
+        let remaps_paths = compilation
+            .arguments
+            .iter()
+            .any(|argument| argument.flag_str() == Some("--remap-path-prefix"));
+        if cfg!(windows) || !is_rustc || remaps_paths {
+            return None;
+        }
+        let path_mapper = path_mapper(compilation).ok()?;
+        let sysroot = match sysroot_copy(&compilation.sysroot, sysroot_copies_dir) {
+            Ok(sysroot) => sysroot,
+            Err(error) => {
+                // Sysroot failures usually affect every compile; warn once.
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if WARNED.swap(true, Ordering::Relaxed) {
+                    debug!("REAPI: failed to prepare the local sysroot: {error:#}");
+                } else {
+                    warn!(
+                        "REAPI: failed to prepare the local sysroot; keeping local compilation unchanged: {error:#}"
+                    );
+                }
+                return None;
+            }
+        };
+        let mut args: Vec<_> = path_mapper
+            .input_root_remap_args()
+            .into_iter()
+            .map(|arg| LocalArg {
+                hashed_as: arg.clone(),
+                arg,
+            })
+            .collect();
+        let mut sysroot_arg = OsString::from("--sysroot=");
+        sysroot_arg.push(sysroot);
+        args.push(LocalArg {
+            arg: sysroot_arg,
+            hashed_as: "--sysroot=<sysroot copy>".into(),
+        });
+        Some(LocalCompileChanges {
+            args,
+            stdout_stderr_mapper: Some(Box::new(move |text| {
+                path_mapper.input_root_paths_to_local(text)
+            })),
+        })
     }
 
     /// `dir` without its trailing `<profile>/deps`, or `None` if it doesn't end in `deps`.
@@ -4551,18 +4619,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             env_vars.push(("RUSTUP_HOME".into(), rustup_home));
         }
 
-        // Try to find rustc via which first, then check CARGO_HOME.
-        // This handles both standard development setups (rustc in PATH)
-        // and CI environments (rustc only in CARGO_HOME/bin).
-        let rustc_path = if let Ok(path) = which::which("rustc") {
-            path
-        } else if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
-            PathBuf::from(cargo_home).join("bin").join("rustc")
-        } else {
-            panic!("rustc not found in PATH or CARGO_HOME")
-        };
-
-        let rlib_dep_reader = RlibDepReader::new_with_check(rustc_path, &env_vars);
+        let rlib_dep_reader = RlibDepReader::new_with_check(find_rustc(), &env_vars);
         let is_ok = rlib_dep_reader.is_ok();
         // Unwrap so the error is reported in the test output
         let _ = rlib_dep_reader.unwrap();
@@ -5538,8 +5595,10 @@ foo.rs:
     #[cfg(all(feature = "reapi", unix))]
     mod reapi_mapping {
         use super::*;
-        use crate::compiler::rust::reapi_mapping::{deps_dir_base, map_for_reapi};
-        use crate::reapi::{ActionEnv, CompileLocallyReason, ReapiCompile};
+        use crate::compiler::rust::reapi_mapping::{
+            deps_dir_base, map_for_reapi, reapi_local_compile_changes,
+        };
+        use crate::reapi::{ActionEnv, CompileLocallyReason, ReapiCompile, sysroot_copy};
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::symlink;
         use test_case::test_case;
@@ -6667,6 +6726,107 @@ foo.rs:
                 Ok(compile) => panic!("eligible: {compile:?}"),
                 Err(e) => assert_eq!(reason, e.reason),
             }
+        }
+
+        fn compilation_with_sysroot(dir: &Path, extra: &[&str]) -> RustCompilation {
+            let mut c = compilation(extra);
+            c.sysroot = dir.join("toolchain");
+            std::fs::create_dir_all(c.sysroot.join("lib/rustlib")).unwrap();
+            c
+        }
+
+        fn args_and_hashed(changes: &LocalCompileChanges) -> (Vec<String>, Vec<String>) {
+            changes
+                .args
+                .iter()
+                .map(|arg| {
+                    (
+                        arg.arg.to_str().unwrap().to_owned(),
+                        arg.hashed_as.to_str().unwrap().to_owned(),
+                    )
+                })
+                .unzip()
+        }
+
+        #[test]
+        fn test_local_compile_changes_remap_paths_and_use_a_sysroot_copy() {
+            let dir = tempfile::tempdir().unwrap();
+            let sysroot_copies_dir = dir.path().join("sysroot-copies");
+            let c = compilation_with_sysroot(dir.path(), &[]);
+            let changes = reapi_local_compile_changes(&c, &sysroot_copies_dir).unwrap();
+            let copy = sysroot_copy(&c.sysroot, &sysroot_copies_dir).unwrap();
+            assert_eq!(
+                [
+                    "--remap-path-prefix=/ws/app=.".to_owned(),
+                    "--remap-path-prefix=/ws/app/target=.sccache-build".to_owned(),
+                    format!("--sysroot={}", copy.display())
+                ],
+                args_and_hashed(&changes).0.as_slice()
+            );
+        }
+
+        #[test]
+        fn test_local_compile_changes_leave_the_sysroot_copy_out_of_the_hash_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let c = compilation_with_sysroot(dir.path(), &[]);
+            let changes =
+                reapi_local_compile_changes(&c, &dir.path().join("sysroot-copies")).unwrap();
+            assert_eq!(
+                [
+                    "--remap-path-prefix=/ws/app=.",
+                    "--remap-path-prefix=/ws/app/target=.sccache-build",
+                    "--sysroot=<sysroot copy>"
+                ],
+                args_and_hashed(&changes).1.as_slice()
+            );
+        }
+
+        #[test]
+        fn test_local_compile_changes_map_build_root_paths_in_stderr() {
+            let dir = tempfile::tempdir().unwrap();
+            let c = compilation_with_sysroot(dir.path(), &[]);
+            let changes =
+                reapi_local_compile_changes(&c, &dir.path().join("sysroot-copies")).unwrap();
+            let map = changes.stdout_stderr_mapper.unwrap();
+            assert_eq!(
+                b"--> /ws/app/target/debug/build/foo-1/out/gen.rs:3:5".as_slice(),
+                map(b"--> .sccache-build/debug/build/foo-1/out/gen.rs:3:5")
+            );
+        }
+
+        #[test]
+        fn test_no_local_compile_changes_for_a_compile_that_remaps_paths() {
+            let dir = tempfile::tempdir().unwrap();
+            let c = compilation_with_sysroot(dir.path(), &["--remap-path-prefix=/ws/app=/build"]);
+            assert!(reapi_local_compile_changes(&c, &dir.path().join("sysroot-copies")).is_none());
+            assert!(!dir.path().join("sysroot-copies").exists());
+        }
+
+        #[test]
+        fn test_no_local_compile_changes_for_a_rustc_driver() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = compilation_with_sysroot(dir.path(), &[]);
+            c.executable = "/toolchain/bin/clippy-driver".into();
+            assert!(reapi_local_compile_changes(&c, &dir.path().join("sysroot-copies")).is_none());
+            assert!(!dir.path().join("sysroot-copies").exists());
+        }
+
+        #[test]
+        fn test_no_local_compile_changes_without_a_sysroot_copy() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = compilation(&[]);
+            c.sysroot = dir.path().join("missing");
+            assert!(reapi_local_compile_changes(&c, &dir.path().join("sysroot-copies")).is_none());
+        }
+
+        #[test]
+        fn test_no_local_compile_changes_without_a_cargo_layout() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = compilation_with_sysroot(dir.path(), &[]);
+            c.outputs.get_mut("link").unwrap().path = "/ws/app/libfoo.rlib".into();
+            let copies = dir.path().join("sysroot-copies");
+            assert!(reapi_local_compile_changes(&c, &copies).is_none());
+            assert!(!copies.exists());
         }
     }
 }

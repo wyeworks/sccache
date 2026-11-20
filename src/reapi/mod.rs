@@ -35,6 +35,9 @@ mod mapping;
 #[allow(dead_code)]
 mod remote_compile;
 
+#[allow(dead_code)]
+mod sysroot;
+
 #[cfg(test)]
 mod test;
 
@@ -43,3 +46,4 @@ pub(crate) use bazel_remote_apis as proto;
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, normalize_absolute,
 };
+pub(crate) use sysroot::sysroot_copy;
