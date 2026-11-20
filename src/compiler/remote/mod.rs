@@ -17,6 +17,7 @@ use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use crate::server::SccacheService;
 use async_trait::async_trait;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
@@ -43,6 +44,29 @@ pub struct CompileRequest<'a, T: CommandCreatorSync> {
     pub weak_toolchain_key: String,
     pub output_name: String,
     pub hash_key_options: HashKeyOptions,
+    pub local_compile_changes: LocalCompileChanges,
+}
+
+pub type StdoutStderrMapper = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct LocalArg {
+    pub arg: OsString,
+    /// Only output-neutral differences, such as equivalent sysroot-copy paths,
+    /// may use a different value for the cache key.
+    pub hashed_as: OsString,
+}
+
+#[derive(Default)]
+pub struct LocalCompileChanges {
+    pub args: Vec<LocalArg>,
+    /// Executed output is mapped before caching; cache-hit diagnostics are already mapped.
+    pub stdout_stderr_mapper: Option<StdoutStderrMapper>,
+}
+
+pub struct PreparedCompile<T: CommandCreatorSync> {
+    pub compilation: Box<dyn Compilation<T>>,
+    pub local_compile_changes: LocalCompileChanges,
 }
 
 impl<T: CommandCreatorSync> CompileRequest<'_, T> {
@@ -55,6 +79,7 @@ impl<T: CommandCreatorSync> CompileRequest<'_, T> {
             weak_toolchain_key: _,
             output_name,
             hash_key_options,
+            local_compile_changes,
         } = self;
         let mut path_transformer = crate::dist::PathTransformer::new();
         let (command, _, cacheable) = compilation
@@ -64,13 +89,9 @@ impl<T: CommandCreatorSync> CompileRequest<'_, T> {
             )
             .context("Failed to generate compile commands")?;
         debug!("[{}]: Compiling locally", output_name);
-        let output = LocalCompile {
-            service,
-            creator,
-            command,
-        }
-        .run()
-        .await?;
+        let output = LocalCompile::new(service, creator, command, local_compile_changes)?
+            .run()
+            .await?;
         Ok(CompileOutcome {
             cacheable,
             execution: DistType::NoDist,
@@ -89,16 +110,50 @@ struct LocalCompile<'a, T: CommandCreatorSync> {
     service: &'a SccacheService<T>,
     creator: &'a T,
     command: Box<dyn CompileCommand<T>>,
+    stdout_stderr_mapper: Option<StdoutStderrMapper>,
 }
 
-impl<T: CommandCreatorSync> LocalCompile<'_, T> {
+impl<'a, T: CommandCreatorSync> LocalCompile<'a, T> {
+    fn new(
+        service: &'a SccacheService<T>,
+        creator: &'a T,
+        mut command: Box<dyn CompileCommand<T>>,
+        changes: LocalCompileChanges,
+    ) -> Result<Self> {
+        if !changes.args.is_empty() {
+            let args: Vec<_> = changes.args.into_iter().map(|arg| arg.arg).collect();
+            command.append_arguments(&args)?;
+        }
+        Ok(Self {
+            service,
+            creator,
+            command,
+            stdout_stderr_mapper: changes.stdout_stderr_mapper,
+        })
+    }
+
     #[cfg(feature = "dist-client")]
     fn executable(&self) -> PathBuf {
         self.command.get_executable()
     }
 
     async fn run(self) -> Result<process::Output> {
-        self.command.execute(self.service, self.creator).await
+        let result = self.command.execute(self.service, self.creator).await;
+        let Some(mapper) = self.stdout_stderr_mapper else {
+            return result;
+        };
+        let map = |mut output: process::Output| {
+            output.stdout = mapper(&output.stdout);
+            output.stderr = mapper(&output.stderr);
+            output
+        };
+        match result {
+            Ok(output) => Ok(map(output)),
+            Err(error) => match error.downcast::<ProcessError>() {
+                Ok(ProcessError(output)) => Err(ProcessError(map(output)).into()),
+                Err(error) => Err(error),
+            },
+        }
     }
 }
 
@@ -106,6 +161,15 @@ impl<T: CommandCreatorSync> LocalCompile<'_, T> {
 pub trait CompileExecutor<T: CommandCreatorSync>: Send + Sync {
     fn hash_key_options(&self) -> HashKeyOptions {
         HashKeyOptions::default()
+    }
+
+    /// Runs after input discovery, before the final cache key and lookup. Changes
+    /// must preserve the discovered inputs.
+    async fn prepare(&self, compilation: Box<dyn Compilation<T>>) -> Result<PreparedCompile<T>> {
+        Ok(PreparedCompile {
+            compilation,
+            local_compile_changes: LocalCompileChanges::default(),
+        })
     }
 
     /// Runs one compile and leaves successful outputs at their local paths. An

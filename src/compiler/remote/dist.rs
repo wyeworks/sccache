@@ -62,6 +62,7 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for DistExecutor {
             weak_toolchain_key,
             output_name,
             hash_key_options,
+            local_compile_changes,
         } = request;
         let mut path_transformer = dist::PathTransformer::new();
         let (local_command, dist_command, cacheable) = compilation
@@ -70,11 +71,8 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for DistExecutor {
                 hash_key_options.rewrite_includes_only,
             )
             .context("Failed to generate compile commands")?;
-        let local_compile = LocalCompile {
-            service,
-            creator,
-            command: local_command,
-        };
+        let local_compile =
+            LocalCompile::new(service, creator, local_command, local_compile_changes)?;
         let Some(command) = dist_command else {
             debug!("[{}]: Compiling locally", output_name);
             return Ok(CompileOutcome {

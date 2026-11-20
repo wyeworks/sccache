@@ -27,7 +27,7 @@ use crate::compiler::nvcc::Nvcc;
 use crate::compiler::nvcc::NvccHostCompiler;
 use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
-use crate::compiler::remote::execute_compile;
+use crate::compiler::remote::{LocalCompileChanges, PreparedCompile, execute_compile};
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
 use crate::compiler::{CompileExecutor, CompileOutcome, CompileRequest, HashKeyOptions};
@@ -101,6 +101,8 @@ where
     fn get_arguments(&self) -> Vec<OsString>;
     fn get_env_vars(&self) -> Vec<(OsString, OsString)>;
     fn get_cwd(&self) -> PathBuf;
+    /// Multi-process commands may reject additions to their argument lists.
+    fn append_arguments(&mut self, args: &[OsString]) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -142,6 +144,9 @@ where
     fn get_cwd(&self) -> PathBuf {
         self.cmd.get_cwd()
     }
+    fn append_arguments(&mut self, args: &[OsString]) -> Result<()> {
+        self.cmd.append_arguments(args)
+    }
 
     async fn execute(
         &self,
@@ -158,6 +163,7 @@ pub trait CompileCommandImpl: Send + Sync + 'static {
     fn get_arguments(&self) -> Vec<OsString>;
     fn get_env_vars(&self) -> Vec<(OsString, OsString)>;
     fn get_cwd(&self) -> PathBuf;
+    fn append_arguments(&mut self, args: &[OsString]) -> Result<()>;
 
     async fn execute<T>(
         &self,
@@ -197,6 +203,10 @@ impl CompileCommandImpl for SingleCompileCommand {
     }
     fn get_cwd(&self) -> PathBuf {
         self.cwd.clone()
+    }
+    fn append_arguments(&mut self, args: &[OsString]) -> Result<()> {
+        self.arguments.extend_from_slice(args);
+        Ok(())
     }
 
     async fn execute<T>(
@@ -632,6 +642,33 @@ where
                 weak_toolchain_key,
             }) => (key, compilation, weak_toolchain_key),
         };
+        let PreparedCompile {
+            compilation,
+            local_compile_changes,
+        } = match &executor {
+            Some(executor) => executor
+                .prepare(compilation)
+                .await
+                .context("Failed to prepare compilation")?,
+            None => PreparedCompile {
+                compilation,
+                local_compile_changes: LocalCompileChanges::default(),
+            },
+        };
+        // Changed compiler arguments must affect lookup as well as cache writes.
+        let key = if local_compile_changes.args.is_empty() {
+            key
+        } else {
+            let mut digest = Digest::new();
+            digest.update(b"sccache-local-compile-args-v1\0");
+            digest.update(key.as_bytes());
+            for arg in &local_compile_changes.args {
+                let bytes = arg.hashed_as.as_encoded_bytes();
+                digest.update(&(bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
+            digest.finish()
+        };
         debug!("[{}]: Hash key: {}", out_pretty, key);
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
@@ -798,6 +835,7 @@ where
                         weak_toolchain_key,
                         output_name: out_pretty.clone(),
                         hash_key_options,
+                        local_compile_changes,
                     },
                 )
                 .await?;
@@ -1866,6 +1904,7 @@ mod test {
     use crate::cache::{CacheMode, CacheRead};
     #[cfg(feature = "dist-client")]
     use crate::compiler::DistExecutor;
+    use crate::compiler::remote::{LocalArg, StdoutStderrMapper};
     use crate::config::PreprocessorCacheModeConfig;
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
@@ -3696,6 +3735,7 @@ LLVM version: 6.0",
     struct LocalTestExecutor {
         options: HashKeyOptions,
         hash_key_options_calls: Arc<AtomicUsize>,
+        prepare_calls: Arc<AtomicUsize>,
         execute_calls: Arc<AtomicUsize>,
     }
 
@@ -3704,6 +3744,17 @@ LLVM version: 6.0",
         fn hash_key_options(&self) -> HashKeyOptions {
             self.hash_key_options_calls.fetch_add(1, Ordering::Relaxed);
             self.options
+        }
+
+        async fn prepare(
+            &self,
+            compilation: Box<dyn Compilation<T>>,
+        ) -> Result<PreparedCompile<T>> {
+            self.prepare_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(PreparedCompile {
+                compilation,
+                local_compile_changes: LocalCompileChanges::default(),
+            })
         }
 
         async fn execute(&self, request: CompileRequest<'_, T>) -> Result<CompileOutcome> {
@@ -3782,6 +3833,7 @@ LLVM version: 6.0",
             other => panic!("Bad result from parse_arguments: {other:?}"),
         };
         let hash_key_options_calls = Arc::new(AtomicUsize::new(0));
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
         let execute_calls = Arc::new(AtomicUsize::new(0));
         let executor = Arc::new(LocalTestExecutor {
             options: HashKeyOptions {
@@ -3789,6 +3841,7 @@ LLVM version: 6.0",
                 rewrite_includes_only,
             },
             hash_key_options_calls: hash_key_options_calls.clone(),
+            prepare_calls: prepare_calls.clone(),
             execute_calls: execute_calls.clone(),
         });
         let (result, output) = runtime
@@ -3810,6 +3863,7 @@ LLVM version: 6.0",
         write.wait().unwrap();
         assert!(output.status.success());
         assert_eq!(1, hash_key_options_calls.load(Ordering::Relaxed));
+        assert_eq!(1, prepare_calls.load(Ordering::Relaxed));
         assert_eq!(1, execute_calls.load(Ordering::Relaxed));
 
         fs::remove_file(&object).unwrap();
@@ -3838,7 +3892,319 @@ LLVM version: 6.0",
         assert_eq!(b"file contents", fs::read(&object).unwrap().as_slice());
         assert_eq!(output.stdout, cached_output.stdout);
         assert_eq!(2, hash_key_options_calls.load(Ordering::Relaxed));
+        assert_eq!(2, prepare_calls.load(Ordering::Relaxed));
         assert_eq!(1, execute_calls.load(Ordering::Relaxed));
+    }
+    struct LocalCompileChangesExecutor {
+        args: Vec<LocalArg>,
+    }
+
+    #[async_trait]
+    impl<T: CommandCreatorSync> CompileExecutor<T> for LocalCompileChangesExecutor {
+        async fn prepare(
+            &self,
+            compilation: Box<dyn Compilation<T>>,
+        ) -> Result<PreparedCompile<T>> {
+            // Prefixing is deliberately non-idempotent, exposing double mapping on cache hits.
+            let mapper = (!self.args.is_empty()).then(|| {
+                Box::new(|text: &[u8]| {
+                    let mut mapped = b"mapped:".to_vec();
+                    mapped.extend_from_slice(text);
+                    mapped
+                }) as StdoutStderrMapper
+            });
+            Ok(PreparedCompile {
+                compilation,
+                local_compile_changes: LocalCompileChanges {
+                    args: self.args.clone(),
+                    stdout_stderr_mapper: mapper,
+                },
+            })
+        }
+
+        async fn execute(&self, request: CompileRequest<'_, T>) -> Result<CompileOutcome> {
+            request.execute_locally().await
+        }
+    }
+
+    type PreparationCreator = Arc<std::sync::Mutex<MockCommandCreator>>;
+
+    struct PreparationFixture {
+        f: TestFixture,
+        creator: PreparationCreator,
+        runtime: Runtime,
+        storage: Arc<DiskCache>,
+        service: server::SccacheService<PreparationCreator>,
+        hasher: Box<dyn CompilerHasher<PreparationCreator>>,
+        arguments: Vec<OsString>,
+    }
+
+    impl PreparationFixture {
+        fn new() -> Self {
+            drop(env_logger::try_init());
+            let creator = new_creator();
+            let f = TestFixture::new();
+            let gcc = f.mk_bin("gcc").unwrap();
+            let runtime = Runtime::new().unwrap();
+            let pool = runtime.handle().clone();
+            let storage = Arc::new(DiskCache::new(
+                f.tempdir.path().join("cache"),
+                u64::MAX,
+                &pool,
+                PreprocessorCacheModeConfig {
+                    use_preprocessor_cache_mode: false,
+                    ..Default::default()
+                },
+                CacheMode::ReadWrite,
+                vec![],
+            ));
+            fs::write(f.tempdir.path().join("foo.c"), "whatever").unwrap();
+            let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+            );
+            next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+            let c = get_compiler_info(
+                creator.clone(),
+                &gcc,
+                f.tempdir.path(),
+                &[],
+                &[],
+                &pool,
+                None,
+            )
+            .wait()
+            .unwrap()
+            .0;
+            let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+            let hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+                CompilerArguments::Ok(h) => h,
+                o => panic!("Bad result from parse_arguments: {:?}", o),
+            };
+            PreparationFixture {
+                f,
+                creator,
+                runtime,
+                storage,
+                service,
+                hasher,
+                arguments,
+            }
+        }
+
+        fn compile(
+            &mut self,
+            changes: Option<&[(&str, &str)]>,
+            exit_code: i32,
+        ) -> (bool, process::Output) {
+            next_command(
+                &self.creator,
+                Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+            );
+            let expected_args: Vec<OsString> = changes
+                .unwrap_or_default()
+                .iter()
+                .map(|(arg, _)| (*arg).into())
+                .collect();
+            let obj = self.f.tempdir.path().join("foo.o");
+            next_command_calls(&self.creator, move |args| {
+                assert!(args.ends_with(&expected_args), "{args:?}");
+                File::create(&obj)?.write_all(b"file contents")?;
+                Ok(MockChild::new(
+                    exit_status(exit_code),
+                    b"out \xffremapped/foo.c",
+                    b"in \xferemapped/foo.c",
+                ))
+            });
+            let executor = changes.map(|args| {
+                Arc::new(LocalCompileChangesExecutor {
+                    args: args
+                        .iter()
+                        .map(|(arg, hashed_as)| LocalArg {
+                            arg: (*arg).into(),
+                            hashed_as: (*hashed_as).into(),
+                        })
+                        .collect(),
+                }) as Arc<dyn CompileExecutor<PreparationCreator>>
+            });
+            let result = self.runtime.block_on(self.hasher.get_cached_or_compile(
+                &self.service,
+                executor,
+                self.creator.clone(),
+                self.storage.clone(),
+                self.arguments.clone(),
+                self.f.tempdir.path().to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                self.runtime.handle().clone(),
+            ));
+            match result {
+                Ok((CompileResult::CacheMiss(_, _, _, write), output)) => {
+                    write.wait().unwrap();
+                    (false, output)
+                }
+                Ok((CompileResult::CacheHit(_), output)) => {
+                    let mut creator = self.creator.lock().unwrap();
+                    assert_eq!(creator.children.len(), 1);
+                    creator.children.pop();
+                    (true, output)
+                }
+                Ok((other, _)) => panic!("Unexpected compile result: {other:?}"),
+                Err(error) => match error.downcast::<ProcessError>() {
+                    Ok(ProcessError(output)) => (false, output),
+                    Err(error) => panic!("Unexpected error: {error:#}"),
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn test_prepared_args_reach_the_local_compile_and_key() {
+        let mut fixture = PreparationFixture::new();
+        let first = [("--sysroot=/first", "--sysroot=<copy>")];
+        let second = [("--sysroot=/second", "--sysroot=<copy>")];
+        let different_key = [("--sysroot=/first", "--sysroot=<different>")];
+        assert!(!fixture.compile(Some(&first), 0).0);
+        assert!(fixture.compile(Some(&second), 0).0);
+        assert!(!fixture.compile(Some(&different_key), 0).0);
+    }
+
+    #[test]
+    fn test_prepared_arg_boundaries_are_part_of_the_key() {
+        let mut fixture = PreparationFixture::new();
+        let first = [("-DONE", "a\0b"), ("-DTWO", "c")];
+        let second = [("-DONE", "a"), ("-DTWO", "b\0c")];
+        assert!(!fixture.compile(Some(&first), 0).0);
+        assert!(!fixture.compile(Some(&second), 0).0);
+        assert!(fixture.compile(Some(&first), 0).0);
+    }
+
+    #[test]
+    fn test_default_preparation_keeps_existing_cache_keys() {
+        let mut fixture = PreparationFixture::new();
+        let (hit, original) = fixture.compile(None, 0);
+        assert!(!hit);
+        let (hit, prepared) = fixture.compile(Some(&[]), 0);
+        assert!(hit);
+        assert_eq!(original.stdout, prepared.stdout);
+        assert_eq!(original.stderr, prepared.stderr);
+    }
+
+    #[test]
+    fn test_local_mapper_maps_misses_and_hits_once_without_losing_bytes() {
+        let mut fixture = PreparationFixture::new();
+        for expected_hit in [false, true] {
+            let (hit, output) = fixture.compile(Some(&[("-DONE", "-DONE")]), 0);
+            assert_eq!(hit, expected_hit);
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"mapped:out \xffremapped/foo.c");
+            assert_eq!(output.stderr, b"mapped:in \xferemapped/foo.c");
+        }
+    }
+
+    #[test]
+    fn test_local_mapper_maps_failed_compiles() {
+        let mut fixture = PreparationFixture::new();
+        let (_, output) = fixture.compile(Some(&[("-DONE", "-DONE")]), 1);
+        assert!(!output.status.success());
+        assert_eq!(output.stdout, b"mapped:out \xffremapped/foo.c");
+        assert_eq!(output.stderr, b"mapped:in \xferemapped/foo.c");
+    }
+
+    struct FailingPreparationExecutor;
+
+    #[async_trait]
+    impl<T: CommandCreatorSync> CompileExecutor<T> for FailingPreparationExecutor {
+        async fn prepare(&self, _: Box<dyn Compilation<T>>) -> Result<PreparedCompile<T>> {
+            Err(std::io::Error::other("preparation failed").into())
+        }
+
+        async fn execute(&self, _: CompileRequest<'_, T>) -> Result<CompileOutcome> {
+            panic!("preparation failed before execution");
+        }
+    }
+
+    #[test]
+    fn test_preparation_failure_precedes_cache_lookup_and_preserves_the_error() {
+        let mut fixture = PreparationFixture::new();
+        next_command(
+            &fixture.creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        // Any cache lookup would panic because no response is queued.
+        let storage = Arc::new(MockStorage::new(None, false));
+        let error = fixture
+            .runtime
+            .block_on(fixture.hasher.get_cached_or_compile(
+                &fixture.service,
+                Some(Arc::new(FailingPreparationExecutor)),
+                fixture.creator.clone(),
+                storage,
+                fixture.arguments.clone(),
+                fixture.f.tempdir.path().to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                fixture.runtime.handle().clone(),
+            ))
+            .unwrap_err();
+        let error = error.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(error.to_string(), "preparation failed");
+    }
+
+    #[test]
+    fn test_local_mapper_preserves_non_process_errors() {
+        let mut fixture = PreparationFixture::new();
+        next_command(
+            &fixture.creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        let pool = fixture.runtime.handle().clone();
+        let HashResult {
+            compilation,
+            weak_toolchain_key,
+            ..
+        } = fixture
+            .runtime
+            .block_on(fixture.hasher.generate_hash_key(
+                &fixture.creator,
+                fixture.f.tempdir.path().to_path_buf(),
+                vec![],
+                false,
+                &pool,
+                false,
+                fixture.storage.clone(),
+                CacheControl::Default,
+            ))
+            .unwrap();
+        next_command(
+            &fixture.creator,
+            Err(std::io::Error::other("spawn failed").into()),
+        );
+        let result = fixture.runtime.block_on(
+            CompileRequest {
+                service: &fixture.service,
+                creator: &fixture.creator,
+                compilation,
+                cwd: fixture.f.tempdir.path().to_path_buf(),
+                weak_toolchain_key,
+                output_name: "foo.o".to_owned(),
+                hash_key_options: HashKeyOptions::default(),
+                local_compile_changes: LocalCompileChanges {
+                    args: vec![],
+                    stdout_stderr_mapper: Some(Box::new(|_| panic!("no process output to map"))),
+                },
+            }
+            .execute_locally(),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected the local spawn to fail"),
+        };
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().to_string(),
+            "spawn failed"
+        );
     }
 }
 

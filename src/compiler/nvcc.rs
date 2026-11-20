@@ -525,6 +525,10 @@ impl CompileCommandImpl for NvccCompileCommand {
         self.cwd.clone()
     }
 
+    fn append_arguments(&mut self, _args: &[OsString]) -> Result<()> {
+        bail!("failed to append arguments: an nvcc compile runs several commands")
+    }
+
     async fn execute<T>(
         &self,
         service: &server::SccacheService<T>,
@@ -1500,6 +1504,27 @@ mod test {
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_multi_process_command_rejects_appended_arguments() {
+        let mut command = NvccCompileCommand {
+            temp_dir: PathBuf::from("temp"),
+            keep_dir: None,
+            num_parallel: 1,
+            executable: "nvcc".into(),
+            arguments: ovec!["-c", "foo.cu"],
+            compilation_flag: "-c".into(),
+            env_vars: vec![],
+            cwd: ".".into(),
+            host_compiler: NvccHostCompiler::Gcc,
+            output_file_name: "foo.o".into(),
+        };
+        let error = command
+            .append_arguments(&[OsString::from("--extra")])
+            .unwrap_err();
+        assert!(error.to_string().contains("runs several commands"));
+        assert_eq!(command.arguments, ovec!["-c", "foo.cu"]);
+    }
 
     fn parse_arguments_gcc(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
