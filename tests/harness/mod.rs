@@ -191,6 +191,7 @@ pub fn sccache_client_cfg(
             toolchain_cache_size: TC_CACHE_SIZE,
             rewrite_includes_only: false, // TODO
         },
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,

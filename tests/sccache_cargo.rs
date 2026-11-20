@@ -37,6 +37,110 @@ fn test_rust_cargo_build() -> Result<()> {
     test_rust_cargo_cmd("build", SccacheTest::new(None)?)
 }
 
+#[cfg(all(feature = "reapi", unix))]
+#[test]
+#[serial]
+fn test_reapi_configured_local_build_and_cache_hit() -> Result<()> {
+    use sccache::config::{FileConfig, ReapiConfig};
+
+    let mut test_info = SccacheTest::new(None)?;
+    let checkout = test_info.tempdir.path().join("project");
+    fs::create_dir_all(checkout.join("src"))?;
+    // Match Cargo's physical cwd, including macOS's /var -> /private/var alias.
+    let checkout = checkout.canonicalize()?;
+    fs::write(
+        checkout.join("Cargo.toml"),
+        "[package]\nname = \"reapi_smoke\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )?;
+    fs::write(
+        checkout.join("src/lib.rs"),
+        "pub fn strings() -> Vec<String> { vec![format!(\"{}\", 1)] }\n\
+         include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+    )?;
+    // Give the crate its own OUT_DIR instead of inheriting sccache's build-script directory.
+    fs::write(
+        checkout.join("build.rs"),
+        r#"
+fn main() {
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("generated.rs"), "pub fn generated_source() -> &'static str { file!() }").unwrap();
+}
+"#,
+    )?;
+    let reapi_cache = test_info.tempdir.path().join("reapi-cache");
+    let mut config = FileConfig {
+        reapi: Some(ReapiConfig {
+            endpoint: "grpc://127.0.0.1:1".into(),
+            cache_dir: reapi_cache.clone(),
+            instance_name: String::new(),
+            // Connection credentials are not read by this local-only executor.
+            auth_token_file: Some(test_info.tempdir.path().join("missing-token")),
+        }),
+        client_side_mode: true,
+        ..Default::default()
+    };
+    // REAPI preparation must use its own cache, even if dist.cache_dir is unusable.
+    config.dist.cache_dir = test_info.tempdir.path().join("unusable-dist-cache");
+    fs::write(&config.dist.cache_dir, "not a directory")?;
+    let config_path = test_info.tempdir.path().join("reapi.toml");
+    fs::write(&config_path, toml::to_string(&config)?)?;
+    test_info
+        .env
+        .push(("SCCACHE_CONF", config_path.as_os_str().to_owned()));
+    test_info.env.push(("SCCACHE_CLIENT_SIDE", "true".into()));
+    restart_sccache(
+        &test_info,
+        Some(vec![
+            ("SCCACHE_CONF".into(), config_path.to_str().unwrap().into()),
+            ("SCCACHE_CLIENT_SIDE".into(), "true".into()),
+        ]),
+    )?;
+    let target = cargo_build(&test_info, &checkout)?;
+    let original = fs::read(target.join("debug/libreapi_smoke.rlib"))?;
+    assert!(reapi_cache.join("reapi-sysroot-copies").is_dir());
+    let absolute_checkout = checkout.canonicalize()?;
+    assert!(
+        memchr::memmem::find(&original, absolute_checkout.as_os_str().as_encoded_bytes()).is_none()
+    );
+    test_info
+        .show_stats()?
+        .try_stdout(predicate::str::contains(
+            r#""cache_misses":{"counts":{"Rust":1},"adv_counts":{"rust":1}}"#,
+        ))?
+        .try_stdout(predicate::str::contains(r#""reapi":null"#))?;
+
+    fs::remove_dir_all(&target)?;
+    cargo_build(&test_info, &checkout)?;
+    assert_eq!(
+        original,
+        fs::read(target.join("debug/libreapi_smoke.rlib"))?
+    );
+    test_info
+        .show_stats()?
+        .try_stdout(predicate::str::contains(
+            r#""cache_hits":{"counts":{"Rust":1},"adv_counts":{"rust":1}}"#,
+        ))?;
+
+    Command::new(CARGO.as_os_str())
+        .args(["build", "--offline"])
+        .arg("--target-dir")
+        .arg(&target)
+        .envs(test_info.env.iter().cloned())
+        .env("RUSTFLAGS", "--remap-path-prefix=/unused=/unused")
+        .current_dir(&checkout)
+        .assert()
+        .try_success()?;
+    test_info
+        .show_stats()?
+        .try_stdout(predicate::str::contains(
+            r#""local_compilations":{"--remap-path-prefix":1}"#,
+        ))?;
+    test_info
+        .show_text_stats(false)?
+        .try_stdout(predicate::str::contains("REAPI local compilations:"))?;
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_rust_cargo_build_readonly() -> Result<()> {

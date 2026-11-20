@@ -19,18 +19,22 @@ use crate::compiler::DistExecutor;
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
     CacheControl, CompileExecutor, CompileResult, Compiler, CompilerArguments, CompilerHasher,
-    CompilerKind, CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED,
+    CompilerKind, CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED, ReapiOutcome,
     get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
-use crate::config::Config;
+#[cfg(feature = "dist-client")]
+use crate::config::ExecutionBackend;
+use crate::config::{Config, select_execution_backend};
 use crate::dist;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
 use crate::protocol::{
     Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
 };
+#[cfg(feature = "reapi")]
+use crate::reapi::ReapiExecutor;
 use crate::util;
 #[cfg(feature = "dist-client")]
 use anyhow::Context as _;
@@ -149,6 +153,24 @@ pub struct DistClientContainer {
     // The actual dist client state
     #[cfg(feature = "dist-client")]
     state: futures::lock::Mutex<DistClientState>,
+    /// Present when REAPI is the selected backend.
+    #[cfg(feature = "reapi")]
+    reapi: Option<Arc<ReapiExecutor>>,
+}
+
+#[cfg(feature = "reapi")]
+fn reapi_executor(config: &Config) -> Option<Arc<ReapiExecutor>> {
+    config
+        .reapi
+        .as_ref()
+        .map(|reapi| Arc::new(ReapiExecutor::new(&reapi.cache_dir)))
+}
+
+#[cfg(not(feature = "reapi"))]
+fn warn_if_reapi_configured(config: &Config) {
+    if config.reapi.is_some() {
+        warn!("[reapi] configured but the reapi feature is disabled, ignoring it");
+    }
 }
 
 #[cfg(feature = "dist-client")]
@@ -179,17 +201,26 @@ pub enum DistClientState {
 #[cfg(not(feature = "dist-client"))]
 impl DistClientContainer {
     #[cfg(not(feature = "dist-client"))]
-    fn new(config: &Config, _: &tokio::runtime::Handle) -> Self {
+    fn new(config: &Config, _: &tokio::runtime::Handle) -> Result<Self> {
+        select_execution_backend(&config.dist, config.reapi.as_ref())?;
+        #[cfg(not(feature = "reapi"))]
+        warn_if_reapi_configured(config);
         if config.dist.scheduler_url.is_some() {
             warn!(
                 "Scheduler address configured but dist feature disabled, disabling distributed sccache"
             )
         }
-        Self {}
+        Ok(Self {
+            #[cfg(feature = "reapi")]
+            reapi: reapi_executor(config),
+        })
     }
 
     pub fn new_disabled() -> Self {
-        Self {}
+        Self {
+            #[cfg(feature = "reapi")]
+            reapi: None,
+        }
     }
 
     #[cfg(feature = "dist-client")]
@@ -210,39 +241,57 @@ impl DistClientContainer {
     async fn get_executor<C: CommandCreatorSync>(
         &self,
     ) -> Result<Option<Arc<dyn CompileExecutor<C>>>> {
+        #[cfg(feature = "reapi")]
+        if let Some(reapi) = &self.reapi {
+            return Ok(Some(reapi.clone()));
+        }
         Ok(None)
     }
 }
 
 #[cfg(feature = "dist-client")]
 impl DistClientContainer {
-    fn new(config: &Config, pool: &tokio::runtime::Handle) -> Self {
-        let config = DistClientConfig {
-            pool: pool.clone(),
-            scheduler_url: config.dist.scheduler_url.clone(),
-            auth: config.dist.auth.clone(),
-            cache_dir: config.dist.cache_dir.clone(),
-            toolchain_cache_size: config.dist.toolchain_cache_size,
-            toolchains: config.dist.toolchains.clone(),
-            rewrite_includes_only: config.dist.rewrite_includes_only,
+    fn new(config: &Config, pool: &tokio::runtime::Handle) -> Result<Self> {
+        let backend = select_execution_backend(&config.dist, config.reapi.as_ref())?;
+        #[cfg(feature = "reapi")]
+        let reapi = reapi_executor(config);
+        #[cfg(not(feature = "reapi"))]
+        warn_if_reapi_configured(config);
+        let state = if backend == ExecutionBackend::SccacheDist {
+            let config = DistClientConfig {
+                pool: pool.clone(),
+                scheduler_url: config.dist.scheduler_url.clone(),
+                auth: config.dist.auth.clone(),
+                cache_dir: config.dist.cache_dir.clone(),
+                toolchain_cache_size: config.dist.toolchain_cache_size,
+                toolchains: config.dist.toolchains.clone(),
+                rewrite_includes_only: config.dist.rewrite_includes_only,
+            };
+            pool.block_on(Self::create_state(config))
+        } else {
+            DistClientState::Disabled
         };
-        let state = Self::create_state(config);
-        let state = pool.block_on(state);
-        Self {
+        Ok(Self {
             state: futures::lock::Mutex::new(state),
-        }
+            #[cfg(feature = "reapi")]
+            reapi,
+        })
     }
 
     #[cfg(feature = "dist-client")]
     pub fn new_with_state(state: DistClientState) -> Self {
         Self {
             state: futures::lock::Mutex::new(state),
+            #[cfg(feature = "reapi")]
+            reapi: None,
         }
     }
 
     pub fn new_disabled() -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
+            #[cfg(feature = "reapi")]
+            reapi: None,
         }
     }
 
@@ -323,6 +372,10 @@ impl DistClientContainer {
     async fn get_executor<C: CommandCreatorSync>(
         &self,
     ) -> Result<Option<Arc<dyn CompileExecutor<C>>>> {
+        #[cfg(feature = "reapi")]
+        if let Some(reapi) = &self.reapi {
+            return Ok(Some(reapi.clone()));
+        }
         let client = self.get_client().await?;
         Ok(client.map(|client| Arc::new(DistExecutor::new(client)) as Arc<dyn CompileExecutor<C>>))
     }
@@ -465,7 +518,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         .worker_threads(std::cmp::max(20, 2 * util::num_cpus()))
         .build()?;
     let pool = runtime.handle().clone();
-    let dist_client = DistClientContainer::new(config, &pool);
+    let dist_client = DistClientContainer::new(config, &pool)?;
 
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
 
@@ -1665,15 +1718,7 @@ where
                         }
                     }
 
-                    match dist_type {
-                        DistType::NoDist => {}
-                        DistType::Ok(id) => {
-                            let server = id.addr().to_string();
-                            let server_count = stats.dist_compiles.entry(server).or_insert(0);
-                            *server_count += 1;
-                        }
-                        DistType::Error => stats.dist_errors += 1,
-                    }
+                    stats.count_dist_type(dist_type);
 
                     // Make sure the write guard has been dropped ASAP.
                     drop(stats);
@@ -1860,6 +1905,24 @@ pub struct ServerStats {
     pub dist_errors: u64,
     /// Multi-level cache statistics (if multi-level caching is enabled)
     pub multi_level: Option<crate::cache::multilevel::MultiLevelStats>,
+    /// REAPI statistics, `None` until a REAPI build counts a compile.
+    #[serde(default)]
+    pub reapi: Option<ReapiStats>,
+}
+
+/// Statistics of the compiles in a REAPI build.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ReapiStats {
+    /// Compilations that ran locally, by reason.
+    pub local_compilations: HashMap<String, usize>,
+}
+
+impl std::ops::AddAssign for ReapiStats {
+    fn add_assign(&mut self, rhs: ReapiStats) {
+        for (k, v) in rhs.local_compilations {
+            *self.local_compilations.entry(k).or_default() += v;
+        }
+    }
 }
 
 impl std::ops::AddAssign for ServerStats {
@@ -1890,6 +1953,14 @@ impl std::ops::AddAssign for ServerStats {
             *self.dist_compiles.entry(k).or_default() += v;
         }
         self.dist_errors += rhs.dist_errors;
+        self.reapi = match (self.reapi.take(), rhs.reapi) {
+            (Some(mut a), Some(b)) => {
+                a += b;
+                Some(a)
+            }
+            (a, None) => a,
+            (None, b) => b,
+        };
         self.multi_level = match (self.multi_level.take(), rhs.multi_level) {
             (Some(mut a), Some(b)) => {
                 a += b;
@@ -1949,6 +2020,7 @@ impl Default for ServerStats {
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
             multi_level: None,
+            reapi: None,
         }
     }
 }
@@ -1966,6 +2038,26 @@ impl ServerStatsWriter for StdoutServerStatsWriter {
 }
 
 impl ServerStats {
+    fn count_dist_type(&mut self, dist_type: DistType) {
+        match dist_type {
+            DistType::NoDist => {}
+            DistType::Ok(id) => {
+                let server = id.addr().to_string();
+                let server_count = self.dist_compiles.entry(server).or_insert(0);
+                *server_count += 1;
+            }
+            DistType::Error => self.dist_errors += 1,
+            DistType::Reapi(ReapiOutcome::CompiledLocally(reason)) => {
+                *self
+                    .reapi
+                    .get_or_insert_default()
+                    .local_compilations
+                    .entry(reason)
+                    .or_default() += 1;
+            }
+        }
+    }
+
     fn record_not_cacheable(&mut self, why: &str, extra_info: Option<&str>) {
         self.requests_not_cacheable += 1;
         let reason = match (why, extra_info) {
@@ -2133,6 +2225,24 @@ impl ServerStats {
                     reason,
                     count,
                     name_width = name_width - 2,
+                    stat_width = stat_width,
+                ));
+            }
+        }
+        if let Some(reapi) = self
+            .reapi
+            .as_ref()
+            .filter(|reapi| !reapi.local_compilations.is_empty())
+        {
+            writer.write("\nREAPI local compilations:");
+            let mut counts: Vec<_> = reapi.local_compilations.iter().collect();
+            counts.sort_by(sort_func);
+            for (reason, count) in counts {
+                writer.write(&format!(
+                    "{:<name_width$} {:>stat_width$}",
+                    reason,
+                    count,
+                    name_width = name_width,
                     stat_width = stat_width,
                 ));
             }
@@ -2632,6 +2742,110 @@ mod tests {
         let status = runtime.block_on(container.get_status());
 
         assert!(matches!(status, DistInfo::Disabled(_)));
+    }
+
+    #[cfg(feature = "reapi")]
+    fn reapi_config(cache_dir: &std::path::Path) -> Config {
+        Config {
+            reapi: Some(crate::config::ReapiConfig {
+                endpoint: "grpc://127.0.0.1:1".into(),
+                cache_dir: cache_dir.to_owned(),
+                instance_name: String::new(),
+                auth_token_file: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "reapi")]
+    #[test]
+    fn test_reapi_config_sets_the_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dist_client =
+            DistClientContainer::new(&reapi_config(dir.path()), runtime.handle()).unwrap();
+        let executor = runtime
+            .block_on(dist_client.get_executor::<ProcessCommandCreator>())
+            .unwrap()
+            .expect("an executor");
+        assert_eq!(
+            executor.hash_key_options(),
+            crate::compiler::HashKeyOptions::default()
+        );
+    }
+
+    #[cfg(all(feature = "reapi", feature = "dist-client"))]
+    #[test]
+    fn test_conflicting_execution_backends_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = reapi_config(dir.path());
+        config.dist.scheduler_url = Some(config::HTTPUrl::from_url(
+            "http://127.0.0.1:1".parse().unwrap(),
+        ));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(DistClientContainer::new(&config, runtime.handle()).is_err());
+    }
+
+    #[test]
+    fn test_reapi_stats_merge_and_print() {
+        let count = |n| {
+            let mut stats = ServerStats::default();
+            for _ in 0..n {
+                stats.count_dist_type(DistType::Reapi(ReapiOutcome::CompiledLocally(
+                    "staticlib crate type".to_owned(),
+                )));
+            }
+            stats
+        };
+        let mut stats = ServerStats::default();
+        stats += count(1);
+        stats += count(2);
+        stats += ServerStats::default();
+        let mut writer = StringWriter::new();
+        stats.print(&mut writer, false);
+        let output = writer.get_output();
+        assert!(
+            output.contains("REAPI local compilations:"),
+            "missing from:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|l| l.starts_with("staticlib crate type") && l.ends_with(" 3")),
+            "missing from:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_reapi_stats_serialization() {
+        let mut stats = ServerStats::default();
+        let mut old_json = serde_json::to_value(&stats).unwrap();
+        old_json.as_object_mut().unwrap().remove("reapi");
+        assert!(
+            serde_json::from_value::<ServerStats>(old_json)
+                .unwrap()
+                .reapi
+                .is_none()
+        );
+
+        stats.count_dist_type(DistType::Reapi(ReapiOutcome::CompiledLocally(
+            "not rustc".into(),
+        )));
+        let bytes = bincode::serialize(&stats).unwrap();
+        let restored: ServerStats = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored.reapi.unwrap().local_compilations["not rustc"], 1);
+    }
+
+    #[test]
+    fn test_default_configuration_has_no_executor() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let container = DistClientContainer::new(&Config::default(), runtime.handle()).unwrap();
+        assert!(
+            runtime
+                .block_on(container.get_executor::<ProcessCommandCreator>())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

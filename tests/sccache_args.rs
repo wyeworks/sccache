@@ -16,6 +16,32 @@ use std::process::Command;
 #[macro_use]
 extern crate log;
 
+#[cfg(all(feature = "dist-client", feature = "reapi"))]
+#[test]
+fn test_conflicting_execution_backends_fail_before_startup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = dir.path().join("config.toml");
+    fs::write(
+        &config,
+        r#"
+[dist]
+scheduler_url = "http://127.0.0.1:1"
+[reapi]
+endpoint = "grpc://127.0.0.1:1"
+"#,
+    )?;
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg("--start-server")
+        .env("SCCACHE_CONF", &config)
+        .env("SCCACHE_SERVER_PORT", "0")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "[reapi] and dist.scheduler_url cannot both be enabled",
+        ));
+    Ok(())
+}
+
 #[test]
 #[serial]
 #[cfg(feature = "gcs")]

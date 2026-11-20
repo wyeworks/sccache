@@ -26,6 +26,8 @@ mod client;
 #[allow(dead_code)]
 mod digest;
 
+mod executor;
+
 #[allow(dead_code)]
 mod input_root;
 
@@ -42,6 +44,7 @@ mod sysroot;
 mod test;
 
 pub(crate) use bazel_remote_apis as proto;
+pub(crate) use executor::ReapiExecutor;
 
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, normalize_absolute,

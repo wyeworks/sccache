@@ -180,6 +180,29 @@ If no such env variable is set, sccache looks at default locations as below:
 
 The latest `cache.XXX` entries may be found here: https://github.com/mozilla/sccache/blob/ffe3070f77ef3301c8ff718316e4ab017ec83042/src/config.rs#L300.
 
+## Experimental REAPI
+
+Build with `--features reapi` and add a `[reapi]` section:
+
+```toml
+[reapi]
+endpoint = "grpcs://remote.example.com:443" # grpc:// for plaintext
+instance_name = ""                         # optional
+# cache_dir = "/path/to/reapi-cache"         # optional
+auth_token_file = "/path/to/token"          # optional bearer-token file
+```
+
+REAPI support is under development. Currently, configured builds apply Rust preparation and compile locally, server connections and remote execution are not wired in yet.
+
+The cache directory defaults to the platform cache directory for `sccache-reapi`.
+
+Choose either REAPI or sccache-dist for remote compilation. Setting both
+`[reapi]` and `dist.scheduler_url` is an error when both features are built.
+
+REAPI currently runs in the sccache server, so enabling it turns off client-side
+mode. If REAPI support isn't built in, sccache logs a warning and ignores
+`[reapi]`. Restart the server after changing the configuration.
+
 ## env
 
 Whatever is set by a file based configuration, it is overruled by the env

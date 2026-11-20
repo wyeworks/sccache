@@ -33,6 +33,8 @@ use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use std::{collections::HashMap, fmt};
+#[cfg(test)]
+use test_case::test_case;
 use typed_path::Utf8TypedPathBuf;
 
 use crate::errors::*;
@@ -93,6 +95,7 @@ static CACHED_CONFIG: Mutex<Option<CachedFileConfig>> = Mutex::new(None);
 const ORGANIZATION: &str = "Mozilla";
 const APP_NAME: &str = "sccache";
 const DIST_APP_NAME: &str = "sccache-dist-client";
+const REAPI_APP_NAME: &str = "sccache-reapi";
 const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
 
 pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
@@ -109,6 +112,13 @@ pub fn default_disk_cache_dir() -> PathBuf {
 pub fn default_dist_cache_dir() -> PathBuf {
     ProjectDirs::from("", ORGANIZATION, DIST_APP_NAME)
         .expect("Unable to retrieve dist cache directory")
+        .cache_dir()
+        .to_owned()
+}
+
+fn default_reapi_cache_dir() -> PathBuf {
+    ProjectDirs::from("", ORGANIZATION, REAPI_APP_NAME)
+        .expect("Unable to retrieve REAPI cache directory")
         .cache_dir()
         .to_owned()
 }
@@ -774,6 +784,43 @@ pub struct DistConfig {
     pub rewrite_includes_only: bool,
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReapiConfig {
+    /// `grpc://host:port`, or `grpcs://host:port` for TLS.
+    pub endpoint: String,
+    #[serde(default = "default_reapi_cache_dir")]
+    pub cache_dir: PathBuf,
+    #[serde(default)]
+    pub instance_name: String,
+    /// A file holding the bearer token sent with every request.
+    pub auth_token_file: Option<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionBackend {
+    Local,
+    SccacheDist,
+    Reapi,
+}
+
+pub(crate) fn select_execution_backend(
+    dist: &DistConfig,
+    reapi: Option<&ReapiConfig>,
+) -> Result<ExecutionBackend> {
+    match (
+        cfg!(feature = "dist-client") && dist.scheduler_url.is_some(),
+        cfg!(feature = "reapi") && reapi.is_some(),
+    ) {
+        (false, false) => Ok(ExecutionBackend::Local),
+        (true, false) => Ok(ExecutionBackend::SccacheDist),
+        (false, true) => Ok(ExecutionBackend::Reapi),
+        (true, true) => bail!(
+            "[reapi] and dist.scheduler_url cannot both be enabled; configure one execution backend"
+        ),
+    }
+}
+
 impl Default for DistConfig {
     fn default() -> Self {
         Self {
@@ -794,6 +841,7 @@ impl Default for DistConfig {
 pub struct FileConfig {
     pub cache: CacheConfigs,
     pub dist: DistConfig,
+    pub reapi: Option<ReapiConfig>,
     pub server_startup_timeout_ms: Option<u64>,
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
@@ -1318,6 +1366,7 @@ pub struct Config {
     pub cache_configs: CacheConfigs,
     pub fallback_cache: DiskCacheConfig,
     pub dist: DistConfig,
+    pub reapi: Option<ReapiConfig>,
     pub server_startup_timeout: Option<std::time::Duration>,
     pub skip_cache_check: bool,
     /// Base directory (or directories) to strip from paths for cache key computation.
@@ -1347,6 +1396,7 @@ impl Config {
         let FileConfig {
             cache,
             mut dist,
+            reapi,
             server_startup_timeout_ms,
             basedirs: file_basedirs,
             client_side_mode: file_client_side_mode,
@@ -1367,6 +1417,7 @@ impl Config {
         if let Some(cache_dir) = env_dist_cache_dir {
             dist.cache_dir = cache_dir;
         }
+        let backend = select_execution_backend(&dist, reapi.as_ref())?;
 
         // Environment variable takes precedence over file config if it is set
         let basedirs_raw = if let Some(basedirs) = env_basedirs {
@@ -1425,7 +1476,9 @@ impl Config {
             // can't leave the client mode enabled alongside logging.
             && std::env::var_os(crate::LOGGING_ENV).is_none()
             // Client-side mode is also not compatible with distributed compilation.
-            && dist.scheduler_url.is_none();
+            && dist.scheduler_url.is_none()
+            // Nor with REAPI, whose executor runs in the server.
+            && backend != ExecutionBackend::Reapi;
 
         let (caches, fallback_cache) = conf_caches.clone().into_fallback();
         Ok(Self {
@@ -1433,6 +1486,7 @@ impl Config {
             cache_configs: conf_caches,
             fallback_cache,
             dist,
+            reapi,
             server_startup_timeout,
             skip_cache_check: false,
             basedirs,
@@ -1804,6 +1858,7 @@ fn config_overrides() {
             ..Default::default()
         },
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
@@ -1860,6 +1915,7 @@ fn config_overrides() {
                 rw_mode: CacheModeConfig::ReadWrite,
             },
             dist: Default::default(),
+            reapi: None,
             server_startup_timeout: None,
             skip_cache_check: false,
             basedirs: vec![],
@@ -1882,6 +1938,7 @@ fn config_basedirs_overrides() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
@@ -1901,6 +1958,7 @@ fn config_basedirs_overrides() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
@@ -1920,6 +1978,7 @@ fn config_basedirs_overrides() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
@@ -1939,6 +1998,7 @@ fn config_basedirs_overrides() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
@@ -1962,6 +2022,7 @@ fn config_basedirs_overrides() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
@@ -1981,6 +2042,7 @@ fn config_basedirs_overrides() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
@@ -2000,6 +2062,7 @@ fn config_basedirs_overrides() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
@@ -2019,6 +2082,7 @@ fn config_basedirs_overrides() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
@@ -2036,6 +2100,7 @@ fn config_basedirs_overrides() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
@@ -2261,6 +2326,7 @@ fn test_env_basedirs_with_spaces() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
@@ -2296,6 +2362,7 @@ fn test_env_basedirs_with_spaces() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
@@ -2862,6 +2929,10 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 type = "token"
 token = "secrettoken"
 
+[reapi]
+endpoint = "grpc://farm:8980"
+instance_name = "main"
+auth_token_file = "/token"
 
 [cache.azure]
 container = "azurecontainer"
@@ -3041,6 +3112,12 @@ key_prefix = "cosprefix"
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
             },
+            reapi: Some(ReapiConfig {
+                endpoint: "grpc://farm:8980".to_owned(),
+                cache_dir: default_reapi_cache_dir(),
+                instance_name: "main".to_owned(),
+                auth_token_file: Some(PathBuf::from("/token")),
+            }),
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
             client_side_mode: false,
@@ -3135,6 +3212,7 @@ size = "7g"
                 toolchain_cache_size: 5 * 1024 * 1024 * 1024,
                 ..Default::default()
             },
+            reapi: None,
             server_startup_timeout_ms: None,
             basedirs: vec![],
             client_side_mode: false,
@@ -3189,6 +3267,7 @@ fn test_integration_config_normalizes_and_strips() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
@@ -3225,6 +3304,7 @@ fn test_integration_normalized_path_with_double_slashes() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["/home//user///project/".to_string()],
         client_side_mode: false,
@@ -3257,6 +3337,7 @@ fn test_integration_windows_path_normalization() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
         client_side_mode: false,
@@ -3290,6 +3371,7 @@ fn test_integration_cow_borrowed_when_no_match() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
@@ -3323,6 +3405,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
@@ -3355,6 +3438,7 @@ fn test_integration_multiple_basedirs_longest_match() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
         client_side_mode: false,
@@ -3392,6 +3476,7 @@ fn test_integration_paths_with_dots_normalized() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/./project/../project".to_string()],
         client_side_mode: false,
@@ -3425,6 +3510,7 @@ fn test_integration_windows_mixed_slashes() {
     let file_conf = FileConfig {
         cache: Default::default(),
         dist: Default::default(),
+        reapi: None,
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
         client_side_mode: false,
@@ -3569,4 +3655,217 @@ fn test_cache_type_by_name_matches_features() {
             }
         }
     }
+}
+
+#[test]
+fn test_reapi_config_defaults() {
+    let config: FileConfig = toml::from_str(
+        r#"
+[reapi]
+endpoint = "grpcs://farm.example.com:443"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        Some(ReapiConfig {
+            endpoint: "grpcs://farm.example.com:443".to_owned(),
+            cache_dir: default_reapi_cache_dir(),
+            instance_name: String::new(),
+            auth_token_file: None,
+        }),
+        config.reapi
+    );
+}
+
+#[test]
+fn test_reapi_config_rejects_unknown_key() {
+    let config = toml::from_str::<FileConfig>(
+        r#"
+[reapi]
+endpoint = "grpc://farm:8980"
+enpoint = "x"
+"#,
+    );
+    let e = config.unwrap_err();
+    assert!(e.to_string().contains("enpoint"), "{e}");
+}
+
+#[test]
+fn test_reapi_client_side_mode_respects_feature() {
+    let client_side_mode = |reapi: Option<ReapiConfig>| {
+        let env_conf = EnvConfig {
+            cache: Default::default(),
+            basedirs: None,
+            dist_cache_dir: None,
+            client_side_mode: Some(true),
+        };
+        let file_conf = FileConfig {
+            reapi,
+            ..Default::default()
+        };
+        Config::from_env_and_file_configs(env_conf, file_conf)
+            .unwrap()
+            .client_side_mode
+    };
+    let reapi = toml::from_str("endpoint = \"grpc://farm:8980\"").unwrap();
+    assert_eq!(
+        !cfg!(feature = "reapi") && std::env::var_os(crate::LOGGING_ENV).is_none(),
+        client_side_mode(Some(reapi))
+    );
+    // SCCACHE_LOG also turns client-side mode off.
+    assert_eq!(
+        std::env::var_os(crate::LOGGING_ENV).is_none(),
+        client_side_mode(None)
+    );
+}
+
+#[test]
+fn test_reapi_config_requires_endpoint() {
+    let config = toml::from_str::<FileConfig>(
+        r#"
+[reapi]
+instance_name = "main"
+"#,
+    );
+    let e = config.unwrap_err();
+    assert!(e.to_string().contains("endpoint"), "{e}");
+}
+
+#[test]
+fn test_reapi_config_rejects_the_dist_namespace() {
+    let error = toml::from_str::<FileConfig>(
+        r#"
+[dist.reapi]
+endpoint = "grpc://farm:8980"
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("unknown field `reapi`"),
+        "{error}"
+    );
+}
+
+#[cfg(test)]
+#[test_case(None; "default directory")]
+#[test_case(Some("/reapi-cache"); "configured directory")]
+fn test_reapi_cache_dir_is_independent_from_dist(cache_dir: Option<&str>) {
+    let mut file_conf: FileConfig = toml::from_str(
+        r#"
+[dist]
+cache_dir = "/dist-file-cache"
+[reapi]
+endpoint = "grpc://farm:8980"
+"#,
+    )
+    .unwrap();
+    let expected = cache_dir.map_or_else(default_reapi_cache_dir, PathBuf::from);
+    if let Some(cache_dir) = cache_dir {
+        file_conf.reapi.as_mut().unwrap().cache_dir = cache_dir.into();
+    }
+    let env_conf = EnvConfig {
+        cache: Default::default(),
+        basedirs: None,
+        dist_cache_dir: Some("/dist-env-cache".into()),
+        client_side_mode: None,
+    };
+    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
+    assert_eq!(config.dist.cache_dir, PathBuf::from("/dist-env-cache"));
+    assert_eq!(config.reapi.unwrap().cache_dir, expected);
+    assert_ne!(default_reapi_cache_dir(), default_dist_cache_dir());
+    assert_ne!(default_reapi_cache_dir(), default_disk_cache_dir());
+}
+
+#[cfg(test)]
+fn execution_config_from_toml(text: &str) -> Result<Config> {
+    Config::from_env_and_file_configs(
+        EnvConfig {
+            cache: Default::default(),
+            basedirs: None,
+            dist_cache_dir: None,
+            client_side_mode: None,
+        },
+        toml::from_str(text)?,
+    )
+}
+
+#[test]
+fn test_default_configuration_selects_local_execution() {
+    let config = execution_config_from_toml("").unwrap();
+    assert_eq!(
+        select_execution_backend(&config.dist, config.reapi.as_ref()).unwrap(),
+        ExecutionBackend::Local
+    );
+}
+
+#[test]
+fn test_scheduler_selects_sccache_dist_when_supported() {
+    let config = execution_config_from_toml(
+        r#"
+[dist]
+scheduler_url = "http://127.0.0.1:1"
+"#,
+    )
+    .unwrap();
+    let expected = if cfg!(feature = "dist-client") {
+        ExecutionBackend::SccacheDist
+    } else {
+        ExecutionBackend::Local
+    };
+    assert_eq!(
+        select_execution_backend(&config.dist, config.reapi.as_ref()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn test_reapi_section_selects_reapi_when_supported() {
+    let config = execution_config_from_toml(
+        r#"
+[reapi]
+endpoint = "grpc://127.0.0.1:1"
+"#,
+    )
+    .unwrap();
+    let expected = if cfg!(feature = "reapi") {
+        ExecutionBackend::Reapi
+    } else {
+        ExecutionBackend::Local
+    };
+    assert_eq!(
+        select_execution_backend(&config.dist, config.reapi.as_ref()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn test_execution_backend_conflicts_respect_features() {
+    let result = execution_config_from_toml(
+        r#"
+[dist]
+scheduler_url = "http://127.0.0.1:1"
+[reapi]
+endpoint = "grpc://127.0.0.1:1"
+"#,
+    );
+    let expected = match (cfg!(feature = "dist-client"), cfg!(feature = "reapi")) {
+        (true, true) => {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("configure one execution backend"),
+                "{error}"
+            );
+            return;
+        }
+        (true, false) => ExecutionBackend::SccacheDist,
+        (false, true) => ExecutionBackend::Reapi,
+        (false, false) => ExecutionBackend::Local,
+    };
+    let config = result.unwrap();
+    assert_eq!(
+        select_execution_backend(&config.dist, config.reapi.as_ref()).unwrap(),
+        expected
+    );
 }
