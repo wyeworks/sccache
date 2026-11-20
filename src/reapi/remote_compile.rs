@@ -1018,6 +1018,14 @@ mod test {
         MissingWorkerRoot,
         EmptyWorkerRoot,
         NonUtf8WorkerRoot,
+        MissingRmeta,
+        OutputPath(&'static str),
+        MalformedOutputDigest,
+        NegativeOutputSize,
+        OversizedOutput,
+        OversizedStdout,
+        InlineContentsMismatch,
+        StdoutDigestMismatch,
     }
 
     impl InvalidResult {
@@ -1050,6 +1058,38 @@ mod test {
                 }
                 Self::MissingRlib => {
                     result.output_files.remove(0);
+                }
+                Self::MissingRmeta => {
+                    result.output_files.pop();
+                }
+                Self::OutputPath(path) => {
+                    result.output_files.last_mut().unwrap().path = path.to_owned();
+                }
+                Self::MalformedOutputDigest => {
+                    let file = result.output_files.last_mut().unwrap();
+                    file.digest.as_mut().unwrap().hash = "bad/hash".to_owned();
+                }
+                Self::NegativeOutputSize => {
+                    let file = result.output_files.last_mut().unwrap();
+                    file.digest.as_mut().unwrap().size_bytes = -1;
+                }
+                Self::OversizedOutput => {
+                    let file = result.output_files.last_mut().unwrap();
+                    file.digest.as_mut().unwrap().size_bytes = MAX_OUTPUT_FILE_BYTES as i64 + 1;
+                }
+                Self::OversizedStdout => {
+                    result.stdout_digest = Some(remexec::Digest {
+                        hash: "0".repeat(64),
+                        size_bytes: MAX_STDOUT_OR_STDERR_BYTES as i64 + 1,
+                    });
+                }
+                Self::InlineContentsMismatch => {
+                    result.output_files.last_mut().unwrap().contents =
+                        b"wrong inline bytes".to_vec();
+                }
+                Self::StdoutDigestMismatch => {
+                    result.stdout_raw = b"wrong inline bytes".to_vec();
+                    result.stdout_digest = Some(digest::of_bytes(b"other"));
                 }
                 Self::MissingDigest => result.output_files[0].digest = None,
                 Self::InlineDigestMismatch => {
@@ -1174,50 +1214,24 @@ mod test {
         );
     }
 
-    #[test_case("negative exit")]
-    #[test_case("missing rmeta")]
-    #[test_case("traversal")]
-    #[test_case("malformed hash")]
-    #[test_case("negative size")]
-    #[test_case("oversized file")]
-    #[test_case("oversized stream")]
-    #[test_case("inline mismatch")]
-    #[test_case("stream mismatch")]
+    #[test_case(InvalidResult::ExitCode(-1) ; "negative exit")]
+    #[test_case(InvalidResult::MissingRmeta ; "missing rmeta")]
+    #[test_case(InvalidResult::OutputPath("../outside") ; "traversal")]
+    #[test_case(InvalidResult::MalformedOutputDigest ; "malformed hash")]
+    #[test_case(InvalidResult::NegativeOutputSize ; "negative size")]
+    #[test_case(InvalidResult::OversizedOutput ; "oversized file")]
+    #[test_case(InvalidResult::OversizedStdout ; "oversized stream")]
+    #[test_case(InvalidResult::InlineContentsMismatch ; "inline mismatch")]
+    #[test_case(InvalidResult::StdoutDigestMismatch ; "stream mismatch")]
     #[tokio::test]
-    async fn test_invalid_metadata_preserves_outputs_without_cas_reads(case: &str) {
+    async fn test_invalid_metadata_preserves_outputs_without_cas_reads(case: InvalidResult) {
         let dir = tempfile::tempdir().unwrap();
         let deps = dir.path().join("target/debug/deps");
         fs::create_dir_all(&deps).unwrap();
         fs::write(deps.join("libfoo.rlib"), b"old rlib").unwrap();
         fs::write(deps.join("libfoo.rmeta"), b"old rmeta").unwrap();
         let mut result = rlib_and_rmeta_result();
-        match case {
-            "negative exit" => result.exit_code = -1,
-            "missing rmeta" => {
-                result.output_files.pop();
-            }
-            "traversal" => result.output_files[1].path = "../outside".to_owned(),
-            "malformed hash" => {
-                result.output_files[1].digest.as_mut().unwrap().hash = "bad/hash".to_owned();
-            }
-            "negative size" => result.output_files[1].digest.as_mut().unwrap().size_bytes = -1,
-            "oversized file" => {
-                result.output_files[1].digest.as_mut().unwrap().size_bytes =
-                    MAX_OUTPUT_FILE_BYTES as i64 + 1;
-            }
-            "oversized stream" => {
-                result.stdout_digest = Some(remexec::Digest {
-                    hash: "0".repeat(64),
-                    size_bytes: MAX_STDOUT_OR_STDERR_BYTES as i64 + 1,
-                });
-            }
-            "inline mismatch" => result.output_files[1].contents = b"wrong inline bytes".to_vec(),
-            "stream mismatch" => {
-                result.stdout_raw = b"wrong inline bytes".to_vec();
-                result.stdout_digest = Some(digest::of_bytes(b"other"));
-            }
-            _ => unreachable!(),
-        }
+        case.apply(&mut result);
         let server = Arc::new(FakeServer::default());
         let error = materialize_from_server(dir.path(), &server, &result)
             .await
