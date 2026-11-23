@@ -49,9 +49,9 @@ pub(super) struct Toolchains {
 }
 
 impl Toolchains {
-    pub(super) fn new(digest_cache: DigestCache) -> Arc<Self> {
+    pub(super) fn new(digest_cache: Arc<DigestCache>) -> Arc<Self> {
         Arc::new(Toolchains {
-            digest_cache: Arc::new(digest_cache),
+            digest_cache,
             states: Default::default(),
             hash_attempts_ended: watch::Sender::new(0),
             retry_after: RETRY_AFTER,
@@ -169,7 +169,7 @@ mod test {
 
     fn toolchains(dir: &Path, retry_after: Duration) -> Arc<Toolchains> {
         let digest_cache = DigestCache::load(dir.join("digests.json")).caching_new_files();
-        let toolchains = Toolchains::new(digest_cache);
+        let toolchains = Toolchains::new(Arc::new(digest_cache));
         Arc::new(Toolchains {
             retry_after,
             ..Arc::into_inner(toolchains).unwrap()
@@ -312,7 +312,7 @@ mod test {
         let sysroot = fake_sysroot(dir.path());
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, b"file").unwrap();
-        let toolchains = Toolchains::new(DigestCache::load(blocker.join("digests.json")));
+        let toolchains = Toolchains::new(Arc::new(DigestCache::load(blocker.join("digests.json"))));
         assert!(toolchains.files(&key(&sysroot), in_secs(10)).await.is_ok());
     }
 

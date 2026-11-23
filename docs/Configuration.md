@@ -193,10 +193,13 @@ instance_name = ""                         # optional
 ready_wait_secs = 0                        # readiness wait; 0 does not wait, max 3600
 ```
 
-REAPI support is under development. On eligible cache misses, sccache connects
-to the farm, checks its capabilities and hashes the toolchain in the background.
-`ready_wait_secs` covers both connection and hashing. Compiles still run locally;
-remote cache lookups and execution are not wired in yet.
+REAPI support is under development. Eligible Rust compiles can reuse results
+from the farm's Action Cache and CAS. Cache misses and remote failures compile
+locally. Uploading inputs and executing on workers are not wired in yet.
+`SCCACHE_RECACHE` and `SCCACHE_NO_CACHE` bypass the remote cache.
+
+`ready_wait_secs` covers connection and toolchain hashing, which run in the
+background. Compiles that exhaust this wait budget run locally.
 
 The token file is read when the sccache server starts. Restart the server after
 changing it. Transient connection failures are retried on later cache misses

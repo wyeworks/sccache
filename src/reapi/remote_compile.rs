@@ -16,7 +16,7 @@
 
 use super::cas::Cas;
 use super::digest::{self, DigestCache};
-use super::input_root::InputRootFile;
+use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{
     BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR, input_root_path,
     normalize_absolute,
@@ -25,6 +25,7 @@ use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use crate::mock_command::exit_status;
 use memchr::memmem;
+use prost::Message;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
@@ -116,6 +117,44 @@ fn command_output_paths(compile: &ReapiCompile) -> Result<Vec<String>> {
                 .with_context(|| format!("invalid output path {}", output.display()))
         })
         .collect()
+}
+
+/// `compile`'s own input root files, without its toolchain's. Hashing blocks, so call it from
+/// a blocking thread.
+pub(super) fn digest_input_root_files(
+    compile: &ReapiCompile,
+    digest_cache: &DigestCache,
+) -> Result<Vec<InputRootFile>> {
+    compile
+        .input_root_files
+        .iter()
+        .map(|local_path| {
+            let path = compile
+                .path_mapper
+                .to_input_root(local_path)
+                .with_context(|| format!("{} is outside the input root", local_path.display()))?;
+            Ok(InputRootFile {
+                path,
+                digest: digest_cache.digest(local_path)?,
+                is_executable: false,
+            })
+        })
+        .collect()
+}
+
+/// The digest of the action that runs `compile` on `files` and `toolchain`'s files.
+pub(super) fn action_digest(
+    compile: &ReapiCompile,
+    files: &[InputRootFile],
+    toolchain: &[(InputRootFile, PathBuf)],
+) -> Result<remexec::Digest> {
+    let input_root = InputRoot::build(files.iter().chain(toolchain.iter().map(|(file, _)| file)))?;
+    let action = remexec::Action {
+        command_digest: Some(digest::of_bytes(&build_command(compile)?.encode_to_vec())),
+        input_root_digest: Some(input_root.digest),
+        ..Default::default()
+    };
+    Ok(digest::of_bytes(&action.encode_to_vec()))
 }
 
 fn is_identifier(name: &str) -> bool {
@@ -407,6 +446,20 @@ pub(super) async fn materialize(
         stdout,
         stderr,
     })
+}
+
+/// Why a compile runs locally after `materialize` failed with `e`.
+pub(super) fn materialize_failure_reason(e: &Error) -> CompileLocallyReason {
+    if e.is::<WorkerRootInOutput>() {
+        CompileLocallyReason::WorkerRootInOutput
+    } else if e.is::<UnusableResult>() {
+        CompileLocallyReason::UnusableResult
+    } else if e.is::<UnwritableOutputs>() {
+        CompileLocallyReason::UnwritableOutputs
+    } else {
+        // `materialize` gives a type to every error except the CAS's.
+        CompileLocallyReason::DownloadingOutputsFailed
+    }
 }
 
 async fn download_stdout_or_stderr(
@@ -713,6 +766,101 @@ pub(super) mod test {
         );
     }
 
+    /// The action digest of a compile of a `src/lib.rs` holding `lib_rs` in a new checkout
+    /// under `dir`, with the toolchain at `sysroot`, changed by `change`.
+    fn action_digest_in(
+        dir: &Path,
+        lib_rs: &str,
+        sysroot: &Path,
+        change: fn(&mut ReapiCompile),
+    ) -> remexec::Digest {
+        let cwd = dir.join("ws");
+        let lib_rs_path = cwd.join("src/lib.rs");
+        std::fs::create_dir_all(lib_rs_path.parent().unwrap()).unwrap();
+        std::fs::write(&lib_rs_path, lib_rs).unwrap();
+        let mut compile = reapi_compile_in(cwd.to_str().unwrap());
+        let dependency = cwd.join("src/dependency.rs");
+        std::fs::write(&dependency, "pub const N: u8 = 1;").unwrap();
+        compile.input_root_files = vec![lib_rs_path, dependency];
+        let digest_cache = DigestCache::load(dir.join("digests.json"));
+        change(&mut compile);
+        let files = digest_input_root_files(&compile, &digest_cache).unwrap();
+        let toolchain =
+            toolchain_files(sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
+        action_digest(&compile, &files, &toolchain).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_the_action_depends_on_the_compile_but_not_the_checkout_path() {
+        let toolchains = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(&toolchains.path().join("a"));
+        let other_sysroot = fake_sysroot(&toolchains.path().join("b"));
+        std::fs::write(other_sysroot.join("bin/rustc"), b"different compiler").unwrap();
+        let digest = |lib_rs, sysroot: &Path, change: fn(&mut ReapiCompile)| {
+            let checkout = tempfile::tempdir().unwrap();
+            action_digest_in(checkout.path(), lib_rs, sysroot, change)
+        };
+        let unchanged: fn(&mut ReapiCompile) = |_| {};
+        let first = digest("pub fn f() {}", &sysroot, unchanged);
+        assert_eq!(
+            first,
+            digest("pub fn f() {}", &sysroot, unchanged),
+            "another checkout"
+        );
+        assert_ne!(
+            first,
+            digest("pub fn g() {}", &sysroot, unchanged),
+            "another lib.rs"
+        );
+        assert_ne!(
+            first,
+            digest("pub fn f() {}", &other_sysroot, unchanged),
+            "another toolchain"
+        );
+        assert_ne!(
+            first,
+            digest("pub fn f() {}", &sysroot, |compile| {
+                compile.arguments.push("-Copt-level=3".to_owned());
+            }),
+            "another argument"
+        );
+        assert_ne!(
+            first,
+            digest("pub fn f() {}", &sysroot, |compile| {
+                compile.env.vars[0].1 = "2.0.0".to_owned();
+            }),
+            "another env var value"
+        );
+    }
+
+    #[test]
+    fn test_action_digest_covers_command_paths_and_preserves_input_order_independence() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(dir.path());
+        let digest = |change: fn(&mut ReapiCompile)| {
+            let checkout = tempfile::tempdir().unwrap();
+            action_digest_in(checkout.path(), "pub fn f() {}", &sysroot, change)
+        };
+        let first = digest(|_| {});
+        assert_eq!(first, digest(|c| c.input_root_files.reverse()));
+        assert_ne!(first, digest(|c| c.env.unset_vars.push("MISSING".into())));
+        assert_ne!(
+            first,
+            digest(|c| c.env.path_vars[0].1 = "another/path".into())
+        );
+        assert_ne!(
+            first,
+            digest(|c| c
+                .outputs
+                .push(c.input_root_files[0].parent().unwrap().join("new-output")))
+        );
+        assert_ne!(
+            first,
+            digest(|c| c.mapped_crate_root = Some("other.rs".into()))
+        );
+    }
+
     #[test]
     fn test_the_command_sorts_its_outputs_and_vars() {
         let command = build_command(&reapi_compile_in("/ws")).unwrap();
@@ -893,14 +1041,16 @@ pub(super) mod test {
         }
     }
 
-    fn inline_output(path: &str, data: &[u8]) -> remexec::OutputFile {
+    pub(in crate::reapi) fn inline_output(path: &str, data: &[u8]) -> remexec::OutputFile {
         remexec::OutputFile {
             contents: data.to_vec(),
             ..cas_output(path, data)
         }
     }
 
-    fn worker_result(output_files: Vec<remexec::OutputFile>) -> remexec::ActionResult {
+    pub(in crate::reapi) fn worker_result(
+        output_files: Vec<remexec::OutputFile>,
+    ) -> remexec::ActionResult {
         remexec::ActionResult {
             output_files,
             stderr_raw: format!("{WORKER_ROOT_MARKER}/w/1\nwarning: in /w/1/src/lib.rs\n")

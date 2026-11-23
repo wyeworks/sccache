@@ -2432,6 +2432,7 @@ mod reapi_mapping {
         });
         Some(LocalCompileChanges {
             args,
+            extra_hash_key: implicit_env_cache_key(compilation),
             stdout_stderr_mapper: Some(Box::new(move |text| {
                 path_mapper.input_root_paths_to_local(text)
             })),
@@ -2938,21 +2939,44 @@ mod reapi_mapping {
         Ok(env)
     }
 
+    const RUSTC_ENV_VARS: [&str; 2] = ["RUSTC_BOOTSTRAP", "RUSTC_FORCE_RUSTC_VERSION"];
+    const APPLE_DEPLOYMENT_TARGETS: [&str; 5] = [
+        "MACOSX_DEPLOYMENT_TARGET",
+        "IPHONEOS_DEPLOYMENT_TARGET",
+        "TVOS_DEPLOYMENT_TARGET",
+        "WATCHOS_DEPLOYMENT_TARGET",
+        "XROS_DEPLOYMENT_TARGET",
+    ];
+
+    fn implicit_env_cache_key(compilation: &RustCompilation) -> Vec<u8> {
+        // These affect rustc without appearing in dep-info or the ordinary CARGO_* key.
+        let mut vars: Vec<_> = compilation
+            .env_vars
+            .iter()
+            .filter(|(name, _)| {
+                name.to_str().is_some_and(|name| {
+                    RUSTC_ENV_VARS.contains(&name) || APPLE_DEPLOYMENT_TARGETS.contains(&name)
+                })
+            })
+            .collect();
+        vars.sort();
+        let mut digest = Digest::new();
+        digest.update(b"sccache-reapi-implicit-env-v1\0");
+        vars.hash(&mut HashToDigest {
+            digest: &mut digest,
+        });
+        digest.finish().into_bytes()
+    }
+
     fn is_implicit_env_var(name: &str, target_triple: &str) -> bool {
-        match name {
-            "CARGO_CRATE_NAME"
-            | "CARGO_PRIMARY_PACKAGE"
-            | "CARGO_BIN_NAME"
-            | "RUSTC_BOOTSTRAP"
-            | "RUSTC_FORCE_RUSTC_VERSION" => true,
-            // Apple deployment targets affect rustc without appearing in dep-info.
-            "MACOSX_DEPLOYMENT_TARGET"
-            | "IPHONEOS_DEPLOYMENT_TARGET"
-            | "TVOS_DEPLOYMENT_TARGET"
-            | "WATCHOS_DEPLOYMENT_TARGET"
-            | "XROS_DEPLOYMENT_TARGET" => target_triple.contains("-apple-"),
-            _ => CARGO_PATH_VARS.contains(&name) || name.starts_with("CARGO_PKG_"),
-        }
+        RUSTC_ENV_VARS.contains(&name)
+            || (target_triple.contains("-apple-") && APPLE_DEPLOYMENT_TARGETS.contains(&name))
+            || matches!(
+                name,
+                "CARGO_CRATE_NAME" | "CARGO_PRIMARY_PACKAGE" | "CARGO_BIN_NAME"
+            )
+            || CARGO_PATH_VARS.contains(&name)
+            || name.starts_with("CARGO_PKG_")
     }
 
     // Shell-owned variables and invalid shell identifiers cannot be preserved by the wrapper.
@@ -6784,6 +6808,41 @@ foo.rs:
                     )
                 })
                 .unzip()
+        }
+
+        #[test_case("RUSTC_BOOTSTRAP")]
+        #[test_case("RUSTC_FORCE_RUSTC_VERSION")]
+        #[test_case("MACOSX_DEPLOYMENT_TARGET")]
+        #[test_case("IPHONEOS_DEPLOYMENT_TARGET")]
+        #[test_case("TVOS_DEPLOYMENT_TARGET")]
+        #[test_case("WATCHOS_DEPLOYMENT_TARGET")]
+        #[test_case("XROS_DEPLOYMENT_TARGET")]
+        fn test_reapi_preparation_keys_implicit_environment(name: &str) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = compilation_with_sysroot(dir.path(), &[]);
+            let changes = |c: &RustCompilation| {
+                reapi_local_compile_changes(c, &dir.path().join("copies")).unwrap()
+            };
+            let absent = changes(&c).extra_hash_key;
+            c.env_vars.push((name.into(), "first".into()));
+            let first = changes(&c);
+            c.env_vars[0].1 = "second".into();
+            let second = changes(&c);
+            assert_ne!(absent, first.extra_hash_key);
+            assert_ne!(first.extra_hash_key, second.extra_hash_key);
+            let args = |changes: &LocalCompileChanges| {
+                changes
+                    .args
+                    .iter()
+                    .map(|arg| &arg.arg)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(args(&first), args(&second));
+            c.env_vars
+                .push(("UNRELATED_TEST_VARIABLE".into(), "ignored".into()));
+            c.env_vars.reverse();
+            assert_eq!(second.extra_hash_key, changes(&c).extra_hash_key);
         }
 
         #[test]

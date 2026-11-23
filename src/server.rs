@@ -1913,12 +1913,15 @@ pub struct ServerStats {
 /// Statistics of the compiles in a REAPI build.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ReapiStats {
+    #[serde(default)]
+    pub action_cache_hits: u64,
     /// Compilations that ran locally, by reason.
     pub local_compilations: HashMap<String, usize>,
 }
 
 impl std::ops::AddAssign for ReapiStats {
     fn add_assign(&mut self, rhs: ReapiStats) {
+        self.action_cache_hits += rhs.action_cache_hits;
         for (k, v) in rhs.local_compilations {
             *self.local_compilations.entry(k).or_default() += v;
         }
@@ -2047,6 +2050,9 @@ impl ServerStats {
                 *server_count += 1;
             }
             DistType::Error => self.dist_errors += 1,
+            DistType::Reapi(ReapiOutcome::ActionCacheHit) => {
+                self.reapi.get_or_insert_default().action_cache_hits += 1;
+            }
             DistType::Reapi(ReapiOutcome::CompiledLocally(reason)) => {
                 *self
                     .reapi
@@ -2187,6 +2193,13 @@ impl ServerStats {
             self.dist_errors,
             "Failed distributed compilations"
         );
+        if let Some(reapi) = &self.reapi {
+            set_stat!(
+                stats_vec,
+                reapi.action_cache_hits,
+                "REAPI action cache hits"
+            );
+        }
 
         // Add multi-level cache statistics if available
         if let Some(ref ml_stats) = self.multi_level {
@@ -2792,6 +2805,7 @@ mod tests {
         let count = |n| {
             let mut stats = ServerStats::default();
             for _ in 0..n {
+                stats.count_dist_type(DistType::Reapi(ReapiOutcome::ActionCacheHit));
                 stats.count_dist_type(DistType::Reapi(ReapiOutcome::CompiledLocally(
                     "staticlib crate type".to_owned(),
                 )));
@@ -2805,6 +2819,12 @@ mod tests {
         let mut writer = StringWriter::new();
         stats.print(&mut writer, false);
         let output = writer.get_output();
+        assert!(
+            output
+                .lines()
+                .any(|l| l.starts_with("REAPI action cache hits") && l.ends_with(" 3")),
+            "missing from:\n{output}"
+        );
         assert!(
             output.contains("REAPI local compilations:"),
             "missing from:\n{output}"
@@ -2832,9 +2852,25 @@ mod tests {
         stats.count_dist_type(DistType::Reapi(ReapiOutcome::CompiledLocally(
             "not rustc".into(),
         )));
+        let mut old_json = serde_json::to_value(&stats).unwrap();
+        old_json["reapi"]
+            .as_object_mut()
+            .unwrap()
+            .remove("action_cache_hits");
+        assert_eq!(
+            serde_json::from_value::<ServerStats>(old_json)
+                .unwrap()
+                .reapi
+                .unwrap()
+                .action_cache_hits,
+            0
+        );
+        stats.count_dist_type(DistType::Reapi(ReapiOutcome::ActionCacheHit));
         let bytes = bincode::serialize(&stats).unwrap();
         let restored: ServerStats = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(restored.reapi.unwrap().local_compilations["not rustc"], 1);
+        let reapi = restored.reapi.unwrap();
+        assert_eq!(reapi.local_compilations["not rustc"], 1);
+        assert_eq!(reapi.action_cache_hits, 1);
     }
 
     #[test]

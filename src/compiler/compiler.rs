@@ -669,6 +669,16 @@ where
             }
             digest.finish()
         };
+        let key = if local_compile_changes.extra_hash_key.is_empty() {
+            key
+        } else {
+            let mut digest = Digest::new();
+            digest.update(b"sccache-local-compile-inputs-v1\0");
+            digest.update(key.as_bytes());
+            digest.update(&(local_compile_changes.extra_hash_key.len() as u64).to_le_bytes());
+            digest.update(&local_compile_changes.extra_hash_key);
+            digest.finish()
+        };
         debug!("[{}]: Hash key: {}", out_pretty, key);
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
@@ -835,6 +845,7 @@ where
                         weak_toolchain_key,
                         output_name: out_pretty.clone(),
                         hash_key_options,
+                        cache_control,
                         local_compile_changes,
                     },
                 )
@@ -1069,6 +1080,7 @@ pub enum DistType {
 /// What happened to a compile in a REAPI build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReapiOutcome {
+    ActionCacheHit,
     /// Compiled locally, for the reason given.
     CompiledLocally(String),
 }
@@ -3915,6 +3927,8 @@ LLVM version: 6.0",
     }
     struct LocalCompileChangesExecutor {
         args: Vec<LocalArg>,
+        extra_hash_key: Vec<u8>,
+        seen_policies: Arc<std::sync::Mutex<Vec<CacheControl>>>,
     }
 
     #[async_trait]
@@ -3934,6 +3948,7 @@ LLVM version: 6.0",
             Ok(PreparedCompile {
                 compilation,
                 local_compile_changes: LocalCompileChanges {
+                    extra_hash_key: self.extra_hash_key.clone(),
                     args: self.args.clone(),
                     stdout_stderr_mapper: mapper,
                 },
@@ -3941,6 +3956,10 @@ LLVM version: 6.0",
         }
 
         async fn execute(&self, request: CompileRequest<'_, T>) -> Result<CompileOutcome> {
+            self.seen_policies
+                .lock()
+                .unwrap()
+                .push(request.cache_control);
             request.execute_locally().await
         }
     }
@@ -3948,6 +3967,9 @@ LLVM version: 6.0",
     type PreparationCreator = Arc<std::sync::Mutex<MockCommandCreator>>;
 
     struct PreparationFixture {
+        cache_control: CacheControl,
+        extra_hash_key: Vec<u8>,
+        seen_policies: Arc<std::sync::Mutex<Vec<CacheControl>>>,
         f: TestFixture,
         creator: PreparationCreator,
         runtime: Runtime,
@@ -4001,6 +4023,9 @@ LLVM version: 6.0",
                 o => panic!("Bad result from parse_arguments: {:?}", o),
             };
             PreparationFixture {
+                cache_control: CacheControl::Default,
+                extra_hash_key: vec![],
+                seen_policies: Default::default(),
                 f,
                 creator,
                 runtime,
@@ -4037,6 +4062,8 @@ LLVM version: 6.0",
             });
             let executor = changes.map(|args| {
                 Arc::new(LocalCompileChangesExecutor {
+                    extra_hash_key: self.extra_hash_key.clone(),
+                    seen_policies: self.seen_policies.clone(),
                     args: args
                         .iter()
                         .map(|(arg, hashed_as)| LocalArg {
@@ -4054,7 +4081,7 @@ LLVM version: 6.0",
                 self.arguments.clone(),
                 self.f.tempdir.path().to_path_buf(),
                 vec![],
-                CacheControl::Default,
+                self.cache_control,
                 self.runtime.handle().clone(),
             ));
             match result {
@@ -4068,6 +4095,7 @@ LLVM version: 6.0",
                     creator.children.pop();
                     (true, output)
                 }
+                Ok((CompileResult::NotCached(_, _), output)) => (false, output),
                 Ok((other, _)) => panic!("Unexpected compile result: {other:?}"),
                 Err(error) => match error.downcast::<ProcessError>() {
                     Ok(ProcessError(output)) => (false, output),
@@ -4075,6 +4103,28 @@ LLVM version: 6.0",
                 },
             }
         }
+    }
+
+    #[test_case(CacheControl::Default ; "default")]
+    #[test_case(CacheControl::ForceRecache ; "recache")]
+    #[test_case(CacheControl::ForceNoCache ; "no cache")]
+    fn test_executor_receives_cache_policy(cache_control: CacheControl) {
+        let mut fixture = PreparationFixture::new();
+        fixture.cache_control = cache_control;
+        fixture.compile(Some(&[]), 0);
+        assert_eq!(*fixture.seen_policies.lock().unwrap(), vec![cache_control]);
+    }
+
+    #[test]
+    fn test_preparation_hash_inputs_affect_local_cache_lookup() {
+        let mut fixture = PreparationFixture::new();
+        fixture.extra_hash_key = b"first environment".to_vec();
+        assert!(!fixture.compile(Some(&[]), 0).0);
+        assert!(fixture.compile(Some(&[]), 0).0);
+        fixture.extra_hash_key = b"second environment".to_vec();
+        assert!(!fixture.compile(Some(&[]), 0).0);
+        fixture.extra_hash_key = b"first environment".to_vec();
+        assert!(fixture.compile(Some(&[]), 0).0);
     }
 
     #[test]
@@ -4208,7 +4258,9 @@ LLVM version: 6.0",
                 weak_toolchain_key,
                 output_name: "foo.o".to_owned(),
                 hash_key_options: HashKeyOptions::default(),
+                cache_control: CacheControl::Default,
                 local_compile_changes: LocalCompileChanges {
+                    extra_hash_key: vec![],
                     args: vec![],
                     stdout_stderr_mapper: Some(Box::new(|_| panic!("no process output to map"))),
                 },

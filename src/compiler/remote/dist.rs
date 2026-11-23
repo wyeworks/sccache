@@ -61,6 +61,7 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for DistExecutor {
             cwd,
             weak_toolchain_key,
             output_name,
+            cache_control: _,
             hash_key_options,
             local_compile_changes,
         } = request;

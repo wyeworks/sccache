@@ -5,6 +5,10 @@
 
 pub mod helpers;
 
+#[cfg(all(feature = "reapi", unix))]
+#[path = "helpers/reapi.rs"]
+mod reapi_test;
+
 use anyhow::{Context, Result, bail};
 use helpers::{CARGO, CRATE_DIR, cargo_clean, stop_sccache};
 
@@ -40,56 +44,15 @@ fn test_rust_cargo_build() -> Result<()> {
 #[cfg(all(feature = "reapi", unix))]
 #[test]
 #[serial]
-fn test_reapi_configured_local_build_and_cache_hit() -> Result<()> {
-    use bazel_remote_apis::build::bazel::remote::execution::v2 as remexec;
-    use bazel_remote_apis::build::bazel::semver::SemVer;
-    use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
+fn test_reapi_remote_hit_and_local_fallback() -> Result<()> {
+    use reapi_test::ReapiTestServer;
     use sccache::config::{FileConfig, ReapiConfig};
-    use std::sync::{Arc, Mutex};
-    use tokio::net::TcpListener;
-    use tonic::transport::{Server, server::TcpIncoming};
-    use tonic::{Request, Response, Status};
-
-    #[derive(Default)]
-    struct Farm {
-        requests: Mutex<Vec<(String, Option<String>)>>,
-    }
-    #[tonic::async_trait]
-    impl Capabilities for Farm {
-        async fn get_capabilities(
-            &self,
-            request: Request<remexec::GetCapabilitiesRequest>,
-        ) -> std::result::Result<Response<remexec::ServerCapabilities>, Status> {
-            let auth = request
-                .metadata()
-                .get("authorization")
-                .map(|v| v.to_str().unwrap().to_owned());
-            self.requests
-                .lock()
-                .unwrap()
-                .push((request.into_inner().instance_name, auth));
-            Ok(Response::new(remexec::ServerCapabilities {
-                cache_capabilities: Some(Default::default()),
-                high_api_version: Some(SemVer {
-                    major: 2,
-                    minor: 1,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }))
-        }
-    }
+    use std::sync::Arc;
 
     let mut test_info = SccacheTest::new(None)?;
     let runtime = tokio::runtime::Runtime::new()?;
-    let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0"))?;
-    let endpoint = format!("grpc://{}", listener.local_addr()?);
-    let farm = Arc::new(Farm::default());
-    runtime.spawn(
-        Server::builder()
-            .add_service(CapabilitiesServer::from_arc(farm.clone()))
-            .serve_with_incoming(TcpIncoming::from(listener)),
-    );
+    let farm = Arc::new(ReapiTestServer::default());
+    let endpoint = runtime.block_on(farm.serve());
     let checkout = test_info.tempdir.path().join("project");
     fs::create_dir_all(checkout.join("src"))?;
     // Match Cargo's physical cwd, including macOS's /var -> /private/var alias.
@@ -122,7 +85,7 @@ fn main() {
             cache_dir: reapi_cache.clone(),
             instance_name: "smoke".into(),
             auth_token_file: Some(token_file),
-            ready_wait_secs: 10,
+            ready_wait_secs: 120,
         }),
         client_side_mode: true,
         ..Default::default()
@@ -150,31 +113,78 @@ fn main() {
     assert!(
         memchr::memmem::find(&original, absolute_checkout.as_os_str().as_encoded_bytes()).is_none()
     );
-    let stats = test_info
-        .show_stats()?
-        .try_stdout(predicate::str::contains(
-            r#""cache_misses":{"counts":{"Rust":1},"adv_counts":{"rust":1}}"#,
-        ))?;
+    let stats = test_info.show_stats()?;
     let stats: serde_json::Value = serde_json::from_slice(&stats.get_output().stdout)?;
-    let reapi = &stats["stats"]["reapi"];
-    // Cold toolchain hashing can outlast the readiness budget in debug builds.
-    assert!(
-        reapi.is_null()
-            || *reapi == serde_json::json!({"local_compilations": {"hashing the toolchain": 1}}),
-        "unexpected REAPI fallback: {reapi}"
+    assert_eq!(stats["stats"]["cache_misses"]["counts"]["Rust"], 1);
+    assert_eq!(
+        stats["stats"]["reapi"]["local_compilations"]["not in the action cache"],
+        1
     );
+    let action = {
+        let requests = farm.lookup_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        requests[0].action_digest.clone().unwrap()
+    };
+    let outputs = fs::read_dir(target.join("debug/deps"))?
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_name()?.to_str()?;
+            if name.starts_with("libreapi_smoke-")
+                && matches!(path.extension()?.to_str()?, "rlib" | "rmeta")
+            {
+                Some((
+                    format!(".sccache-build/debug/deps/{name}"),
+                    fs::read(&path).unwrap(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outputs.len(), 2);
+    farm.cache_outputs(action.clone(), outputs);
 
+    // Keep REAPI's digest cache but give the daemon an empty local result cache.
+    let local_cache = test_info.tempdir.path().join("remote-hit-cache");
+    for (name, value) in &mut test_info.env {
+        if *name == "SCCACHE_DIR" {
+            *value = local_cache.as_os_str().to_owned();
+        }
+    }
+    restart_sccache(
+        &test_info,
+        Some(vec![
+            ("SCCACHE_CONF".into(), config_path.to_str().unwrap().into()),
+            ("SCCACHE_DIR".into(), local_cache.to_str().unwrap().into()),
+        ]),
+    )?;
     fs::remove_dir_all(&target)?;
     cargo_build(&test_info, &checkout)?;
     assert_eq!(
         original,
         fs::read(target.join("debug/libreapi_smoke.rlib"))?
     );
+    let stats = test_info.show_stats()?;
+    let stats: serde_json::Value = serde_json::from_slice(&stats.get_output().stdout)?;
+    assert_eq!(stats["stats"]["reapi"]["action_cache_hits"], 1);
+    assert_eq!(farm.lookup_requests.lock().unwrap().len(), 2);
+    assert_eq!(farm.read_requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        farm.lookup_requests.lock().unwrap()[1]
+            .action_digest
+            .as_ref(),
+        Some(&action)
+    );
+    fs::remove_dir_all(&target)?;
+    cargo_build(&test_info, &checkout)?;
     test_info
         .show_stats()?
         .try_stdout(predicate::str::contains(
             r#""cache_hits":{"counts":{"Rust":1},"adv_counts":{"rust":1}}"#,
         ))?;
+
+    assert_eq!(farm.lookup_requests.lock().unwrap().len(), 2);
+    assert_eq!(farm.read_requests.lock().unwrap().len(), 2);
 
     Command::new(CARGO.as_os_str())
         .args(["build", "--offline"])
@@ -195,8 +205,8 @@ fn main() {
         .show_text_stats(false)?
         .try_stdout(predicate::str::contains("REAPI local compilations:"))?;
     assert_eq!(
-        *farm.requests.lock().unwrap(),
-        vec![("smoke".to_owned(), Some("Bearer test-token".to_owned()))]
+        *farm.capabilities_requests.lock().unwrap(),
+        vec![("smoke".to_owned(), Some("Bearer test-token".to_owned())); 2]
     );
     Ok(())
 }

@@ -12,16 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Local execution and eligibility reporting for configured REAPI builds.
+//! Remote cache lookup with local compilation on a miss or an unusable result.
 
 use super::client::{ConnectOptions, check_connect_options};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
+use super::remote_compile::{
+    action_digest, digest_input_root_files, materialize, materialize_failure_reason,
+};
 use super::toolchains::{ToolchainFiles, Toolchains};
 use crate::compiler::{
-    Compilation, CompileExecutor, CompileOutcome, CompileRequest, DistType, PreparedCompile,
-    ReapiOutcome,
+    CacheControl, Cacheable, Compilation, CompileExecutor, CompileOutcome, CompileRequest,
+    DistType, PreparedCompile, ReapiOutcome,
 };
 use crate::config::ReapiConfig;
 use crate::errors::*;
@@ -29,6 +32,7 @@ use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -40,6 +44,7 @@ const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 pub(crate) struct ReapiExecutor {
     connection: Option<Arc<Connection>>,
     toolchains: Arc<Toolchains>,
+    digest_cache: Arc<DigestCache>,
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
 }
@@ -61,11 +66,11 @@ impl ReapiExecutor {
                 MAX_READY_WAIT.as_secs()
             );
         }
+        let digest_cache = Arc::new(DigestCache::load(config.cache_dir.join(DIGEST_CACHE_FILE)));
         Self {
             connection,
-            toolchains: Toolchains::new(DigestCache::load(
-                config.cache_dir.join(DIGEST_CACHE_FILE),
-            )),
+            toolchains: Toolchains::new(digest_cache.clone()),
+            digest_cache,
             ready_wait,
             sysroot_copies_dir: config.cache_dir.join(SYSROOT_COPIES_DIR),
         }
@@ -85,6 +90,77 @@ impl ReapiExecutor {
             self.toolchains.files(&compile.toolchain, deadline)
         )
     }
+
+    async fn look_up(
+        &self,
+        reapi_compile: ReapiCompile,
+        apis: Arc<ServerApis>,
+        toolchain: ToolchainFiles,
+        out_pretty: &str,
+    ) -> std::result::Result<process::Output, CompileLocallyReason> {
+        let digest_cache = self.digest_cache.clone();
+        let digested = tokio::task::spawn_blocking(move || {
+            let files = digest_input_root_files(&reapi_compile, &digest_cache)?;
+            let digest = action_digest(&reapi_compile, &files, &toolchain)?;
+            Ok::<_, Error>((reapi_compile, digest))
+        })
+        .await;
+        let (reapi_compile, action_digest) = match digested.map_err(Error::from).flatten() {
+            Ok(digested) => digested,
+            Err(e) => {
+                warn!(
+                    "[{}]: Compiling locally: failed to hash the inputs: {:#}",
+                    out_pretty, e
+                );
+                return Err(CompileLocallyReason::HashingInputsFailed);
+            }
+        };
+        let result = match apis.action_cache.get_action_result(&action_digest).await {
+            Ok(Some(result)) if result.exit_code == 0 => result,
+            // Treat cached failures as misses; worker failures may be transient.
+            Ok(_) => return Err(CompileLocallyReason::NotInActionCache),
+            Err(e) => {
+                warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+                return Err(CompileLocallyReason::ActionCacheLookupFailed);
+            }
+        };
+        match materialize(&apis.cas, &reapi_compile, &result).await {
+            Ok(output) => {
+                debug!(
+                    "[{}]: REAPI action cache hit {}",
+                    out_pretty, action_digest.hash
+                );
+                Ok(output)
+            }
+            Err(e) => {
+                let reason = materialize_failure_reason(&e);
+                // Avoid repeated warnings for unusable cached results.
+                let log_level = match reason {
+                    CompileLocallyReason::UnusableResult
+                    | CompileLocallyReason::WorkerRootInOutput => log::Level::Debug,
+                    _ => log::Level::Warn,
+                };
+                log!(
+                    log_level,
+                    "[{}]: Compiling locally: action cache result {}: {:#}",
+                    out_pretty,
+                    action_digest.hash,
+                    e
+                );
+                Err(reason)
+            }
+        }
+    }
+}
+
+async fn compile_locally<T: CommandCreatorSync>(
+    request: CompileRequest<'_, T>,
+    reason: CompileLocallyReason,
+) -> Result<CompileOutcome> {
+    debug!("[{}]: Compiling locally: {reason}", request.output_name);
+    let mut outcome = request.execute_locally().await?;
+    outcome.execution = DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string()));
+    Ok(outcome)
 }
 
 fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
@@ -127,6 +203,9 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
     }
 
     async fn execute(&self, mut request: CompileRequest<'_, T>) -> Result<CompileOutcome> {
+        if request.cache_control != CacheControl::Default {
+            return compile_locally(request, CompileLocallyReason::CacheBypassed).await;
+        }
         let compilation = request.compilation;
         let (compilation, mapped) = tokio::task::spawn_blocking(move || {
             // Preserve the compilation so an eligibility-check panic can still fall back.
@@ -136,14 +215,23 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
         .await
         .context("failed to check REAPI eligibility")?;
         request.compilation = compilation;
-        let reason = match mapped {
-            Ok(Ok(compile)) => self.prepare_lookup(&compile).await.err(),
+        let looked_up = match mapped {
+            Ok(Ok(_)) if request.local_compile_changes.args.is_empty() => {
+                Err(CompileLocallyReason::LocalCompileUnchanged)
+            }
+            Ok(Ok(compile)) => match self.prepare_lookup(&compile).await {
+                Ok((apis, toolchain)) => {
+                    self.look_up(compile, apis, toolchain, &request.output_name)
+                        .await
+                }
+                Err(reason) => Err(reason),
+            },
             Err(_) => {
                 warn!(
                     "[{}]: REAPI eligibility check panicked; compiling locally",
                     request.output_name
                 );
-                Some(CompileLocallyReason::MappingPanicked)
+                Err(CompileLocallyReason::MappingPanicked)
             }
             Ok(Err(not_eligible)) => {
                 match &not_eligible.detail {
@@ -156,19 +244,17 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
                         request.output_name, not_eligible.reason
                     ),
                 }
-                Some(not_eligible.reason)
+                Err(not_eligible.reason)
             }
         };
-        let execution = match reason {
-            Some(reason) => {
-                debug!("[{}]: Compiling locally: {reason}", request.output_name);
-                DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string()))
-            }
-            None => DistType::NoDist,
-        };
-        let mut outcome = request.execute_locally().await?;
-        outcome.execution = execution;
-        Ok(outcome)
+        match looked_up {
+            Ok(output) => Ok(CompileOutcome {
+                cacheable: Cacheable::Yes,
+                execution: DistType::Reapi(ReapiOutcome::ActionCacheHit),
+                output,
+            }),
+            Err(reason) => compile_locally(request, reason).await,
+        }
     }
 }
 
@@ -176,23 +262,26 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
 mod test {
     use super::*;
     use crate::compiler::{
-        CCompileCommand, Cacheable, CompileCommand, LocalArg, LocalCompileChanges,
+        CCompileCommand, CacheControl, Cacheable, CompileCommand, LocalArg, LocalCompileChanges,
         SingleCompileCommand,
     };
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
-    use crate::reapi::remote_compile::test::fake_sysroot;
+    use crate::reapi::proto::build::bazel::remote::execution::v2 as remexec;
+    use crate::reapi::remote_compile::test::{fake_sysroot, inline_output, worker_result};
     use crate::reapi::test::FakeServer;
-    use crate::reapi::{CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey};
+    use crate::reapi::{PathMapper, ToolchainKey};
     use crate::server::SccacheService;
     use crate::test::utils::{new_creator, next_command};
     use std::ffi::OsString;
     use std::path::Path;
-    use std::process;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
     use test_case::test_case;
 
     type Creator = Arc<Mutex<MockCommandCreator>>;
+
+    const TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+    const RLIB: &str = "target/debug/deps/libfoo.rlib";
 
     #[derive(Clone, Copy)]
     enum Eligibility {
@@ -201,7 +290,12 @@ mod test {
         Panics,
     }
 
-    struct FakeCompilation(Eligibility, PathBuf);
+    /// A compile of `dir/ws/src/lib.rs` into `dir/ws/target/debug/deps/libfoo.rlib` with the
+    /// toolchain at `dir/sysroot`. Its local compile gets `--sysroot=<sysroot_copies_dir>`.
+    struct FakeCompilation {
+        eligibility: Eligibility,
+        dir: PathBuf,
+    }
 
     impl Compilation<Creator> for FakeCompilation {
         fn generate_compile_commands(
@@ -226,24 +320,25 @@ mod test {
             ))
         }
 
-        fn map_for_reapi(&self) -> std::result::Result<ReapiCompile, NotEligible> {
-            match self.0 {
+        fn map_for_reapi(&self) -> std::result::Result<ReapiCompile, crate::reapi::NotEligible> {
+            match self.eligibility {
                 Eligibility::Eligible => {}
                 Eligibility::Ineligible => return Err(CompileLocallyReason::Staticlib.into()),
                 Eligibility::Panics => panic!("map_for_reapi"),
             }
+            let ws = self.dir.join("ws");
             Ok(ReapiCompile {
-                path_mapper: PathMapper::new("/src".into(), "/src/target".into()),
+                path_mapper: PathMapper::new(ws.clone(), ws.join("target")),
                 arguments: vec![],
                 mapped_crate_root: None,
                 toolchain: ToolchainKey::new(
-                    "abc123".into(),
-                    self.1.clone(),
-                    "x86_64-unknown-linux-gnu".into(),
+                    "abc123".to_owned(),
+                    self.dir.join("sysroot"),
+                    TARGET_TRIPLE.to_owned(),
                 ),
                 env: Default::default(),
-                input_root_files: vec![],
-                outputs: vec![],
+                input_root_files: vec![ws.join("src/lib.rs")],
+                outputs: vec![ws.join(RLIB)],
             })
         }
 
@@ -254,6 +349,7 @@ mod test {
             let mut arg = OsString::from("--sysroot=");
             arg.push(sysroot_copies_dir);
             Some(LocalCompileChanges {
+                extra_hash_key: vec![],
                 args: vec![LocalArg {
                     hashed_as: arg.clone(),
                     arg,
@@ -285,47 +381,127 @@ mod test {
         }
     }
 
+    /// An executor that waits up to 10s for a fake server, and a temp dir holding the
+    /// toolchain and `ws/src/lib.rs`.
+    struct Fixture {
+        runtime: tokio::runtime::Runtime,
+        server: Arc<FakeServer>,
+        dir: tempfile::TempDir,
+        config: ReapiConfig,
+        eligibility: Eligibility,
+        cache_control: CacheControl,
+        local_compile_changed: bool,
+    }
+
+    impl Fixture {
+        fn new(eligibility: Eligibility) -> Self {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let server = Arc::new(FakeServer::default());
+            let mut config = config(runtime.block_on(server.serve()), 10);
+            let dir = tempfile::tempdir().unwrap();
+            fake_sysroot(dir.path());
+            config.cache_dir = dir.path().join("reapi-cache");
+            let lib_rs = dir.path().join("ws/src/lib.rs");
+            std::fs::create_dir_all(lib_rs.parent().unwrap()).unwrap();
+            std::fs::write(&lib_rs, "pub fn f() {}").unwrap();
+            // Cargo creates the output directory before running rustc.
+            std::fs::create_dir_all(dir.path().join("ws/target/debug/deps")).unwrap();
+            Fixture {
+                runtime,
+                server,
+                dir,
+                config,
+                eligibility,
+                cache_control: CacheControl::Default,
+                local_compile_changed: true,
+            }
+        }
+
+        fn compilation(&self) -> FakeCompilation {
+            FakeCompilation {
+                eligibility: self.eligibility,
+                dir: self.dir.path().to_owned(),
+            }
+        }
+
+        /// Puts a successful result that writes an rlib holding `rlib`, changed by `change`, in
+        /// the fake server's action cache.
+        fn put_result_in_action_cache(&self, change: fn(&mut remexec::ActionResult)) {
+            let compile = self.compilation().map_for_reapi().unwrap();
+            let digest_cache = DigestCache::load(self.dir.path().join("digests.json"));
+            let files = digest_input_root_files(&compile, &digest_cache).unwrap();
+            let toolchain = crate::reapi::remote_compile::toolchain_files(
+                &self.dir.path().join("sysroot"),
+                TARGET_TRIPLE,
+                &digest_cache,
+            )
+            .unwrap();
+            let action_digest = action_digest(&compile, &files, &toolchain).unwrap();
+            let rlib_path = compile
+                .path_mapper
+                .to_input_root(&compile.outputs[0])
+                .unwrap();
+            let mut result = worker_result(vec![inline_output(&rlib_path, b"rlib")]);
+            change(&mut result);
+            self.server.insert_action_result(&action_digest, result);
+        }
+
+        /// Runs the compile through the executor. A local compile writes `out` to stdout and
+        /// `err` to stderr.
+        fn compile(&self) -> (DistType, process::Output) {
+            let executor = ReapiExecutor::new(&self.config);
+            let storage = Arc::new(crate::cache::disk::DiskCache::new(
+                self.dir.path(),
+                0,
+                self.runtime.handle(),
+                Default::default(),
+                crate::cache::CacheMode::ReadWrite,
+                vec![],
+            ));
+            let service = SccacheService::mock_with_storage(storage, self.runtime.handle().clone());
+            let creator = new_creator();
+            next_command(&creator, Ok(MockChild::new(exit_status(0), "out", "err")));
+            let mut prepared = self
+                .runtime
+                .block_on(CompileExecutor::<Creator>::prepare(
+                    &executor,
+                    Box::new(self.compilation()),
+                ))
+                .unwrap();
+            if !self.local_compile_changed {
+                prepared.local_compile_changes.args.clear();
+            }
+            let request = CompileRequest {
+                service: &service,
+                creator: &creator,
+                compilation: prepared.compilation,
+                cwd: self.dir.path().join("ws"),
+                weak_toolchain_key: String::new(),
+                output_name: "lib.rs".into(),
+                hash_key_options: Default::default(),
+                cache_control: self.cache_control,
+                local_compile_changes: prepared.local_compile_changes,
+            };
+            let outcome = self.runtime.block_on(executor.execute(request)).unwrap();
+            if outcome.execution == DistType::Reapi(ReapiOutcome::ActionCacheHit) {
+                assert_eq!(
+                    creator.lock().unwrap().children.len(),
+                    1,
+                    "a cache hit ran the compiler"
+                );
+            }
+            (outcome.execution, outcome.output)
+        }
+    }
+
+    /// Compiles with the config changed by `configure`, which gets the fixture's temp dir.
     fn compile(
         eligibility: Eligibility,
         configure: impl FnOnce(&mut ReapiConfig, &Path),
     ) -> (DistType, process::Output) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let server = Arc::new(FakeServer::default());
-        let mut config = config(runtime.block_on(server.serve()), 10);
-        let cache_dir = tempfile::tempdir().unwrap();
-        config.cache_dir = cache_dir.path().join("reapi");
-        let sysroot = fake_sysroot(cache_dir.path());
-        configure(&mut config, cache_dir.path());
-        let storage = Arc::new(crate::cache::disk::DiskCache::new(
-            cache_dir.path(),
-            0,
-            runtime.handle(),
-            Default::default(),
-            crate::cache::CacheMode::ReadWrite,
-            vec![],
-        ));
-        let service = SccacheService::mock_with_storage(storage, runtime.handle().clone());
-        let creator = new_creator();
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "out", "err")));
-        let executor = ReapiExecutor::new(&config);
-        let prepared = runtime
-            .block_on(CompileExecutor::<Creator>::prepare(
-                &executor,
-                Box::new(FakeCompilation(eligibility, sysroot)),
-            ))
-            .unwrap();
-        let request = CompileRequest {
-            service: &service,
-            creator: &creator,
-            compilation: prepared.compilation,
-            cwd: ".".into(),
-            weak_toolchain_key: String::new(),
-            output_name: "lib.rs".into(),
-            hash_key_options: Default::default(),
-            local_compile_changes: prepared.local_compile_changes,
-        };
-        let outcome = runtime.block_on(executor.execute(request)).unwrap();
-        (outcome.execution, outcome.output)
+        let mut fixture = Fixture::new(eligibility);
+        configure(&mut fixture.config, fixture.dir.path());
+        fixture.compile()
     }
 
     fn compiled_locally(reason: &str) -> DistType {
@@ -340,10 +516,154 @@ mod test {
     }
 
     #[test]
-    fn test_an_eligible_compile_runs_locally_without_a_reason_once_connected() {
+    fn test_a_hit_writes_its_outputs() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        fixture.put_result_in_action_cache(|_| {});
+        let (dist_type, output) = fixture.compile();
+        assert_eq!(DistType::Reapi(ReapiOutcome::ActionCacheHit), dist_type);
+        assert!(output.status.success());
+        let ws = fixture.dir.path().join("ws");
+        assert_eq!(b"rlib".as_slice(), std::fs::read(ws.join(RLIB)).unwrap());
+        let expected_stderr = format!("warning: in {}/src/lib.rs\n", ws.display());
+        assert_eq!(expected_stderr.as_bytes(), output.stderr);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_second_checkout_uses_the_same_action_cache_entry() {
+        let first = Fixture::new(Eligibility::Eligible);
+        first.put_result_in_action_cache(|_| {});
+        let mut second = Fixture::new(Eligibility::Eligible);
+        second.config.endpoint = first.config.endpoint.clone();
+        // Install identical toolchain contents under a different local path.
+        std::fs::copy(
+            first.dir.path().join("sysroot/bin/rustc"),
+            second.dir.path().join("sysroot/bin/rustc"),
+        )
+        .unwrap();
+        assert_eq!(
+            second.compile().0,
+            DistType::Reapi(ReapiOutcome::ActionCacheHit)
+        );
+        assert_eq!(
+            std::fs::read(second.dir.path().join("ws").join(RLIB)).unwrap(),
+            b"rlib"
+        );
+        assert_eq!(first.server.lookup_requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_input_hashing_failure_skips_the_remote_lookup() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        std::fs::remove_file(fixture.dir.path().join("ws/src/lib.rs")).unwrap();
+        assert_eq!(
+            fixture.compile().0,
+            compiled_locally("failed to hash the inputs")
+        );
+        assert!(fixture.server.lookup_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_a_miss_compiles_locally() {
         let (dist_type, output) = compile(Eligibility::Eligible, |_, _| {});
-        assert_eq!(DistType::NoDist, dist_type);
+        assert_eq!(compiled_locally("not in the action cache"), dist_type);
         assert_eq!(b"err".as_slice(), output.stderr);
+    }
+
+    #[test]
+    fn test_a_failed_lookup_compiles_locally() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        let (dist_type, output) = fixture.compile();
+        assert_eq!(compiled_locally("action cache lookup failed"), dist_type);
+        assert_eq!(b"out".as_slice(), output.stdout);
+    }
+
+    #[test_case::test_case(
+        |result| result.exit_code = 1,
+        "not in the action cache" ;
+        "failed result"
+    )]
+    #[test_case::test_case(
+        |result| result.stderr_raw.clear(),
+        "unusable action cache result" ;
+        "result without the worker root line"
+    )]
+    #[test_case::test_case(
+        |result| {
+            let path = result.output_files[0].path.clone();
+            result.output_files[0] = inline_output(&path, b"built in /w/1");
+        },
+        "worker root in an output" ;
+        "worker root in the rlib"
+    )]
+    #[test_case::test_case(
+        // Without inline contents, the client downloads the rlib from the CAS, which lacks it.
+        |result| result.output_files[0].contents.clear(),
+        "failed to download the outputs" ;
+        "rlib missing from the cas"
+    )]
+    fn test_a_result_that_cant_be_used_compiles_locally(
+        change: fn(&mut remexec::ActionResult),
+        reason: &str,
+    ) {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        fixture.put_result_in_action_cache(change);
+        let (dist_type, output) = fixture.compile();
+        assert_eq!(compiled_locally(reason), dist_type);
+        assert_eq!(b"out".as_slice(), output.stdout);
+    }
+
+    #[test]
+    fn test_a_hit_whose_outputs_cant_be_written_compiles_locally() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        fixture.put_result_in_action_cache(|_| {});
+        std::fs::remove_dir_all(fixture.dir.path().join("ws/target")).unwrap();
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(compiled_locally("failed to write the outputs"), dist_type);
+    }
+
+    #[test_case::test_case(CacheControl::ForceRecache ; "recache")]
+    #[test_case::test_case(CacheControl::ForceNoCache ; "no cache")]
+    fn test_a_compile_that_bypasses_the_cache_skips_the_lookup(cache_control: CacheControl) {
+        let mut fixture = Fixture::new(Eligibility::Eligible);
+        fixture.put_result_in_action_cache(|_| {});
+        fixture.cache_control = cache_control;
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(
+            compiled_locally("SCCACHE_RECACHE or SCCACHE_NO_CACHE set"),
+            dist_type
+        );
+        assert!(fixture.server.lookup_requests.lock().unwrap().is_empty());
+        assert!(fixture.server.read_requests.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .server
+                .capabilities_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn test_an_unchanged_local_compile_skips_the_lookup() {
+        let mut fixture = Fixture::new(Eligibility::Eligible);
+        fixture.put_result_in_action_cache(|_| {});
+        fixture.local_compile_changed = false;
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(
+            compiled_locally("local compile without the worker's arguments"),
+            dist_type
+        );
+        assert!(fixture.server.lookup_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_an_eligible_compile_with_a_toolchain_without_std_runs_locally() {
+        let (dist_type, _) = compile(Eligibility::Eligible, |_, dir| {
+            std::fs::remove_dir_all(dir.join("sysroot/lib/rustlib")).unwrap();
+        });
+        assert_eq!(compiled_locally("missing rustc or std"), dist_type);
     }
 
     #[test]
@@ -357,15 +677,15 @@ mod test {
         );
     }
 
-    #[test_case(
+    #[test_case::test_case(
         |config, _| config.endpoint = "farm:8980".to_owned() ;
         "bad endpoint"
     )]
-    #[test_case(
+    #[test_case::test_case(
         |config, dir| config.auth_token_file = Some(dir.join("missing")) ;
         "unreadable token file"
     )]
-    #[test_case(
+    #[test_case::test_case(
         |config, dir| {
             std::fs::write(dir.join("token"), " \n").unwrap();
             config.auth_token_file = Some(dir.join("token"));
@@ -443,7 +763,10 @@ mod test {
         let changes = runtime
             .block_on(CompileExecutor::<Creator>::prepare(
                 &executor,
-                Box::new(FakeCompilation(Eligibility::Eligible, "/toolchain".into())),
+                Box::new(FakeCompilation {
+                    eligibility: Eligibility::Eligible,
+                    dir: "/".into(),
+                }),
             ))
             .unwrap()
             .local_compile_changes;

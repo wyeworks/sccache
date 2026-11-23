@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compiler::{Cacheable, Compilation, CompileCommand, DistType};
+use crate::compiler::{CacheControl, Cacheable, Compilation, CompileCommand, DistType};
 use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use crate::server::SccacheService;
@@ -44,6 +44,7 @@ pub struct CompileRequest<'a, T: CommandCreatorSync> {
     pub weak_toolchain_key: String,
     pub output_name: String,
     pub hash_key_options: HashKeyOptions,
+    pub cache_control: CacheControl,
     pub local_compile_changes: LocalCompileChanges,
 }
 
@@ -60,6 +61,8 @@ pub struct LocalArg {
 #[derive(Default)]
 pub struct LocalCompileChanges {
     pub args: Vec<LocalArg>,
+    /// Implicit inputs missing from the compiler's ordinary cache key.
+    pub extra_hash_key: Vec<u8>,
     /// Executed output is mapped before caching; cache-hit diagnostics are already mapped.
     pub stdout_stderr_mapper: Option<StdoutStderrMapper>,
 }
@@ -79,6 +82,7 @@ impl<T: CommandCreatorSync> CompileRequest<'_, T> {
             weak_toolchain_key: _,
             output_name,
             hash_key_options,
+            cache_control: _,
             local_compile_changes,
         } = self;
         let mut path_transformer = crate::dist::PathTransformer::new();

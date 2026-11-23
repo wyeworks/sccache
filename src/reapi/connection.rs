@@ -27,7 +27,6 @@ use tokio::time::Instant;
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
-#[allow(dead_code)]
 pub(super) struct ServerApis {
     pub(super) cas: Cas,
     pub(super) action_cache: ActionCache,
