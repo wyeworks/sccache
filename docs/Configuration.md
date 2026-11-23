@@ -190,12 +190,13 @@ endpoint = "grpcs://remote.example.com:443" # grpc:// for plaintext
 instance_name = ""                         # optional
 # cache_dir = "/path/to/reapi-cache"         # optional
 # auth_token_file = "/path/to/token"        # optional bearer-token file
-ready_wait_secs = 0                        # connection wait; 0 does not wait, max 3600
+ready_wait_secs = 0                        # readiness wait; 0 does not wait, max 3600
 ```
 
 REAPI support is under development. On eligible cache misses, sccache connects
-to the farm and checks its capabilities. Compiles still run locally; remote
-cache lookups and execution are not wired in yet.
+to the farm, checks its capabilities and hashes the toolchain in the background.
+`ready_wait_secs` covers both connection and hashing. Compiles still run locally;
+remote cache lookups and execution are not wired in yet.
 
 The token file is read when the sccache server starts. Restart the server after
 changing it. Transient connection failures are retried on later cache misses

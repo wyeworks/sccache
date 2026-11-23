@@ -795,7 +795,7 @@ pub struct ReapiConfig {
     pub instance_name: String,
     /// A file holding the bearer token sent with every request.
     pub auth_token_file: Option<PathBuf>,
-    /// Maximum time to wait for a connection before compiling locally, in seconds.
+    /// Maximum time to wait for connection and toolchain hashing before compiling locally, in seconds.
     #[serde(default)]
     pub ready_wait_secs: u64,
 }

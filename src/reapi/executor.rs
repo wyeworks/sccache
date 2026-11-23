@@ -16,7 +16,9 @@
 
 use super::client::{ConnectOptions, check_connect_options};
 use super::connection::{Connection, ServerApis};
-use super::mapping::CompileLocallyReason;
+use super::digest::DigestCache;
+use super::mapping::{CompileLocallyReason, ReapiCompile};
+use super::toolchains::{ToolchainFiles, Toolchains};
 use crate::compiler::{
     Compilation, CompileExecutor, CompileOutcome, CompileRequest, DistType, PreparedCompile,
     ReapiOutcome,
@@ -32,10 +34,12 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
+const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
 const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 
 pub(crate) struct ReapiExecutor {
     connection: Option<Arc<Connection>>,
+    toolchains: Arc<Toolchains>,
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
 }
@@ -59,19 +63,27 @@ impl ReapiExecutor {
         }
         Self {
             connection,
+            toolchains: Toolchains::new(DigestCache::load(
+                config.cache_dir.join(DIGEST_CACHE_FILE),
+            )),
             ready_wait,
             sysroot_copies_dir: config.cache_dir.join(SYSROOT_COPIES_DIR),
         }
     }
 
-    async fn server_apis(&self) -> std::result::Result<Arc<ServerApis>, CompileLocallyReason> {
+    async fn prepare_lookup(
+        &self,
+        compile: &ReapiCompile,
+    ) -> std::result::Result<(Arc<ServerApis>, ToolchainFiles), CompileLocallyReason> {
         let connection = self
             .connection
             .as_ref()
             .ok_or(CompileLocallyReason::Misconfigured)?;
-        connection
-            .server_apis(Instant::now() + self.ready_wait)
-            .await
+        let deadline = Instant::now() + self.ready_wait;
+        tokio::try_join!(
+            connection.server_apis(deadline),
+            self.toolchains.files(&compile.toolchain, deadline)
+        )
     }
 }
 
@@ -125,7 +137,7 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
         .context("failed to check REAPI eligibility")?;
         request.compilation = compilation;
         let reason = match mapped {
-            Ok(Ok(_)) => self.server_apis().await.err(),
+            Ok(Ok(compile)) => self.prepare_lookup(&compile).await.err(),
             Err(_) => {
                 warn!(
                     "[{}]: REAPI eligibility check panicked; compiling locally",
@@ -169,8 +181,9 @@ mod test {
     };
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+    use crate::reapi::remote_compile::test::fake_sysroot;
     use crate::reapi::test::FakeServer;
-    use crate::reapi::{CompileLocallyReason, NotEligible, PathMapper, ReapiCompile};
+    use crate::reapi::{CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey};
     use crate::server::SccacheService;
     use crate::test::utils::{new_creator, next_command};
     use std::ffi::OsString;
@@ -188,7 +201,7 @@ mod test {
         Panics,
     }
 
-    struct FakeCompilation(Eligibility);
+    struct FakeCompilation(Eligibility, PathBuf);
 
     impl Compilation<Creator> for FakeCompilation {
         fn generate_compile_commands(
@@ -223,7 +236,11 @@ mod test {
                 path_mapper: PathMapper::new("/src".into(), "/src/target".into()),
                 arguments: vec![],
                 mapped_crate_root: None,
-                target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+                toolchain: ToolchainKey::new(
+                    "abc123".into(),
+                    self.1.clone(),
+                    "x86_64-unknown-linux-gnu".into(),
+                ),
                 env: Default::default(),
                 input_root_files: vec![],
                 outputs: vec![],
@@ -276,6 +293,8 @@ mod test {
         let server = Arc::new(FakeServer::default());
         let mut config = config(runtime.block_on(server.serve()), 10);
         let cache_dir = tempfile::tempdir().unwrap();
+        config.cache_dir = cache_dir.path().join("reapi");
+        let sysroot = fake_sysroot(cache_dir.path());
         configure(&mut config, cache_dir.path());
         let storage = Arc::new(crate::cache::disk::DiskCache::new(
             cache_dir.path(),
@@ -292,7 +311,7 @@ mod test {
         let prepared = runtime
             .block_on(CompileExecutor::<Creator>::prepare(
                 &executor,
-                Box::new(FakeCompilation(eligibility)),
+                Box::new(FakeCompilation(eligibility, sysroot)),
             ))
             .unwrap();
         let request = CompileRequest {
@@ -332,9 +351,9 @@ mod test {
         let (dist_type, _) = compile(Eligibility::Eligible, |config, _| {
             config.ready_wait_secs = 0;
         });
-        assert_eq!(
-            compiled_locally("connecting to the REAPI server"),
-            dist_type
+        assert!(
+            matches!(dist_type, DistType::Reapi(ReapiOutcome::CompiledLocally(ref reason))
+            if reason == "connecting to the REAPI server" || reason == "hashing the toolchain")
         );
     }
 
@@ -373,6 +392,21 @@ mod test {
         assert_eq!(b"out".as_slice(), output.stdout);
     }
 
+    #[test_case("bin/rustc" ; "missing compiler")]
+    #[test_case("lib/rustlib/x86_64-unknown-linux-gnu/lib" ; "missing standard library")]
+    fn test_missing_toolchain_files_keep_compiles_local(path: &str) {
+        let (execution, output) = compile(Eligibility::Eligible, |_, dir| {
+            let path = dir.join("sysroot").join(path);
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).unwrap();
+            } else {
+                std::fs::remove_file(path).unwrap();
+            }
+        });
+        assert_eq!(compiled_locally("missing rustc or std"), execution);
+        assert!(output.status.success());
+    }
+
     #[test]
     fn test_ready_wait_is_capped() {
         let executor = ReapiExecutor::new(&config("grpc://127.0.0.1:1".into(), u64::MAX));
@@ -409,7 +443,7 @@ mod test {
         let changes = runtime
             .block_on(CompileExecutor::<Creator>::prepare(
                 &executor,
-                Box::new(FakeCompilation(Eligibility::Eligible)),
+                Box::new(FakeCompilation(Eligibility::Eligible, "/toolchain".into())),
             ))
             .unwrap()
             .local_compile_changes;

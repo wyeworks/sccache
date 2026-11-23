@@ -64,8 +64,8 @@ pub(crate) fn of_file(path: &Path) -> Result<remexec::Digest> {
 }
 
 /// The metadata that tells whether a file changed since it was hashed.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct FileStamp {
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct FileStamp {
     size: u64,
     modified: Timestamp,
     /// `None` on a Windows filesystem that doesn't record creation times.
@@ -77,7 +77,7 @@ struct FileStamp {
 }
 
 impl FileStamp {
-    fn of(path: &Path) -> Result<Self> {
+    pub(super) fn of(path: &Path) -> Result<Self> {
         // Follows symlinks, as `of_file` does.
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("reading the metadata of {}", path.display()))?;
@@ -213,6 +213,12 @@ impl DigestCache {
             }
         }
         Ok(digest)
+    }
+
+    #[cfg(test)]
+    pub(super) fn caching_new_files(mut self) -> Self {
+        self.min_age_to_cache = Duration::ZERO;
+        self
     }
 
     pub(crate) fn save(&self) -> Result<()> {

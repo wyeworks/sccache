@@ -393,6 +393,8 @@ pub struct ParsedArguments {
 /// A struct on which to hang a `Compilation` impl.
 #[derive(Debug, Clone)]
 pub struct RustCompilation {
+    #[cfg(feature = "reapi")]
+    commit_hash: Option<String>,
     /// The path to the rustc executable, not the rustup proxy.
     executable: PathBuf,
     #[cfg(feature = "reapi")]
@@ -2084,6 +2086,8 @@ where
         Ok(HashResult {
             key: m.finish(),
             compilation: Box::new(RustCompilation {
+                #[cfg(feature = "reapi")]
+                commit_hash: reapi_mapping::parse_commit_hash(&self.version),
                 executable: self.executable.clone(),
                 #[cfg(feature = "reapi")]
                 env_deps,
@@ -2341,7 +2345,7 @@ mod reapi_mapping {
     use super::*;
     use crate::compiler::remote::LocalArg;
     use crate::reapi::{
-        ActionEnv, CompileLocallyReason, PathMapper, normalize_absolute, sysroot_copy,
+        ActionEnv, CompileLocallyReason, PathMapper, ToolchainKey, normalize_absolute, sysroot_copy,
     };
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2364,7 +2368,20 @@ mod reapi_mapping {
                 anyhow!("{}", compilation.executable.display()),
             ));
         }
-        mapped_compile(compilation, path_mapper(compilation)?)
+        let commit_hash = compilation
+            .commit_hash
+            .clone()
+            .ok_or(CompileLocallyReason::NoCommitHash)?;
+        mapped_compile(compilation, path_mapper(compilation)?, commit_hash)
+    }
+
+    pub(super) fn parse_commit_hash(version: &str) -> Option<String> {
+        version
+            .lines()
+            .find_map(|line| line.strip_prefix("commit-hash: "))
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty() && *hash != "unknown")
+            .map(str::to_owned)
     }
 
     pub(super) fn reapi_local_compile_changes(
@@ -2504,6 +2521,7 @@ mod reapi_mapping {
     fn mapped_compile(
         compilation: &RustCompilation,
         path_mapper: PathMapper,
+        commit_hash: String,
     ) -> StdResult<ReapiCompile, NotEligible> {
         // Staticlibs bundle dependency and std object code absent from the input root.
         if compilation.crate_types.staticlib {
@@ -2668,7 +2686,7 @@ mod reapi_mapping {
             path_mapper,
             arguments,
             mapped_crate_root,
-            target_triple,
+            toolchain: ToolchainKey::new(commit_hash, compilation.sysroot.clone(), target_triple),
             env,
             input_root_files,
             outputs,
@@ -5596,7 +5614,7 @@ foo.rs:
     mod reapi_mapping {
         use super::*;
         use crate::compiler::rust::reapi_mapping::{
-            deps_dir_base, map_for_reapi, reapi_local_compile_changes,
+            deps_dir_base, map_for_reapi, parse_commit_hash, reapi_local_compile_changes,
         };
         use crate::reapi::{ActionEnv, CompileLocallyReason, ReapiCompile, sysroot_copy};
         use std::os::unix::ffi::OsStringExt;
@@ -5605,6 +5623,25 @@ foo.rs:
 
         const CWD: &str = "/ws/app";
         const HOST: &str = "x86_64-unknown-linux-gnu";
+
+        #[test_case("rustc 1.91.0\ncommit-hash: abc123\nhost: x\n", Some("abc123") ; "release")]
+        #[test_case("commit-hash: unknown\n", None ; "unknown")]
+        #[test_case("commit-hash: \n", None ; "empty")]
+        #[test_case("commit-hash:   \n", None ; "whitespace")]
+        #[test_case("rustc 1.91.0\n", None ; "absent")]
+        fn test_parse_commit_hash(version: &str, expected: Option<&str>) {
+            assert_eq!(parse_commit_hash(version).as_deref(), expected);
+        }
+
+        #[test]
+        fn test_a_compile_without_a_commit_hash_stays_local() {
+            let mut compilation = compilation(&[]);
+            compilation.commit_hash = None;
+            assert_eq!(
+                map_for_reapi(&compilation).unwrap_err().reason,
+                CompileLocallyReason::NoCommitHash
+            );
+        }
 
         fn compilation_with_target_dir(
             cwd: &str,
@@ -5640,6 +5677,7 @@ foo.rs:
                 env_deps: vec![],
                 host: HOST.to_owned(),
                 sysroot: "/toolchain".into(),
+                commit_hash: Some("abc123".into()),
                 #[cfg(feature = "dist-client")]
                 target_libdir: format!("/toolchain/lib/rustlib/{HOST}/lib").into(),
                 #[cfg(any(feature = "dist-client", feature = "reapi"))]
@@ -5801,7 +5839,7 @@ foo.rs:
             let compilation: Box<dyn Compilation<Arc<Mutex<MockCommandCreator>>>> =
                 Box::new(compilation(&[]));
             let mapped = compilation.map_for_reapi().unwrap();
-            assert_eq!(HOST, mapped.target_triple);
+            assert_eq!(HOST, mapped.toolchain.target_triple);
             assert!(mapped.arguments.contains(&"src/lib.rs".to_owned()));
         }
 
@@ -6468,12 +6506,12 @@ foo.rs:
         #[test]
         fn test_passes_the_target_triple() {
             let compile = map_for_reapi(&compilation(&[])).unwrap();
-            assert_eq!(HOST, compile.target_triple);
+            assert_eq!(HOST, compile.toolchain.target_triple);
             assert!(compile.arguments.contains(&format!("--target={HOST}")));
 
             let compile =
                 map_for_reapi(&compilation(&["--target", "aarch64-unknown-linux-gnu"])).unwrap();
-            assert_eq!("aarch64-unknown-linux-gnu", compile.target_triple);
+            assert_eq!("aarch64-unknown-linux-gnu", compile.toolchain.target_triple);
             assert!(!compile.arguments.contains(&format!("--target={HOST}")));
             assert!(
                 compile

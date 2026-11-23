@@ -18,6 +18,7 @@
 //! Paths under a compile's cwd keep their relative path in the input root, and paths
 //! under its build root (cargo's target dir) go under [`BUILD_ROOT_DIR`].
 
+use super::digest::FileStamp;
 use crate::errors::*;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -33,10 +34,58 @@ pub struct ReapiCompile {
     /// Absolute crate-root arguments must remain absolute on the worker: rustc
     /// preserves their spelling in its outputs. These are passed separately.
     pub(crate) mapped_crate_root: Option<String>,
-    pub(crate) target_triple: String,
+    pub(crate) toolchain: ToolchainKey,
     pub(crate) env: ActionEnv,
     pub(crate) input_root_files: Vec<PathBuf>,
     pub(crate) outputs: Vec<PathBuf>,
+}
+
+/// Identifies a local toolchain for in-memory reuse. File metadata detects updates
+/// without hashing the toolchain for every compile; content digests identify it remotely.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ToolchainKey {
+    pub(crate) commit_hash: String,
+    pub(crate) sysroot: PathBuf,
+    pub(crate) target_triple: String,
+    stamps: Vec<(PathBuf, Option<FileStamp>)>,
+}
+
+impl ToolchainKey {
+    /// Reads the stamps, so call it from a blocking thread.
+    pub(crate) fn new(commit_hash: String, sysroot: PathBuf, target_triple: String) -> Self {
+        let mut stamps = vec![];
+        let target = sysroot.join("lib/rustlib").join(&target_triple);
+        for (root, depth) in [
+            (sysroot.join("bin/rustc"), 0),
+            (sysroot.join("lib"), 1),
+            (target.join("lib"), usize::MAX),
+            (target.join("bin"), usize::MAX),
+        ] {
+            for entry in walkdir::WalkDir::new(root)
+                .follow_links(true)
+                .max_depth(depth)
+            {
+                let path = match entry {
+                    Ok(entry) => entry.into_path(),
+                    Err(error) => {
+                        if let Some(path) = error.path() {
+                            stamps.push((path.to_owned(), None));
+                        }
+                        continue;
+                    }
+                };
+                let stamp = FileStamp::of(&path).ok();
+                stamps.push((path, stamp));
+            }
+        }
+        stamps.sort_by(|a, b| a.0.cmp(&b.0));
+        ToolchainKey {
+            commit_hash,
+            sysroot,
+            target_triple,
+            stamps,
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -95,6 +144,11 @@ pub(crate) enum CompileLocallyReason {
     ConnectFailed,
     IncompatibleServer,
     CredentialsRefused,
+    NonUtf8ToolchainPath,
+    MissingRustcOrStd,
+    HashingToolchainFailed,
+    HashingToolchain,
+    NoCommitHash,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -120,6 +174,11 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::Connecting => "connecting to the REAPI server",
             Self::ConnectFailed => "failed to connect to the REAPI server",
             Self::IncompatibleServer => "incompatible REAPI server",
+            Self::NoCommitHash => "rustc without a commit hash",
+            Self::HashingToolchain => "hashing the toolchain",
+            Self::HashingToolchainFailed => "failed to hash the toolchain",
+            Self::MissingRustcOrStd => "missing rustc or std",
+            Self::NonUtf8ToolchainPath => "non-UTF-8 toolchain path",
             Self::CredentialsRefused => "REAPI server refused the credentials",
         })
     }
@@ -305,6 +364,49 @@ mod test {
     #[cfg(unix)]
     use crate::test::utils::find_rustc;
     use test_case::test_case;
+
+    #[test_case("bin/rustc" ; "compiler")]
+    #[test_case("lib/librustc_driver-x.so" ; "compiler library")]
+    #[test_case("lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-x.rlib" ; "standard library")]
+    #[test_case("lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld" ; "linker")]
+    fn test_toolchain_key_tracks_file_edits(path: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = crate::reapi::remote_compile::test::fake_sysroot(dir.path());
+        let key = || {
+            ToolchainKey::new(
+                "abc123".into(),
+                sysroot.clone(),
+                "x86_64-unknown-linux-gnu".into(),
+            )
+        };
+        let original = key();
+        assert_eq!(original, key());
+        let path = sysroot.join(path);
+        let old_metadata = std::fs::metadata(&path).unwrap();
+        // Keep the directory and file mtime unchanged, as an in-place edit can.
+        std::fs::write(&path, b"changed content, different length").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old_metadata.modified().unwrap())
+            .unwrap();
+        assert_ne!(original, key());
+    }
+
+    #[test]
+    fn test_toolchain_key_tracks_added_targets_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = dir.path().join("sysroot");
+        let key = |commit: &str, target: &str| {
+            ToolchainKey::new(commit.into(), sysroot.clone(), target.into())
+        };
+        let original = key("abc123", "target");
+        assert_ne!(original, key("new-commit", "target"));
+        assert_ne!(original, key("abc123", "other-target"));
+        std::fs::create_dir_all(sysroot.join("lib/rustlib/target/lib")).unwrap();
+        assert_ne!(original, key("abc123", "target"));
+    }
 
     fn path_mapper() -> PathMapper {
         PathMapper::new("/ws".into(), "/ws/target".into())
@@ -772,7 +874,7 @@ mod test {
             .map(str::to_owned)
             .collect(),
             mapped_crate_root: None,
-            target_triple: String::new(),
+            toolchain: ToolchainKey::new("abc123".into(), copy.clone(), String::new()),
             env: ActionEnv {
                 path_vars: vec![(
                     "OUT_DIR".into(),

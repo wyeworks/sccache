@@ -24,6 +24,7 @@ mod cas;
 mod client;
 
 mod connection;
+mod toolchains;
 
 #[allow(dead_code)]
 mod digest;
@@ -49,6 +50,7 @@ pub(crate) use bazel_remote_apis as proto;
 pub(crate) use executor::ReapiExecutor;
 
 pub(crate) use mapping::{
-    ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, normalize_absolute,
+    ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
+    normalize_absolute,
 };
 pub(crate) use sysroot::sysroot_copy;
