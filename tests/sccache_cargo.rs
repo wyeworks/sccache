@@ -41,9 +41,55 @@ fn test_rust_cargo_build() -> Result<()> {
 #[test]
 #[serial]
 fn test_reapi_configured_local_build_and_cache_hit() -> Result<()> {
+    use bazel_remote_apis::build::bazel::remote::execution::v2 as remexec;
+    use bazel_remote_apis::build::bazel::semver::SemVer;
+    use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
     use sccache::config::{FileConfig, ReapiConfig};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+    use tonic::transport::{Server, server::TcpIncoming};
+    use tonic::{Request, Response, Status};
+
+    #[derive(Default)]
+    struct Farm {
+        requests: Mutex<Vec<(String, Option<String>)>>,
+    }
+    #[tonic::async_trait]
+    impl Capabilities for Farm {
+        async fn get_capabilities(
+            &self,
+            request: Request<remexec::GetCapabilitiesRequest>,
+        ) -> std::result::Result<Response<remexec::ServerCapabilities>, Status> {
+            let auth = request
+                .metadata()
+                .get("authorization")
+                .map(|v| v.to_str().unwrap().to_owned());
+            self.requests
+                .lock()
+                .unwrap()
+                .push((request.into_inner().instance_name, auth));
+            Ok(Response::new(remexec::ServerCapabilities {
+                cache_capabilities: Some(Default::default()),
+                high_api_version: Some(SemVer {
+                    major: 2,
+                    minor: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+        }
+    }
 
     let mut test_info = SccacheTest::new(None)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0"))?;
+    let endpoint = format!("grpc://{}", listener.local_addr()?);
+    let farm = Arc::new(Farm::default());
+    runtime.spawn(
+        Server::builder()
+            .add_service(CapabilitiesServer::from_arc(farm.clone()))
+            .serve_with_incoming(TcpIncoming::from(listener)),
+    );
     let checkout = test_info.tempdir.path().join("project");
     fs::create_dir_all(checkout.join("src"))?;
     // Match Cargo's physical cwd, including macOS's /var -> /private/var alias.
@@ -68,13 +114,15 @@ fn main() {
 "#,
     )?;
     let reapi_cache = test_info.tempdir.path().join("reapi-cache");
+    let token_file = test_info.tempdir.path().join("token");
+    fs::write(&token_file, "  test-token\n")?;
     let mut config = FileConfig {
         reapi: Some(ReapiConfig {
-            endpoint: "grpc://127.0.0.1:1".into(),
+            endpoint,
             cache_dir: reapi_cache.clone(),
-            instance_name: String::new(),
-            // Connection credentials are not read by this local-only executor.
-            auth_token_file: Some(test_info.tempdir.path().join("missing-token")),
+            instance_name: "smoke".into(),
+            auth_token_file: Some(token_file),
+            ready_wait_secs: 10,
         }),
         client_side_mode: true,
         ..Default::default()
@@ -138,6 +186,10 @@ fn main() {
     test_info
         .show_text_stats(false)?
         .try_stdout(predicate::str::contains("REAPI local compilations:"))?;
+    assert_eq!(
+        *farm.requests.lock().unwrap(),
+        vec![("smoke".to_owned(), Some("Bearer test-token".to_owned()))]
+    );
     Ok(())
 }
 

@@ -27,7 +27,7 @@ use remexec::action_cache_server::{ActionCache, ActionCacheServer};
 use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -40,6 +40,13 @@ type RpcResult<T> = std::result::Result<Response<T>, Status>;
 #[derive(Default)]
 pub(crate) struct FakeServer {
     pub(crate) instance_name: String,
+    pub(crate) without_caching: bool,
+    pub(crate) capabilities_error: Mutex<Option<tonic::Code>>,
+    pub(crate) capabilities_calls: AtomicUsize,
+    pub(crate) capabilities_started: Notify,
+    pub(crate) capabilities_gate: Option<Arc<Notify>>,
+    pub(crate) capabilities_authorization_headers: Mutex<Vec<Option<String>>>,
+    pub(crate) capabilities_requests: Mutex<Vec<remexec::GetCapabilitiesRequest>>,
     pub(crate) supports_zstd_bytestream: bool,
     pub(crate) corrupt_reads: AtomicBool,
     pub(crate) oversize_reads: AtomicBool,
@@ -143,15 +150,36 @@ impl FakeServer {
 impl Capabilities for FakeServer {
     async fn get_capabilities(
         &self,
-        _: Request<remexec::GetCapabilitiesRequest>,
+        request: Request<remexec::GetCapabilitiesRequest>,
     ) -> RpcResult<remexec::ServerCapabilities> {
+        self.capabilities_calls.fetch_add(1, Ordering::SeqCst);
+        self.capabilities_authorization_headers
+            .lock()
+            .unwrap()
+            .push(
+                request
+                    .metadata()
+                    .get("authorization")
+                    .map(|header| header.to_str().unwrap().to_owned()),
+            );
+        self.capabilities_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        self.capabilities_started.notify_one();
+        if let Some(gate) = &self.capabilities_gate {
+            gate.notified().await;
+        }
+        if let Some(code) = *self.capabilities_error.lock().unwrap() {
+            return Err(Status::new(code, "capabilities_error"));
+        }
         let supported_compressors = if self.supports_zstd_bytestream {
             vec![remexec::compressor::Value::Zstd as i32]
         } else {
             vec![]
         };
         Ok(Response::new(remexec::ServerCapabilities {
-            cache_capabilities: Some(remexec::CacheCapabilities {
+            cache_capabilities: (!self.without_caching).then(|| remexec::CacheCapabilities {
                 supported_compressors,
                 ..Default::default()
             }),

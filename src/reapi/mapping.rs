@@ -89,6 +89,12 @@ pub(crate) enum CompileLocallyReason {
     NonUtf8EnvVar,
     UnsupportedEnvVarName,
     UnreadableDependencies,
+    MappingPanicked,
+    Misconfigured,
+    Connecting,
+    ConnectFailed,
+    IncompatibleServer,
+    CredentialsRefused,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -109,6 +115,12 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::NonUtf8EnvVar => "non-UTF-8 env var",
             Self::UnsupportedEnvVarName => "env var the REAPI command can't pass to rustc",
             Self::UnreadableDependencies => "unreadable dependencies",
+            Self::MappingPanicked => "mapping the compile for REAPI panicked",
+            Self::Misconfigured => "[reapi] misconfigured",
+            Self::Connecting => "connecting to the REAPI server",
+            Self::ConnectFailed => "failed to connect to the REAPI server",
+            Self::IncompatibleServer => "incompatible REAPI server",
+            Self::CredentialsRefused => "REAPI server refused the credentials",
         })
     }
 }

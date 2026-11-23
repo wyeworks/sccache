@@ -23,6 +23,8 @@ mod cas;
 #[allow(dead_code)]
 mod client;
 
+mod connection;
+
 #[allow(dead_code)]
 mod digest;
 

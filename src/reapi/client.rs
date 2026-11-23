@@ -27,6 +27,8 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 const REQUIRED_API_MAJOR_VERSION: i32 = 2;
+/// v2.1 added `Command.output_paths`, the only output field sccache's commands set.
+const MIN_API_MINOR_VERSION: i32 = 1;
 
 #[derive(Clone, Default)]
 pub(crate) struct ConnectOptions {
@@ -72,7 +74,7 @@ pub(crate) async fn with_timeout<T>(
     }
 }
 
-/// Error for a REAPI server that lacks REAPI v2, SHA-256 digests or caching.
+/// Error for a REAPI server that lacks REAPI v2.1, SHA-256 digests or caching.
 #[derive(Debug)]
 pub(crate) struct IncompatibleServer(String);
 
@@ -84,6 +86,18 @@ impl std::fmt::Display for IncompatibleServer {
 
 impl std::error::Error for IncompatibleServer {}
 
+/// Credentials rejected by GetCapabilities.
+#[derive(Debug)]
+pub(crate) struct CredentialsRefused;
+
+impl std::fmt::Display for CredentialsRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the REAPI server refused the credentials")
+    }
+}
+
+impl std::error::Error for CredentialsRefused {}
+
 /// A connection to a REAPI server.
 pub(crate) struct Client {
     instance_name: String,
@@ -92,7 +106,7 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    /// Fails with [`IncompatibleServer`] if the server lacks REAPI v2, SHA-256 digests or
+    /// Fails with [`IncompatibleServer`] if the server lacks REAPI v2.1, SHA-256 digests or
     /// caching.
     pub(crate) async fn connect(options: &ConnectOptions) -> Result<Self> {
         let endpoint = parse_endpoint(&options.endpoint)?;
@@ -113,16 +127,7 @@ impl Client {
         } else if options.auth_token.is_some() {
             warn!("REAPI: sending the auth token without TLS");
         }
-        let auth_header = match options.auth_token.as_deref().map(str::trim) {
-            Some("") => bail!("the REAPI auth token is empty"),
-            Some(token) => {
-                let mut header = AsciiMetadataValue::try_from(format!("Bearer {token}"))
-                    .context("the REAPI auth token contains a non-ASCII or control character")?;
-                header.set_sensitive(true);
-                Some(header)
-            }
-            None => None,
-        };
+        let auth_header = auth_header(options.auth_token.as_deref())?;
         let channel = with_timeout(
             "failed to connect to the REAPI server",
             CONNECT_TIMEOUT,
@@ -146,7 +151,18 @@ impl Client {
                 Ok(CapabilitiesClient::new(channel.clone())
                     .get_capabilities(request)
                     .await
-                    .map_err(status_error)?
+                    .map_err(|status| {
+                        let refused = matches!(
+                            status.code(),
+                            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                        );
+                        let e = status_error(status);
+                        if refused {
+                            e.context(CredentialsRefused)
+                        } else {
+                            e
+                        }
+                    })?
                     .into_inner())
             },
         )
@@ -188,6 +204,27 @@ impl Client {
 
     pub(crate) fn supports_zstd_bytestream(&self) -> bool {
         self.supports_zstd_bytestream
+    }
+}
+
+/// Fails if `options` has an invalid endpoint or auth token, without connecting.
+pub(super) fn check_connect_options(options: &ConnectOptions) -> Result<()> {
+    let endpoint = parse_endpoint(&options.endpoint)?;
+    Endpoint::from_shared(endpoint.http_url).context("the REAPI endpoint is not valid")?;
+    auth_header(options.auth_token.as_deref())?;
+    Ok(())
+}
+
+fn auth_header(auth_token: Option<&str>) -> Result<Option<AsciiMetadataValue>> {
+    match auth_token.map(str::trim) {
+        Some("") => bail!("the REAPI auth token is empty"),
+        Some(token) => {
+            let mut header = AsciiMetadataValue::try_from(format!("Bearer {token}"))
+                .context("the REAPI auth token contains a non-ASCII or control character")?;
+            header.set_sensitive(true);
+            Ok(Some(header))
+        }
+        None => Ok(None),
     }
 }
 
@@ -257,7 +294,7 @@ fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint> {
     })
 }
 
-/// Fails with [`IncompatibleServer`] if the server doesn't support REAPI v2. A server
+/// Fails with [`IncompatibleServer`] if the server doesn't support REAPI v2.1. A server
 /// that reports no versions passes.
 fn check_api_version(capabilities: &remexec::ServerCapabilities) -> Result<()> {
     let lowest_major = capabilities
@@ -278,6 +315,16 @@ fn check_api_version(capabilities: &remexec::ServerCapabilities) -> Result<()> {
             "the REAPI server supports API {} to {}; sccache needs v{REQUIRED_API_MAJOR_VERSION}",
             format_major(lowest_major),
             format_major(highest_major),
+        ))));
+    }
+    if let Some(highest) = &capabilities.high_api_version
+        && highest.major == REQUIRED_API_MAJOR_VERSION
+        && highest.minor < MIN_API_MINOR_VERSION
+    {
+        return Err(Error::new(IncompatibleServer(format!(
+            "the REAPI server supports API up to v{}.{}; sccache needs \
+             v{REQUIRED_API_MAJOR_VERSION}.{MIN_API_MINOR_VERSION}",
+            highest.major, highest.minor
         ))));
     }
     Ok(())
@@ -377,18 +424,19 @@ mod test {
         }
     }
 
-    fn api_version(major: i32) -> Option<SemVer> {
+    fn api_version(major: i32, minor: i32) -> Option<SemVer> {
         Some(SemVer {
             major,
+            minor,
             ..Default::default()
         })
     }
 
-    #[test_case(tonic::Code::Unauthenticated ; "unauthenticated")]
-    #[test_case(tonic::Code::PermissionDenied ; "permission denied")]
-    #[test_case(tonic::Code::Unavailable ; "unavailable")]
+    #[test_case(tonic::Code::Unauthenticated, true ; "unauthenticated")]
+    #[test_case(tonic::Code::PermissionDenied, true ; "permission denied")]
+    #[test_case(tonic::Code::Unavailable, false ; "unavailable")]
     #[tokio::test]
-    async fn test_capabilities_rpc_failure_has_context(code: tonic::Code) {
+    async fn test_capabilities_rpc_failure_has_context(code: tonic::Code, refused: bool) {
         let endpoint = serve_fake(FakeCapabilities {
             response: CapabilitiesResponse::Error(code),
             ..Default::default()
@@ -398,13 +446,19 @@ mod test {
             .await
             .err()
             .expect("the capabilities RPC should fail");
+        let credentials = if refused {
+            "the REAPI server refused the credentials: "
+        } else {
+            ""
+        };
         assert_eq!(
             format!(
-                "failed to get the REAPI server's capabilities: {code:?}: simulated RPC failure"
+                "failed to get the REAPI server's capabilities: {credentials}{code:?}: simulated RPC failure"
             ),
             format!("{error:#}")
         );
         assert!(!error.is::<IncompatibleServer>());
+        assert_eq!(error.is::<CredentialsRefused>(), refused);
     }
 
     #[tokio::test]
@@ -447,8 +501,8 @@ mod test {
                     supported_compressors: vec![remexec::compressor::Value::Zstd as i32],
                     ..Default::default()
                 }),
-                low_api_version: api_version(2),
-                high_api_version: api_version(2),
+                low_api_version: api_version(2, 0),
+                high_api_version: api_version(2, 3),
                 ..Default::default()
             },
             ..Default::default()
@@ -524,8 +578,8 @@ mod test {
         let endpoint = serve_fake(FakeCapabilities {
             capabilities: remexec::ServerCapabilities {
                 cache_capabilities: Some(Default::default()),
-                low_api_version: api_version(major),
-                high_api_version: api_version(major),
+                low_api_version: api_version(major, 0),
+                high_api_version: api_version(major, 0),
                 ..Default::default()
             },
             ..Default::default()
@@ -537,6 +591,40 @@ mod test {
             .unwrap();
         assert!(e.to_string().contains(expected_range), "{e}");
         assert!(e.is::<IncompatibleServer>(), "{e}");
+    }
+
+    /// A server whose newest API version is v2.`highest_minor`.
+    async fn serve_v2(highest_minor: i32) -> String {
+        serve_fake(FakeCapabilities {
+            capabilities: remexec::ServerCapabilities {
+                cache_capabilities: Some(Default::default()),
+                low_api_version: api_version(2, 0),
+                high_api_version: api_version(2, highest_minor),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_server_with_api_v2_0_only_is_refused() {
+        let endpoint = serve_v2(0).await;
+        let e = Client::connect(&connect_options(&endpoint))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.to_string().contains("up to v2.0; sccache needs v2.1"),
+            "{e}"
+        );
+        assert!(e.is::<IncompatibleServer>(), "{e}");
+    }
+
+    #[tokio::test]
+    async fn test_server_with_api_v2_1_is_accepted() {
+        let endpoint = serve_v2(1).await;
+        Client::connect(&connect_options(&endpoint)).await.unwrap();
     }
 
     #[tokio::test]
@@ -599,9 +687,9 @@ mod test {
         let endpoint = serve_fake(FakeCapabilities {
             capabilities: remexec::ServerCapabilities {
                 cache_capabilities: Some(Default::default()),
-                deprecated_api_version: api_version(2),
-                low_api_version: api_version(3),
-                high_api_version: api_version(3),
+                deprecated_api_version: api_version(2, 0),
+                low_api_version: api_version(3, 0),
+                high_api_version: api_version(3, 0),
                 ..Default::default()
             },
             ..Default::default()
@@ -700,5 +788,21 @@ mod test {
     fn test_endpoint_is_refused_without_echoing_it(endpoint: &str) {
         let e = parse_endpoint(endpoint).unwrap_err();
         assert!(!format!("{e:#}").contains("secret"), "{e:#}");
+    }
+
+    #[test_case("grpcs://farm:443", Some("token"), true ; "valid")]
+    #[test_case("farm:443", None, false ; "bad endpoint")]
+    #[test_case("grpcs://farm:443", Some(" "), false ; "empty token")]
+    fn test_connect_options_are_checked_without_connecting(
+        endpoint: &str,
+        auth_token: Option<&str>,
+        valid: bool,
+    ) {
+        let options = ConnectOptions {
+            endpoint: endpoint.to_owned(),
+            auth_token: auth_token.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(valid, check_connect_options(&options).is_ok());
     }
 }

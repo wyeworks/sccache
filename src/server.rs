@@ -163,7 +163,7 @@ fn reapi_executor(config: &Config) -> Option<Arc<ReapiExecutor>> {
     config
         .reapi
         .as_ref()
-        .map(|reapi| Arc::new(ReapiExecutor::new(&reapi.cache_dir)))
+        .map(|reapi| Arc::new(ReapiExecutor::new(reapi)))
 }
 
 #[cfg(not(feature = "reapi"))]
@@ -2752,6 +2752,7 @@ mod tests {
                 cache_dir: cache_dir.to_owned(),
                 instance_name: String::new(),
                 auth_token_file: None,
+                ready_wait_secs: 0,
             }),
             ..Default::default()
         }

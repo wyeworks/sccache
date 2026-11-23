@@ -189,10 +189,18 @@ Build with `--features reapi` and add a `[reapi]` section:
 endpoint = "grpcs://remote.example.com:443" # grpc:// for plaintext
 instance_name = ""                         # optional
 # cache_dir = "/path/to/reapi-cache"         # optional
-auth_token_file = "/path/to/token"          # optional bearer-token file
+# auth_token_file = "/path/to/token"        # optional bearer-token file
+ready_wait_secs = 0                        # connection wait; 0 does not wait, max 3600
 ```
 
-REAPI support is under development. Currently, configured builds apply Rust preparation and compile locally, server connections and remote execution are not wired in yet.
+REAPI support is under development. On eligible cache misses, sccache connects
+to the farm and checks its capabilities. Compiles still run locally; remote
+cache lookups and execution are not wired in yet.
+
+The token file is read when the sccache server starts. Restart the server after
+changing it. Transient connection failures are retried on later cache misses
+after a backoff of 5 to 60 seconds. Refused credentials or incompatible server
+capabilities keep compiles local until the server restarts.
 
 The cache directory defaults to the platform cache directory for `sccache-reapi`.
 

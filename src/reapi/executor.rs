@@ -14,28 +14,87 @@
 
 //! Local execution and eligibility reporting for configured REAPI builds.
 
+use super::client::{ConnectOptions, check_connect_options};
+use super::connection::{Connection, ServerApis};
+use super::mapping::CompileLocallyReason;
 use crate::compiler::{
     Compilation, CompileExecutor, CompileOutcome, CompileRequest, DistType, PreparedCompile,
     ReapiOutcome,
 };
+use crate::config::ReapiConfig;
 use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
 
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
+const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 
 pub(crate) struct ReapiExecutor {
+    connection: Option<Arc<Connection>>,
+    ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
 }
 
 impl ReapiExecutor {
-    pub(crate) fn new(reapi_cache_dir: &Path) -> Self {
+    /// Credentials are read once; changes require a server restart.
+    pub(crate) fn new(config: &ReapiConfig) -> Self {
+        let connection = match read_connect_options(config) {
+            Ok(options) => Some(Connection::new(options)),
+            Err(error) => {
+                warn!("REAPI: {error:#}; compiling locally");
+                None
+            }
+        };
+        let ready_wait = Duration::from_secs(config.ready_wait_secs).min(MAX_READY_WAIT);
+        if config.ready_wait_secs > MAX_READY_WAIT.as_secs() {
+            warn!(
+                "REAPI: ready_wait_secs is capped at {}",
+                MAX_READY_WAIT.as_secs()
+            );
+        }
         Self {
-            sysroot_copies_dir: reapi_cache_dir.join(SYSROOT_COPIES_DIR),
+            connection,
+            ready_wait,
+            sysroot_copies_dir: config.cache_dir.join(SYSROOT_COPIES_DIR),
         }
     }
+
+    async fn server_apis(&self) -> std::result::Result<Arc<ServerApis>, CompileLocallyReason> {
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or(CompileLocallyReason::Misconfigured)?;
+        connection
+            .server_apis(Instant::now() + self.ready_wait)
+            .await
+    }
+}
+
+fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
+    let auth_token = config
+        .auth_token_file
+        .as_ref()
+        .map(|file| {
+            std::fs::read_to_string(file).with_context(|| {
+                format!(
+                    "failed to read the REAPI auth token from {}",
+                    file.display()
+                )
+            })
+        })
+        .transpose()?;
+    let options = ConnectOptions {
+        endpoint: config.endpoint.clone(),
+        instance_name: config.instance_name.clone(),
+        auth_token,
+    };
+    check_connect_options(&options)?;
+    Ok(options)
 }
 
 #[async_trait]
@@ -65,14 +124,14 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
         .await
         .context("failed to check REAPI eligibility")?;
         request.compilation = compilation;
-        let execution = match mapped {
-            Ok(Ok(_)) => DistType::NoDist,
+        let reason = match mapped {
+            Ok(Ok(_)) => self.server_apis().await.err(),
             Err(_) => {
                 warn!(
                     "[{}]: REAPI eligibility check panicked; compiling locally",
                     request.output_name
                 );
-                DistType::NoDist
+                Some(CompileLocallyReason::MappingPanicked)
             }
             Ok(Err(not_eligible)) => {
                 match &not_eligible.detail {
@@ -85,10 +144,15 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
                         request.output_name, not_eligible.reason
                     ),
                 }
-                DistType::Reapi(ReapiOutcome::CompiledLocally(
-                    not_eligible.reason.to_string(),
-                ))
+                Some(not_eligible.reason)
             }
+        };
+        let execution = match reason {
+            Some(reason) => {
+                debug!("[{}]: Compiling locally: {reason}", request.output_name);
+                DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string()))
+            }
+            None => DistType::NoDist,
         };
         let mut outcome = request.execute_locally().await?;
         outcome.execution = execution;
@@ -105,12 +169,15 @@ mod test {
     };
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+    use crate::reapi::test::FakeServer;
     use crate::reapi::{CompileLocallyReason, NotEligible, PathMapper, ReapiCompile};
     use crate::server::SccacheService;
     use crate::test::utils::{new_creator, next_command};
     use std::ffi::OsString;
+    use std::path::Path;
     use std::process;
     use std::sync::{Arc, Mutex};
+    use test_case::test_case;
 
     type Creator = Arc<Mutex<MockCommandCreator>>;
 
@@ -191,9 +258,25 @@ mod test {
         }
     }
 
-    fn compile(eligibility: Eligibility) -> (DistType, process::Output) {
+    fn config(endpoint: String, ready_wait_secs: u64) -> ReapiConfig {
+        ReapiConfig {
+            endpoint,
+            cache_dir: "/cache".into(),
+            instance_name: String::new(),
+            auth_token_file: None,
+            ready_wait_secs,
+        }
+    }
+
+    fn compile(
+        eligibility: Eligibility,
+        configure: impl FnOnce(&mut ReapiConfig, &Path),
+    ) -> (DistType, process::Output) {
         let runtime = tokio::runtime::Runtime::new().unwrap();
+        let server = Arc::new(FakeServer::default());
+        let mut config = config(runtime.block_on(server.serve()), 10);
         let cache_dir = tempfile::tempdir().unwrap();
+        configure(&mut config, cache_dir.path());
         let storage = Arc::new(crate::cache::disk::DiskCache::new(
             cache_dir.path(),
             0,
@@ -205,7 +288,7 @@ mod test {
         let service = SccacheService::mock_with_storage(storage, runtime.handle().clone());
         let creator = new_creator();
         next_command(&creator, Ok(MockChild::new(exit_status(0), "out", "err")));
-        let executor = ReapiExecutor::new("/cache".as_ref());
+        let executor = ReapiExecutor::new(&config);
         let prepared = runtime
             .block_on(CompileExecutor::<Creator>::prepare(
                 &executor,
@@ -226,35 +309,102 @@ mod test {
         (outcome.execution, outcome.output)
     }
 
+    fn compiled_locally(reason: &str) -> DistType {
+        DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_owned()))
+    }
+
     #[test]
     fn test_an_ineligible_compile_runs_locally_and_counts_why() {
-        let (dist_type, output) = compile(Eligibility::Ineligible);
+        let (dist_type, output) = compile(Eligibility::Ineligible, |_, _| {});
+        assert_eq!(compiled_locally("staticlib crate type"), dist_type);
+        assert_eq!(b"out".as_slice(), output.stdout);
+    }
+
+    #[test]
+    fn test_an_eligible_compile_runs_locally_without_a_reason_once_connected() {
+        let (dist_type, output) = compile(Eligibility::Eligible, |_, _| {});
+        assert_eq!(DistType::NoDist, dist_type);
+        assert_eq!(b"err".as_slice(), output.stderr);
+    }
+
+    #[test]
+    fn test_an_eligible_compile_that_doesnt_wait_finds_the_server_connecting() {
+        let (dist_type, _) = compile(Eligibility::Eligible, |config, _| {
+            config.ready_wait_secs = 0;
+        });
         assert_eq!(
-            DistType::Reapi(ReapiOutcome::CompiledLocally(
-                "staticlib crate type".to_owned()
-            )),
+            compiled_locally("connecting to the REAPI server"),
+            dist_type
+        );
+    }
+
+    #[test_case(
+        |config, _| config.endpoint = "farm:8980".to_owned() ;
+        "bad endpoint"
+    )]
+    #[test_case(
+        |config, dir| config.auth_token_file = Some(dir.join("missing")) ;
+        "unreadable token file"
+    )]
+    #[test_case(
+        |config, dir| {
+            std::fs::write(dir.join("token"), " \n").unwrap();
+            config.auth_token_file = Some(dir.join("token"));
+        } ;
+        "empty token file"
+    )]
+    fn test_a_misconfigured_executor_compiles_eligible_compiles_locally(
+        configure: fn(&mut ReapiConfig, &Path),
+    ) {
+        let (dist_type, output) = compile(Eligibility::Eligible, configure);
+        assert_eq!(compiled_locally("[reapi] misconfigured"), dist_type);
+        assert_eq!(b"out".as_slice(), output.stdout);
+        let (dist_type, _) = compile(Eligibility::Ineligible, configure);
+        assert_eq!(compiled_locally("staticlib crate type"), dist_type);
+    }
+
+    #[test]
+    fn test_a_panicking_mapping_still_compiles_locally() {
+        let (dist_type, output) = compile(Eligibility::Panics, |_, _| {});
+        assert_eq!(
+            compiled_locally("mapping the compile for REAPI panicked"),
             dist_type
         );
         assert_eq!(b"out".as_slice(), output.stdout);
     }
 
     #[test]
-    fn test_an_eligible_compile_runs_locally_without_a_reason() {
-        let (dist_type, output) = compile(Eligibility::Eligible);
-        assert_eq!(DistType::NoDist, dist_type);
-        assert_eq!(b"err".as_slice(), output.stderr);
+    fn test_ready_wait_is_capped() {
+        let executor = ReapiExecutor::new(&config("grpc://127.0.0.1:1".into(), u64::MAX));
+        assert_eq!(executor.ready_wait, MAX_READY_WAIT);
     }
 
     #[test]
-    fn test_a_panicking_eligibility_check_still_compiles_locally() {
-        let (dist_type, output) = compile(Eligibility::Panics);
-        assert_eq!(DistType::NoDist, dist_type);
-        assert_eq!(b"out".as_slice(), output.stdout);
+    fn test_invalid_token_file_contents_are_not_in_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config("grpc://127.0.0.1:1".into(), 0);
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "secret\nvalue").unwrap();
+        config.auth_token_file = Some(token_file);
+        let error = read_connect_options(&config).err().unwrap();
+        assert!(!format!("{error:#}").contains("secret"));
+    }
+
+    #[test]
+    fn test_unreachable_server_keeps_the_compile_local() {
+        let (dist_type, output) = compile(Eligibility::Eligible, |config, _| {
+            config.endpoint = "grpc://127.0.0.1:1".into();
+        });
+        assert_eq!(
+            compiled_locally("failed to connect to the REAPI server"),
+            dist_type
+        );
+        assert!(output.status.success());
     }
 
     #[test]
     fn test_local_compiles_get_the_sysroot_copies_dir_under_the_reapi_cache_dir() {
-        let executor = ReapiExecutor::new("/cache".as_ref());
+        let executor = ReapiExecutor::new(&config("grpc://127.0.0.1:1".into(), 0));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let changes = runtime
             .block_on(CompileExecutor::<Creator>::prepare(
