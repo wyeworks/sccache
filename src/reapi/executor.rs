@@ -20,7 +20,7 @@ use super::digest::DigestCache;
 use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
 use super::remote_compile::{
-    action_digest, digest_input_root_files, materialize, materialize_failure_reason,
+    ActionOptions, action_digest, digest_input_root_files, materialize, materialize_failure_reason,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
 use crate::compiler::{
@@ -49,6 +49,7 @@ pub(crate) struct ReapiExecutor {
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
     lookup_pause: LookupPause,
+    action_options: Arc<ActionOptions>,
 }
 
 impl ReapiExecutor {
@@ -76,6 +77,7 @@ impl ReapiExecutor {
             ready_wait,
             sysroot_copies_dir: config.cache_dir.join(SYSROOT_COPIES_DIR),
             lookup_pause: LookupPause::default(),
+            action_options: Arc::new(ActionOptions::new(config)),
         }
     }
 
@@ -105,9 +107,10 @@ impl ReapiExecutor {
         out_pretty: &str,
     ) -> std::result::Result<process::Output, CompileLocallyReason> {
         let digest_cache = self.digest_cache.clone();
+        let action_options = self.action_options.clone();
         let digested = tokio::task::spawn_blocking(move || {
             let files = digest_input_root_files(&reapi_compile, &digest_cache)?;
-            let digest = action_digest(&reapi_compile, &files, &toolchain)?;
+            let digest = action_digest(&reapi_compile, &files, &toolchain, &action_options)?;
             Ok::<_, Error>((reapi_compile, digest))
         })
         .await;
@@ -401,6 +404,8 @@ mod test {
             instance_name: String::new(),
             auth_token_file: None,
             ready_wait_secs,
+            salt: String::new(),
+            platform: Default::default(),
         }
     }
 
@@ -472,7 +477,13 @@ mod test {
                 &digest_cache,
             )
             .unwrap();
-            let action_digest = action_digest(&compile, &files, &toolchain).unwrap();
+            let action_digest = action_digest(
+                &compile,
+                &files,
+                &toolchain,
+                &ActionOptions::new(&self.config),
+            )
+            .unwrap();
             let rlib_path = compile
                 .path_mapper
                 .to_input_root(&compile.outputs[0])
@@ -608,6 +619,37 @@ mod test {
             compiled_locally("failed to hash the inputs")
         );
         assert!(fixture.server.lookup_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_action_cache_keys_include_salt_and_platform() {
+        let mut fixture = Fixture::new(Eligibility::Eligible);
+        fixture.config.salt = "v1".into();
+        fixture
+            .config
+            .platform
+            .insert("OSFamily".into(), "linux".into());
+        fixture.put_result_in_action_cache(|_| {});
+        assert_eq!(
+            fixture.compile().0,
+            DistType::Reapi(ReapiOutcome::ActionCacheHit)
+        );
+
+        fixture.config.salt = "v2".into();
+        assert_eq!(
+            fixture.compile().0,
+            compiled_locally("not in the action cache")
+        );
+
+        fixture.config.salt = "v1".into();
+        fixture
+            .config
+            .platform
+            .insert("OSFamily".into(), "other".into());
+        assert_eq!(
+            fixture.compile().0,
+            compiled_locally("not in the action cache")
+        );
     }
 
     #[test]

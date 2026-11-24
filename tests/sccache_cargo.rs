@@ -86,6 +86,8 @@ fn main() {
             instance_name: "smoke".into(),
             auth_token_file: Some(token_file),
             ready_wait_secs: 120,
+            salt: String::new(),
+            platform: Default::default(),
         }),
         client_side_mode: true,
         ..Default::default()

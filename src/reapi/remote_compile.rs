@@ -22,6 +22,7 @@ use super::mapping::{
     normalize_absolute,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
+use crate::config::ReapiConfig;
 use crate::errors::*;
 use crate::mock_command::exit_status;
 use memchr::memmem;
@@ -142,18 +143,65 @@ pub(super) fn digest_input_root_files(
         .collect()
 }
 
+#[derive(Debug, Default, Clone)]
+pub(super) struct ActionOptions {
+    salt: Vec<u8>,
+    platform: Option<remexec::Platform>,
+}
+
+impl ActionOptions {
+    pub(super) fn new(config: &ReapiConfig) -> Self {
+        // BTreeMap order is the sorted order REAPI requires.
+        let platform = (!config.platform.is_empty()).then(|| remexec::Platform {
+            properties: config
+                .platform
+                .iter()
+                .map(|(name, value)| remexec::platform::Property {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        });
+        ActionOptions {
+            salt: config.salt.as_bytes().to_vec(),
+            platform,
+        }
+    }
+}
+
+/// The command that runs `compile`, and the action that runs it on the input root
+/// `input_root_digest`.
+fn build_action(
+    compile: &ReapiCompile,
+    input_root_digest: remexec::Digest,
+    options: &ActionOptions,
+) -> Result<(remexec::Command, remexec::Action)> {
+    let mut command = build_command(compile)?;
+    // REAPI v2.2+ servers read the platform from the Action; the spec asks to set it on the
+    // Command too, for older ones.
+    #[expect(deprecated)]
+    {
+        command.platform = options.platform.clone();
+    }
+    let action = remexec::Action {
+        command_digest: Some(digest::of_bytes(&command.encode_to_vec())),
+        input_root_digest: Some(input_root_digest),
+        platform: options.platform.clone(),
+        salt: options.salt.clone(),
+        ..Default::default()
+    };
+    Ok((command, action))
+}
+
 /// The digest of the action that runs `compile` on `files` and `toolchain`'s files.
 pub(super) fn action_digest(
     compile: &ReapiCompile,
     files: &[InputRootFile],
     toolchain: &[(InputRootFile, PathBuf)],
+    options: &ActionOptions,
 ) -> Result<remexec::Digest> {
     let input_root = InputRoot::build(files.iter().chain(toolchain.iter().map(|(file, _)| file)))?;
-    let action = remexec::Action {
-        command_digest: Some(digest::of_bytes(&build_command(compile)?.encode_to_vec())),
-        input_root_digest: Some(input_root.digest),
-        ..Default::default()
-    };
+    let (_, action) = build_action(compile, input_root.digest, options)?;
     Ok(digest::of_bytes(&action.encode_to_vec()))
 }
 
@@ -759,6 +807,39 @@ pub(super) mod test {
     }
 
     #[test]
+    #[allow(deprecated)]
+    fn test_action_platform_is_sorted_and_matches_the_command() {
+        let config: ReapiConfig = toml::from_str(
+            r#"
+endpoint = "grpc://farm:8980"
+salt = "v1"
+[platform]
+OSFamily = "linux"
+Arch = "amd64"
+"#,
+        )
+        .unwrap();
+        let compile = reapi_compile_in("/home/a/ws");
+        let (command, action) = build_action(
+            &compile,
+            digest::of_bytes(b"input root"),
+            &ActionOptions::new(&config),
+        )
+        .unwrap();
+        assert_eq!(action.salt, b"v1");
+        assert_eq!(action.platform, command.platform);
+        let platform = action.platform.unwrap();
+        assert_eq!(
+            platform
+                .properties
+                .iter()
+                .map(|p| (p.name.as_str(), p.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Arch", "amd64"), ("OSFamily", "linux")]
+        );
+    }
+
+    #[test]
     fn test_the_command_doesnt_depend_on_the_checkout_path() {
         assert_eq!(
             build_command(&reapi_compile_in("/home/a/ws")).unwrap(),
@@ -787,7 +868,7 @@ pub(super) mod test {
         let files = digest_input_root_files(&compile, &digest_cache).unwrap();
         let toolchain =
             toolchain_files(sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
-        action_digest(&compile, &files, &toolchain).unwrap()
+        action_digest(&compile, &files, &toolchain, &ActionOptions::default()).unwrap()
     }
 
     #[cfg(unix)]

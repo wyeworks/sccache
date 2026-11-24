@@ -2766,6 +2766,8 @@ mod tests {
                 instance_name: String::new(),
                 auth_token_file: None,
                 ready_wait_secs: 0,
+                salt: String::new(),
+                platform: Default::default(),
             }),
             ..Default::default()
         }

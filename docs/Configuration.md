@@ -201,6 +201,11 @@ locally. Uploading inputs and executing on workers are not wired in yet.
 `ready_wait_secs` covers connection and toolchain hashing, which run in the
 background. Compiles that exhaust this wait budget run locally.
 
+Set `salt` in `[reapi]` to start using a different set of Action Cache entries,
+for example after changing the worker environment. Use `[reapi.platform]` for
+worker properties such as `OSFamily = "linux"`. Both settings are optional and
+changing either changes the action digest.
+
 The token file is read when the sccache server starts. Restart the server after
 changing it. Transient connection failures are retried on later cache misses
 after a backoff of 5 to 60 seconds. Refused credentials or incompatible server

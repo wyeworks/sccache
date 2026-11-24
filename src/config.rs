@@ -26,6 +26,7 @@ use serde::{
 };
 #[cfg(test)]
 use serial_test::serial;
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -798,6 +799,10 @@ pub struct ReapiConfig {
     /// Maximum time to wait for connection and toolchain hashing before compiling locally, in seconds.
     #[serde(default)]
     pub ready_wait_secs: u64,
+    #[serde(default)]
+    pub salt: String,
+    #[serde(default)]
+    pub platform: BTreeMap<String, String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2937,6 +2942,10 @@ endpoint = "grpc://farm:8980"
 instance_name = "main"
 auth_token_file = "/token"
 ready_wait_secs = 5
+salt = "v1"
+
+[reapi.platform]
+OSFamily = "linux"
 
 [cache.azure]
 container = "azurecontainer"
@@ -3122,6 +3131,8 @@ key_prefix = "cosprefix"
                 instance_name: "main".to_owned(),
                 auth_token_file: Some(PathBuf::from("/token")),
                 ready_wait_secs: 5,
+                salt: "v1".into(),
+                platform: [("OSFamily".into(), "linux".into())].into(),
             }),
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3678,6 +3689,8 @@ endpoint = "grpcs://farm.example.com:443"
             instance_name: String::new(),
             auth_token_file: None,
             ready_wait_secs: 0,
+            salt: String::new(),
+            platform: Default::default(),
         }),
         config.reapi
     );
