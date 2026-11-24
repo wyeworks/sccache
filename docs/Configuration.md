@@ -206,6 +206,11 @@ changing it. Transient connection failures are retried on later cache misses
 after a backoff of 5 to 60 seconds. Refused credentials or incompatible server
 capabilities keep compiles local until the server restarts.
 
+After three consecutive Action Cache RPC failures, lookups pause for 5 seconds.
+One compile probes after the pause. Failed probes double the pause up to 60 seconds;
+a successful response, including a cache miss, resets the backoff. Compiles run
+locally while lookups are paused.
+
 The cache directory defaults to the platform cache directory for `sccache-reapi`.
 
 Choose either REAPI or sccache-dist for remote compilation. Setting both

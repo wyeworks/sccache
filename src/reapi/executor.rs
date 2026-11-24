@@ -17,6 +17,7 @@
 use super::client::{ConnectOptions, check_connect_options};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
+use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
 use super::remote_compile::{
     action_digest, digest_input_root_files, materialize, materialize_failure_reason,
@@ -47,6 +48,7 @@ pub(crate) struct ReapiExecutor {
     digest_cache: Arc<DigestCache>,
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
+    lookup_pause: LookupPause,
 }
 
 impl ReapiExecutor {
@@ -73,6 +75,7 @@ impl ReapiExecutor {
             digest_cache,
             ready_wait,
             sysroot_copies_dir: config.cache_dir.join(SYSROOT_COPIES_DIR),
+            lookup_pause: LookupPause::default(),
         }
     }
 
@@ -84,6 +87,9 @@ impl ReapiExecutor {
             .connection
             .as_ref()
             .ok_or(CompileLocallyReason::Misconfigured)?;
+        if self.lookup_pause.is_paused() {
+            return Err(CompileLocallyReason::ActionCacheLookupsPaused);
+        }
         let deadline = Instant::now() + self.ready_wait;
         tokio::try_join!(
             connection.server_apis(deadline),
@@ -115,14 +121,30 @@ impl ReapiExecutor {
                 return Err(CompileLocallyReason::HashingInputsFailed);
             }
         };
-        let result = match apis.action_cache.get_action_result(&action_digest).await {
-            Ok(Some(result)) if result.exit_code == 0 => result,
-            // Treat cached failures as misses; worker failures may be transient.
-            Ok(_) => return Err(CompileLocallyReason::NotInActionCache),
+        // Reserve a probe only once hashing and connection setup have finished.
+        let permit = self
+            .lookup_pause
+            .try_lookup()
+            .ok_or(CompileLocallyReason::ActionCacheLookupsPaused)?;
+        let cached = match apis.action_cache.get_action_result(&action_digest).await {
+            Ok(cached) => {
+                permit.succeeded();
+                cached
+            }
             Err(e) => {
                 warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+                if let Some(pause) = permit.failed() {
+                    warn!(
+                        "REAPI: action cache lookups are failing; compiling locally for {pause:?}"
+                    );
+                }
                 return Err(CompileLocallyReason::ActionCacheLookupFailed);
             }
+        };
+        let result = match cached {
+            Some(result) if result.exit_code == 0 => result,
+            // Treat cached failures as misses; worker failures may be transient.
+            _ => return Err(CompileLocallyReason::NotInActionCache),
         };
         match materialize(&apis.cas, &reapi_compile, &result).await {
             Ok(output) => {
@@ -267,6 +289,7 @@ mod test {
     };
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+    use crate::reapi::lookup_pause::FAILURES_TO_PAUSE;
     use crate::reapi::proto::build::bazel::remote::execution::v2 as remexec;
     use crate::reapi::remote_compile::test::{fake_sysroot, inline_output, worker_result};
     use crate::reapi::test::FakeServer;
@@ -395,7 +418,20 @@ mod test {
 
     impl Fixture {
         fn new(eligibility: Eligibility) -> Self {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
+            Self::with_runtime(eligibility, tokio::runtime::Runtime::new().unwrap())
+        }
+
+        fn clock_controlled() -> Self {
+            Self::with_runtime(
+                Eligibility::Eligible,
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            )
+        }
+
+        fn with_runtime(eligibility: Eligibility, runtime: tokio::runtime::Runtime) -> Self {
             let server = Arc::new(FakeServer::default());
             let mut config = config(runtime.block_on(server.serve()), 10);
             let dir = tempfile::tempdir().unwrap();
@@ -449,7 +485,18 @@ mod test {
         /// Runs the compile through the executor. A local compile writes `out` to stdout and
         /// `err` to stderr.
         fn compile(&self) -> (DistType, process::Output) {
-            let executor = ReapiExecutor::new(&self.config);
+            self.compile_with(&ReapiExecutor::new(&self.config))
+        }
+
+        fn advance_time(&self, duration: Duration) {
+            self.runtime.block_on(async {
+                tokio::time::pause();
+                tokio::time::advance(duration).await;
+                tokio::time::resume();
+            });
+        }
+
+        fn compile_with(&self, executor: &ReapiExecutor) -> (DistType, process::Output) {
             let storage = Arc::new(crate::cache::disk::DiskCache::new(
                 self.dir.path(),
                 0,
@@ -464,7 +511,7 @@ mod test {
             let mut prepared = self
                 .runtime
                 .block_on(CompileExecutor::<Creator>::prepare(
-                    &executor,
+                    executor,
                     Box::new(self.compilation()),
                 ))
                 .unwrap();
@@ -577,6 +624,127 @@ mod test {
         let (dist_type, output) = fixture.compile();
         assert_eq!(compiled_locally("action cache lookup failed"), dist_type);
         assert_eq!(b"out".as_slice(), output.stdout);
+    }
+
+    #[test]
+    fn test_compiles_resume_after_a_cooldown_and_reset_the_backoff() {
+        let fixture = Fixture::clock_controlled();
+        fixture.put_result_in_action_cache(|_| {});
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        let executor = ReapiExecutor::new(&fixture.config);
+        for _ in 0..FAILURES_TO_PAUSE {
+            assert_eq!(
+                compiled_locally("action cache lookup failed"),
+                fixture.compile_with(&executor).0
+            );
+        }
+        *fixture.server.lookup_error.lock().unwrap() = None;
+        let (execution, output) = fixture.compile_with(&executor);
+        assert_eq!(
+            compiled_locally("action cache lookups paused after failures"),
+            execution
+        );
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(fixture.server.lookup_requests.lock().unwrap().len(), 3);
+        fixture.advance_time(Duration::from_secs(5));
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::ActionCacheHit),
+            fixture.compile_with(&executor).0
+        );
+        assert_eq!(fixture.server.lookup_requests.lock().unwrap().len(), 4);
+
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        for _ in 0..FAILURES_TO_PAUSE {
+            assert_eq!(
+                compiled_locally("action cache lookup failed"),
+                fixture.compile_with(&executor).0
+            );
+        }
+        *fixture.server.lookup_error.lock().unwrap() = None;
+        fixture.server.action_results.lock().unwrap().clear();
+        fixture.advance_time(Duration::from_secs(5));
+        assert_eq!(
+            compiled_locally("not in the action cache"),
+            fixture.compile_with(&executor).0
+        );
+        assert_eq!(fixture.server.lookup_requests.lock().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn test_cache_misses_reset_consecutive_rpc_failures() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        let executor = ReapiExecutor::new(&fixture.config);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        for _ in 0..FAILURES_TO_PAUSE - 1 {
+            assert_eq!(
+                compiled_locally("action cache lookup failed"),
+                fixture.compile_with(&executor).0
+            );
+        }
+        *fixture.server.lookup_error.lock().unwrap() = None;
+        assert_eq!(
+            compiled_locally("not in the action cache"),
+            fixture.compile_with(&executor).0
+        );
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        for _ in 0..FAILURES_TO_PAUSE {
+            assert_eq!(
+                compiled_locally("action cache lookup failed"),
+                fixture.compile_with(&executor).0
+            );
+        }
+        assert_eq!(
+            compiled_locally("action cache lookups paused after failures"),
+            fixture.compile_with(&executor).0
+        );
+        assert_eq!(fixture.server.lookup_requests.lock().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn test_input_hashing_failures_do_not_reserve_the_recovery_probe() {
+        let fixture = Fixture::clock_controlled();
+        fixture.put_result_in_action_cache(|_| {});
+        let executor = ReapiExecutor::new(&fixture.config);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        for _ in 0..FAILURES_TO_PAUSE {
+            fixture.compile_with(&executor);
+        }
+        let input = fixture.dir.path().join("ws/src/lib.rs");
+        std::fs::remove_file(&input).unwrap();
+        assert_eq!(
+            compiled_locally("action cache lookups paused after failures"),
+            fixture.compile_with(&executor).0
+        );
+        fixture.advance_time(Duration::from_secs(5));
+        assert_eq!(
+            compiled_locally("failed to hash the inputs"),
+            fixture.compile_with(&executor).0
+        );
+        std::fs::write(input, "pub fn f() {}").unwrap();
+        *fixture.server.lookup_error.lock().unwrap() = None;
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::ActionCacheHit),
+            fixture.compile_with(&executor).0
+        );
+        assert_eq!(fixture.server.lookup_requests.lock().unwrap().len(), 4);
+    }
+
+    #[test_case(|result| result.exit_code = 1, "not in the action cache" ; "cached compiler failure")]
+    #[test_case(|result| result.stderr_raw.clear(), "unusable action cache result" ; "invalid metadata")]
+    #[test_case(|result| result.output_files[0].contents.clear(), "failed to download the outputs" ; "missing blob")]
+    fn test_successful_rpcs_do_not_pause_lookups_when_results_are_unusable(
+        change: fn(&mut remexec::ActionResult),
+        reason: &str,
+    ) {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        fixture.put_result_in_action_cache(change);
+        let executor = ReapiExecutor::new(&fixture.config);
+        for _ in 0..=FAILURES_TO_PAUSE {
+            let (execution, output) = fixture.compile_with(&executor);
+            assert_eq!(compiled_locally(reason), execution);
+            assert_eq!(output.stdout, b"out");
+        }
+        assert_eq!(fixture.server.lookup_requests.lock().unwrap().len(), 4);
     }
 
     #[test_case::test_case(

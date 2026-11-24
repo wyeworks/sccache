@@ -30,6 +30,7 @@ mod toolchains;
 mod digest;
 
 mod executor;
+mod lookup_pause;
 
 #[allow(dead_code)]
 mod input_root;
