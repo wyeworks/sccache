@@ -29,6 +29,9 @@ mod toolchains;
 #[allow(dead_code)]
 mod digest;
 
+#[allow(dead_code)]
+mod execution;
+
 mod executor;
 mod lookup_pause;
 

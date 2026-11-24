@@ -243,8 +243,25 @@ fn auth_header(auth_token: Option<&str>) -> Result<Option<AsciiMetadataValue>> {
 
 /// `status`'s code and message, without its source: a transport error there can name the
 /// REAPI server's host.
+#[derive(Debug)]
+pub(crate) struct RpcError {
+    pub(crate) code: tonic::Code,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
 pub(super) fn status_error(status: tonic::Status) -> Error {
-    anyhow!("{:?}: {}", status.code(), status.message())
+    Error::new(RpcError {
+        code: status.code(),
+        message: status.message().to_owned(),
+    })
 }
 
 /// `error` with each mention of `host` replaced, since rustls names the expected host when the
