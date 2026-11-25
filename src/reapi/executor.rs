@@ -248,7 +248,11 @@ impl ReapiExecutor {
                 .await
                 .map_err(|error| {
                     warn!("[{out_pretty}]: failed to download worker rustc version: {error:#}");
-                    CompileLocallyReason::DownloadingOutputsFailed
+                    if is_refused_read(&error) {
+                        CompileLocallyReason::CredentialsRefused
+                    } else {
+                        CompileLocallyReason::DownloadingOutputsFailed
+                    }
                 })?;
                 let stdout = String::from_utf8_lossy(&stdout);
                 let commit = stdout
@@ -377,10 +381,7 @@ impl ReapiExecutor {
             }
             Err(e) => {
                 warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
-                if matches!(
-                    rpc_code(&e),
-                    Some(tonic::Code::Unauthenticated | tonic::Code::PermissionDenied)
-                ) {
+                if is_refused_read(&e) {
                     if let Some(connection) = &self.connection {
                         connection.credentials_refused(&apis).await;
                     }
@@ -487,10 +488,8 @@ impl ReapiExecutor {
                 Ok((outcome, output))
             }
             Err(e) => {
-                if matches!(
-                    rpc_code(&e),
-                    Some(tonic::Code::Unauthenticated | tonic::Code::PermissionDenied)
-                ) && let Some(connection) = &self.connection
+                if is_refused_read(&e)
+                    && let Some(connection) = &self.connection
                 {
                     connection.credentials_refused(&apis).await;
                     return Err(CompileLocallyReason::CredentialsRefused);
@@ -513,6 +512,13 @@ impl ReapiExecutor {
             }
         }
     }
+}
+
+fn is_refused_read(error: &Error) -> bool {
+    matches!(
+        rpc_code(error),
+        Some(tonic::Code::Unauthenticated | tonic::Code::PermissionDenied)
+    )
 }
 
 async fn compile_locally<T: CommandCreatorSync>(
@@ -1098,6 +1104,37 @@ mod test {
         );
         let (outcome, _) = fixture.compile_with(&executor);
         assert_eq!(outcome, DistType::Reapi(ReapiOutcome::ActionCacheHit));
+    }
+
+    #[test_case(tonic::Code::Unauthenticated ; "unauthenticated")]
+    #[test_case(tonic::Code::PermissionDenied ; "permission denied")]
+    fn test_worker_probe_download_auth_failure_reconnects(code: tonic::Code) {
+        let fixture = Fixture::with_server(
+            Eligibility::Eligible,
+            tokio::runtime::Runtime::new().unwrap(),
+            FakeServer {
+                executes_actions: true,
+                worker_rustc_commit_hash: Mutex::new(Some("abc123".into())),
+                read_error: Some(code),
+                ..Default::default()
+            },
+        );
+        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
+        executor.linux_toolchain = true;
+        for _ in 0..2 {
+            assert_eq!(
+                fixture.compile_with(&executor).0,
+                compiled_locally("REAPI server refused the credentials"),
+            );
+        }
+        assert_eq!(fixture.server.capabilities_calls.load(Ordering::SeqCst), 2);
+
+        // A second refusal with the same credentials stops reconnecting.
+        assert_eq!(
+            fixture.compile_with(&executor).0,
+            compiled_locally("REAPI server refused the credentials"),
+        );
+        assert_eq!(fixture.server.capabilities_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
