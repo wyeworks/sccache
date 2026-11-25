@@ -14,7 +14,8 @@
 
 //! Shared test helpers for REAPI modules.
 
-use super::client::{Client, ConnectOptions};
+use super::client::{Client, ConnectOptions, REQUEST_METADATA_HEADER, RUSTC_MNEMONIC};
+const TOOL_INVOCATION_ID: &str = "the invocation";
 use super::digest;
 use super::execution::{PreconditionFailure, Violation};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
@@ -48,6 +49,7 @@ type RpcResult<T> = std::result::Result<Response<T>, Status>;
 /// In-memory REAPI server for unit tests.
 #[derive(Default)]
 pub(crate) struct FakeServer {
+    pub(crate) request_metadata: Mutex<Vec<(&'static str, remexec::RequestMetadata)>>,
     pub(crate) executes_actions: bool,
     pub(crate) lookups_miss: bool,
     pub(crate) busy_answers: Mutex<HashMap<&'static str, usize>>,
@@ -176,6 +178,40 @@ struct ResourceName {
 }
 
 impl FakeServer {
+    /// The `RequestMetadata` that a [`Client`] from `serve_and_connect` sends, with the ID of
+    /// `action_digest` for a call about one compile's action.
+    pub(crate) fn request_metadata_for(
+        action_digest: Option<&remexec::Digest>,
+    ) -> remexec::RequestMetadata {
+        remexec::RequestMetadata {
+            tool_details: Some(remexec::ToolDetails {
+                tool_name: "sccache".to_owned(),
+                tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+            }),
+            tool_invocation_id: TOOL_INVOCATION_ID.to_owned(),
+            action_id: action_digest.map_or_else(String::new, |digest| digest.hash.clone()),
+            action_mnemonic: if action_digest.is_some() {
+                RUSTC_MNEMONIC
+            } else {
+                ""
+            }
+            .to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn record_request_metadata<T>(&self, method: &'static str, request: &Request<T>) {
+        let request_metadata = request
+            .metadata()
+            .get_bin(REQUEST_METADATA_HEADER)
+            .map(|value| remexec::RequestMetadata::decode(value.to_bytes().unwrap()).unwrap())
+            .unwrap_or_default();
+        self.request_metadata
+            .lock()
+            .unwrap()
+            .push((method, request_metadata));
+    }
+
     async fn begin_upload(&self) -> UploadGuard<'_> {
         let active = self.active_uploads.fetch_add(1, Ordering::SeqCst) + 1;
         let guard = UploadGuard(&self.active_uploads);
@@ -233,6 +269,7 @@ impl FakeServer {
     pub(crate) async fn serve_and_connect(self: &Arc<Self>) -> Client {
         Client::connect(&ConnectOptions {
             endpoint: self.serve().await,
+            tool_invocation_id: TOOL_INVOCATION_ID.to_owned(),
             instance_name: self.instance_name.clone(),
             ..Default::default()
         })
@@ -364,6 +401,7 @@ impl ContentAddressableStorage for FakeServer {
         &self,
         request: Request<remexec::FindMissingBlobsRequest>,
     ) -> RpcResult<remexec::FindMissingBlobsResponse> {
+        self.record_request_metadata("FindMissingBlobs", &request);
         self.find_missing_blobs_calls.fetch_add(1, Ordering::SeqCst);
         if self.take_busy_answer("FindMissingBlobs") {
             return Err(Status::unavailable("busy"));
@@ -537,6 +575,7 @@ impl ActionCache for FakeServer {
         &self,
         request: Request<remexec::GetActionResultRequest>,
     ) -> RpcResult<remexec::ActionResult> {
+        self.record_request_metadata("GetActionResult", &request);
         if self.take_busy_answer("GetActionResult") {
             return Err(Status::unavailable("busy"));
         }
@@ -948,6 +987,7 @@ impl Execution for FakeServer {
         &self,
         request: Request<remexec::ExecuteRequest>,
     ) -> RpcResult<Self::ExecuteStream> {
+        self.record_request_metadata("Execute", &request);
         self.execute_calls.fetch_add(1, Ordering::SeqCst);
         if take_one(&self.executes_to_refuse) {
             return Err(Status::unavailable("every worker is busy"));
@@ -1049,6 +1089,7 @@ impl Execution for FakeServer {
         &self,
         request: Request<remexec::WaitExecutionRequest>,
     ) -> RpcResult<Self::WaitExecutionStream> {
+        self.record_request_metadata("WaitExecution", &request);
         self.wait_execution_calls.fetch_add(1, Ordering::SeqCst);
         if take_one(&self.wait_executions_to_refuse) {
             return Err(Status::unavailable("try again"));

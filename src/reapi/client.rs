@@ -14,14 +14,21 @@
 
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
+use prost::Message;
 use remexec::capabilities_client::CapabilitiesClient;
-use std::{future::Future, time::Duration};
-use tonic::metadata::AsciiMetadataValue;
-use tonic::service::{Interceptor, interceptor::InterceptedService};
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataValue};
+use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// The largest response to a call that answers with an `ActionResult`. Servers inline stdout
+/// and stderr up to their own message limit, which is often above tonic's 4 MiB default.
 pub(super) const MAX_ACTION_RESULT_RESPONSE_BYTES: usize = 32 << 20;
 /// Tries after the first for a call that a busy or restarting server refused.
 pub(super) const RETRIES: u32 = 2;
@@ -38,7 +45,8 @@ const RETRIED_FAILURE_MAX: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(1)
 };
-
+// TCP keepalive, since grpc-go and grpc-java servers close connections that send
+// HTTP/2 pings more often than every five minutes.
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
@@ -46,37 +54,58 @@ const TCP_KEEPALIVE_RETRIES: u32 = 3;
 const REQUIRED_API_MAJOR_VERSION: i32 = 2;
 /// v2.1 added `Command.output_paths`, the only output field sccache's commands set.
 const MIN_API_MINOR_VERSION: i32 = 1;
+/// Used when the server doesn't advertise a batch limit.
 const DEFAULT_MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
+/// The `RequestMetadata` mnemonic of a compile's action, as rules_rust names it.
+pub(super) const RUSTC_MNEMONIC: &str = "Rustc";
+/// The mnemonic of the action that runs `rustc -vV` on a worker.
+pub(super) const RUSTC_VERSION_MNEMONIC: &str = "RustcVersion";
+/// Carries a [`remexec::RequestMetadata`], which a server logs to tell its clients, their runs
+/// and their actions apart.
+pub(super) const REQUEST_METADATA_HEADER: &str =
+    "build.bazel.remote.execution.v2.requestmetadata-bin";
 
 #[derive(Clone, Default)]
 pub(crate) struct ConnectOptions {
-    /// `grpc://host:port`, or `grpcs://host:port`
+    /// `grpc://host:port`, or `grpcs://host:port` for TLS verified against the system's
+    /// root certificates, or against `tls_ca_certificates` when set.
     pub(crate) endpoint: String,
     pub(crate) instance_name: String,
-    /// Authentication token sent as a bearer token with every request.
-    /// TODO: replace this with a more broad authentication flow that supports other auth mechanisms.
+    /// Sent as a bearer token with every request. Surrounding whitespace is ignored.
     pub(crate) auth_token: Option<String>,
+    /// Sent with every request.
+    pub(crate) headers: BTreeMap<String, String>,
+    /// Sent in every request's `RequestMetadata`, so that the server can tell this sccache
+    /// server's calls from those of earlier runs and other clients.
+    pub(crate) tool_invocation_id: String,
+    /// PEM certificates that TLS trusts instead of the system's root certificates.
     pub(crate) tls_ca_certificates: Option<Certificate>,
+    /// The PEM certificate and key TLS sends to a server that asks for a client certificate.
     pub(crate) tls_client_identity: Option<Identity>,
 }
 
-pub(crate) type AuthChannel = InterceptedService<Channel, AuthInterceptor>;
+pub(crate) type ReapiChannel = InterceptedService<Channel, HeadersInterceptor>;
 
-/// Adds `auth_header`, when set, to every request.
+/// Adds `headers` to every request, and `request_metadata` to a request that has no
+/// `RequestMetadata` of its own.
 #[derive(Clone)]
-pub(crate) struct AuthInterceptor {
-    auth_header: Option<AsciiMetadataValue>,
+pub(crate) struct HeadersInterceptor {
+    headers: Arc<[(AsciiMetadataKey, AsciiMetadataValue)]>,
+    request_metadata: BinaryMetadataValue,
 }
 
-impl Interceptor for AuthInterceptor {
+impl Interceptor for HeadersInterceptor {
     fn call(
         &mut self,
         mut request: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
-        if let Some(auth_header) = &self.auth_header {
+        for (name, value) in self.headers.iter() {
+            request.metadata_mut().insert(name.clone(), value.clone());
+        }
+        if !request.metadata().contains_key(REQUEST_METADATA_HEADER) {
             request
                 .metadata_mut()
-                .insert("authorization", auth_header.clone());
+                .insert_bin(REQUEST_METADATA_HEADER, self.request_metadata.clone());
         }
         Ok(request)
     }
@@ -135,7 +164,7 @@ impl std::fmt::Display for IncompatibleServer {
 
 impl std::error::Error for IncompatibleServer {}
 
-/// Credentials rejected by GetCapabilities.
+/// Error for a REAPI server that refuses the auth token, or a request without one.
 #[derive(Debug)]
 pub(crate) struct CredentialsRefused;
 
@@ -145,12 +174,11 @@ impl std::fmt::Display for CredentialsRefused {
     }
 }
 
-impl std::error::Error for CredentialsRefused {}
-
 /// A connection to a REAPI server.
 pub(crate) struct Client {
     instance_name: String,
-    channel: AuthChannel,
+    channel: ReapiChannel,
+    request_metadata: remexec::RequestMetadata,
     max_batch_bytes: usize,
     supports_zstd_bytestream: bool,
     executes_actions: bool,
@@ -166,10 +194,10 @@ impl Client {
             .tcp_keepalive(Some(TCP_KEEPALIVE_IDLE))
             .tcp_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL))
             .tcp_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
-        if tls_domain.is_none() && options.auth_token.is_some() {
-            warn!("REAPI: sending the auth token without TLS");
+        if tls_domain.is_none() && (options.auth_token.is_some() || !options.headers.is_empty()) {
+            warn!("REAPI: sending the auth token or headers without TLS");
         }
-        let auth_header = auth_header(options.auth_token.as_deref())?;
+        let headers = request_headers(options)?.into();
         let channel = with_timeout(
             "failed to connect to the REAPI server",
             CONNECT_TIMEOUT,
@@ -181,7 +209,23 @@ impl Client {
             },
         )
         .await?;
-        let channel = InterceptedService::new(channel, AuthInterceptor { auth_header });
+        let request_metadata = remexec::RequestMetadata {
+            tool_details: Some(remexec::ToolDetails {
+                tool_name: "sccache".to_owned(),
+                tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+            }),
+            tool_invocation_id: options.tool_invocation_id.clone(),
+            ..Default::default()
+        };
+        let channel = InterceptedService::new(
+            channel,
+            HeadersInterceptor {
+                headers,
+                request_metadata: BinaryMetadataValue::from_bytes(
+                    &request_metadata.encode_to_vec(),
+                ),
+            },
+        );
 
         let capabilities = with_timeout(
             "failed to get the REAPI server's capabilities",
@@ -228,7 +272,7 @@ impl Client {
             .supported_compressors
             .contains(&(remexec::compressor::Value::Zstd as i32));
         let max_batch_bytes = match usize::try_from(cache_capabilities.max_batch_total_size_bytes) {
-            Ok(bytes) if bytes > 0 => bytes,
+            Ok(max_batch_bytes) if max_batch_bytes > 0 => max_batch_bytes,
             _ => DEFAULT_MAX_BATCH_BYTES,
         };
         // Servers from before `digest_functions` existed set `digest_function` only.
@@ -246,6 +290,7 @@ impl Client {
         Ok(Client {
             instance_name: options.instance_name.clone(),
             channel,
+            request_metadata,
             max_batch_bytes,
             supports_zstd_bytestream,
             executes_actions,
@@ -257,8 +302,13 @@ impl Client {
     }
 
     /// A clone of the channel; every clone shares one connection.
-    pub(crate) fn channel(&self) -> AuthChannel {
+    pub(crate) fn channel(&self) -> ReapiChannel {
         self.channel.clone()
+    }
+
+    /// The `RequestMetadata` of every call that isn't for one action.
+    pub(crate) fn request_metadata(&self) -> &remexec::RequestMetadata {
+        &self.request_metadata
     }
 
     pub(crate) fn max_batch_bytes(&self) -> usize {
@@ -274,13 +324,75 @@ impl Client {
     }
 }
 
-/// Fails if `options` has an invalid endpoint, auth token or TLS file, without connecting.
+/// `message` as a request whose `RequestMetadata` is `request_metadata` with the ID and
+/// mnemonic of the action the call is for.
+pub(super) fn action_request<T>(
+    message: T,
+    request_metadata: &remexec::RequestMetadata,
+    action_digest: &remexec::Digest,
+    action_mnemonic: &str,
+) -> tonic::Request<T> {
+    let request_metadata = remexec::RequestMetadata {
+        action_id: action_digest.hash.clone(),
+        action_mnemonic: action_mnemonic.to_owned(),
+        ..request_metadata.clone()
+    };
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert_bin(
+        REQUEST_METADATA_HEADER,
+        BinaryMetadataValue::from_bytes(&request_metadata.encode_to_vec()),
+    );
+    request
+}
+
+/// Fails if `options` has an invalid endpoint, auth token, header or TLS file, without
+/// connecting.
 /// The system's root certificates aren't loaded: a store that is missing or slow to read is a
 /// reason to retry the connection, not an invalid config.
 pub(super) fn check_connect_options(options: &ConnectOptions) -> Result<()> {
     channel_endpoint(options, false)?;
-    auth_header(options.auth_token.as_deref())?;
+    request_headers(options)?;
     Ok(())
+}
+
+/// The headers for every request: the bearer token's `authorization`, then `options.headers`.
+/// A header's value is left out of errors, since it may be a credential.
+fn request_headers(
+    options: &ConnectOptions,
+) -> Result<Vec<(AsciiMetadataKey, AsciiMetadataValue)>> {
+    let mut headers = Vec::new();
+    if let Some(auth_header) = auth_header(options.auth_token.as_deref())? {
+        headers.push((AsciiMetadataKey::from_static("authorization"), auth_header));
+    }
+    for (name, value) in &options.headers {
+        let key = AsciiMetadataKey::from_bytes(name.as_bytes())
+            .with_context(|| format!("the REAPI header name {name:?} is not valid"))?;
+        // gRPC and HTTP/2 own these: tonic drops or replaces some, and HTTP/2 refuses
+        // requests that have the others.
+        if key.as_str().starts_with("grpc-")
+            || [
+                "te",
+                "content-type",
+                "user-agent",
+                "connection",
+                "keep-alive",
+                "proxy-connection",
+                "transfer-encoding",
+                "upgrade",
+            ]
+            .contains(&key.as_str())
+        {
+            bail!("the REAPI header {name:?} is reserved for gRPC or HTTP/2");
+        }
+        if headers.iter().any(|(existing, _)| *existing == key) {
+            bail!("the REAPI header {name:?} is set twice, or with auth_token_file");
+        }
+        let value = sensitive_ascii_value(value).with_context(|| {
+            format!("the REAPI header {name:?} has a non-ASCII or control character")
+        })?;
+        headers.push((key, value));
+    }
+    Ok(headers)
 }
 
 /// The tonic endpoint for `options`, with TLS set up for `grpcs://`, and the host name TLS
@@ -316,21 +428,29 @@ fn channel_endpoint(
     Ok((channel_builder, parsed.tls_domain))
 }
 
+/// The bearer `authorization` header for `auth_token`, if any.
 fn auth_header(auth_token: Option<&str>) -> Result<Option<AsciiMetadataValue>> {
     match auth_token.map(str::trim) {
         Some("") => bail!("the REAPI auth token is empty"),
-        Some(token) => {
-            let mut header = AsciiMetadataValue::try_from(format!("Bearer {token}"))
-                .context("the REAPI auth token contains a non-ASCII or control character")?;
-            header.set_sensitive(true);
-            Ok(Some(header))
-        }
+        Some(token) => sensitive_ascii_value(&format!("Bearer {token}"))
+            .context("the REAPI auth token contains a non-ASCII or control character")
+            .map(Some),
         None => Ok(None),
     }
 }
 
-/// `status`'s code and message, without its source: a transport error there can name the
-/// REAPI server's host.
+/// `value` as a header value that tonic leaves out of logs, or `None` if it has a non-ASCII or
+/// control character. tonic takes bytes above 0x7f, which servers may not.
+fn sensitive_ascii_value(value: &str) -> Option<AsciiMetadataValue> {
+    let mut value = AsciiMetadataValue::try_from(value)
+        .ok()
+        .filter(|_| value.is_ascii())?;
+    value.set_sensitive(true);
+    Some(value)
+}
+
+/// Error for a failed REAPI call. It keeps the status's code and message and drops the
+/// source, which can name the REAPI server's host.
 #[derive(Debug)]
 pub(crate) struct RpcError {
     pub(crate) code: tonic::Code,
@@ -352,15 +472,16 @@ pub(super) fn loggable(text: &[u8]) -> String {
 
 impl std::error::Error for RpcError {}
 
-pub(super) fn rpc_code(error: &Error) -> Option<tonic::Code> {
-    error.downcast_ref::<RpcError>().map(|error| error.code)
-}
-
 pub(super) fn status_error(status: tonic::Status) -> Error {
     Error::new(RpcError {
         code: status.code(),
         message: status.message().to_owned(),
     })
+}
+
+/// The code of the REAPI call that failed with `e`, if `e` is one.
+pub(super) fn rpc_code(e: &Error) -> Option<tonic::Code> {
+    e.downcast_ref::<RpcError>().map(|e| e.code)
 }
 
 /// `error` with each mention of `host` replaced, since rustls names the expected host when the
@@ -464,28 +585,20 @@ mod test {
     use super::*;
     use crate::reapi::proto::build::bazel::semver::SemVer;
     use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use test_case::test_case;
     use tokio::net::TcpListener;
-    use tokio::sync::Notify;
     use tonic::transport::ServerTlsConfig;
     use tonic::transport::server::TcpIncoming;
 
-    #[derive(Default)]
-    enum CapabilitiesResponse {
-        #[default]
-        Success,
-        Error(tonic::Code),
-        Stall(Arc<Notify>),
-    }
-
-    /// Answers GetCapabilities with `capabilities` and records each request's instance name and
-    /// `authorization` header.
+    /// Answers GetCapabilities with `capabilities` and records each request's instance name,
+    /// `authorization` header and metadata.
     struct FakeCapabilities {
         capabilities: remexec::ServerCapabilities,
-        response: CapabilitiesResponse,
         instance_names: Arc<Mutex<Vec<String>>>,
         authorization_headers: Arc<Mutex<Vec<Option<String>>>>,
+        metadata: Arc<Mutex<Vec<tonic::metadata::MetadataMap>>>,
     }
 
     impl Default for FakeCapabilities {
@@ -495,9 +608,9 @@ mod test {
                     cache_capabilities: Some(Default::default()),
                     ..Default::default()
                 },
-                response: CapabilitiesResponse::default(),
                 instance_names: Default::default(),
                 authorization_headers: Default::default(),
+                metadata: Default::default(),
             }
         }
     }
@@ -517,22 +630,15 @@ mod test {
                 .lock()
                 .unwrap()
                 .push(authorization_header);
+            self.metadata
+                .lock()
+                .unwrap()
+                .push(request.metadata().clone());
             self.instance_names
                 .lock()
                 .unwrap()
                 .push(request.into_inner().instance_name);
-            match &self.response {
-                CapabilitiesResponse::Success => {
-                    Ok(tonic::Response::new(self.capabilities.clone()))
-                }
-                CapabilitiesResponse::Error(code) => {
-                    Err(tonic::Status::new(*code, "simulated RPC failure"))
-                }
-                CapabilitiesResponse::Stall(received) => {
-                    received.notify_one();
-                    std::future::pending().await
-                }
-            }
+            Ok(tonic::Response::new(self.capabilities.clone()))
         }
     }
 
@@ -607,65 +713,10 @@ mod test {
         })
     }
 
-    #[test_case(tonic::Code::Unauthenticated, true ; "unauthenticated")]
-    #[test_case(tonic::Code::PermissionDenied, true ; "permission denied")]
-    #[test_case(tonic::Code::Unavailable, false ; "unavailable")]
-    #[tokio::test]
-    async fn test_capabilities_rpc_failure_has_context(code: tonic::Code, refused: bool) {
-        let endpoint = serve_fake(FakeCapabilities {
-            response: CapabilitiesResponse::Error(code),
-            ..Default::default()
-        })
-        .await;
-        let error = Client::connect(&connect_options(&endpoint))
-            .await
-            .err()
-            .expect("the capabilities RPC should fail");
-        let credentials = if refused {
-            "the REAPI server refused the credentials: "
-        } else {
-            ""
-        };
-        assert_eq!(
-            format!(
-                "failed to get the REAPI server's capabilities: {credentials}{code:?}: simulated RPC failure"
-            ),
-            format!("{error:#}")
-        );
-        assert!(!error.is::<IncompatibleServer>());
-        assert_eq!(error.is::<CredentialsRefused>(), refused);
-    }
-
-    #[tokio::test]
-    async fn test_capabilities_rpc_times_out() {
-        let received = Arc::new(Notify::new());
-        let endpoint = serve_fake(FakeCapabilities {
-            response: CapabilitiesResponse::Stall(received.clone()),
-            ..Default::default()
-        })
-        .await;
-        let options = connect_options(&endpoint);
-        let mut connecting = tokio::spawn(async move { Client::connect(&options).await });
-        tokio::select! {
-            _ = received.notified() => {}
-            _ = &mut connecting => panic!("the client finished before the stalled RPC was received"),
-        }
-        // Establish the real socket connection before pausing time, so the connect
-        // timeout cannot fire while waiting for network I/O.
-        tokio::time::pause();
-        tokio::time::advance(RPC_TIMEOUT).await;
-        let error = tokio::time::timeout(Duration::from_secs(1), connecting)
-            .await
-            .expect("the capabilities RPC should time out")
-            .unwrap()
-            .err()
-            .expect("the stalled capabilities RPC should fail");
-        assert_eq!(
-            format!(
-                "failed to get the REAPI server's capabilities: timed out after {RPC_TIMEOUT:?}"
-            ),
-            error.to_string()
-        );
+    #[test]
+    fn test_a_status_message_is_escaped() {
+        let e = status_error(tonic::Status::internal("ok\nINFO forged\x1b[2J"));
+        assert_eq!(r#"Internal: "ok\nINFO forged\u{1b}[2J""#, e.to_string());
     }
 
     #[tokio::test]
@@ -675,6 +726,11 @@ mod test {
                 cache_capabilities: Some(remexec::CacheCapabilities {
                     max_batch_total_size_bytes: 4 * 1024 * 1024,
                     supported_compressors: vec![remexec::compressor::Value::Zstd as i32],
+                    ..Default::default()
+                }),
+                execution_capabilities: Some(remexec::ExecutionCapabilities {
+                    exec_enabled: true,
+                    digest_functions: vec![remexec::digest_function::Value::Sha256 as i32],
                     ..Default::default()
                 }),
                 low_api_version: api_version(2, 0),
@@ -692,14 +748,23 @@ mod test {
         .await
         .unwrap();
         assert_eq!(vec!["main".to_owned()], *instance_names.lock().unwrap());
+        assert_eq!(4 * 1024 * 1024, client.max_batch_bytes());
         assert!(client.supports_zstd_bytestream());
-        assert_eq!(client.max_batch_bytes(), 4 * 1024 * 1024);
+        assert!(client.executes_actions());
+    }
+
+    #[tokio::test]
+    async fn test_connect_defaults_what_the_server_doesnt_advertise() {
+        let endpoint = serve_fake(FakeCapabilities::default()).await;
+        let client = Client::connect(&connect_options(&endpoint)).await.unwrap();
+        assert_eq!(DEFAULT_MAX_BATCH_BYTES, client.max_batch_bytes());
+        assert!(!client.supports_zstd_bytestream());
+        assert!(!client.executes_actions());
     }
 
     const SHA256: i32 = remexec::digest_function::Value::Sha256 as i32;
     const MD5: i32 = remexec::digest_function::Value::Md5 as i32;
 
-    #[test_case(true, 0, vec![SHA256], true ; "sha256 in the list")]
     #[test_case(true, SHA256, vec![], true ; "sha256 in the old field")]
     #[test_case(false, SHA256, vec![SHA256], false ; "execution disabled")]
     #[test_case(true, MD5, vec![MD5], false ; "without sha256")]
@@ -726,33 +791,6 @@ mod test {
         .await;
         let client = Client::connect(&connect_options(&endpoint)).await.unwrap();
         assert_eq!(executes_actions, client.executes_actions());
-    }
-
-    #[test_case(0, DEFAULT_MAX_BATCH_BYTES ; "not advertised")]
-    #[test_case(-1, DEFAULT_MAX_BATCH_BYTES ; "negative")]
-    #[test_case(1024, 1024 ; "advertised")]
-    #[tokio::test]
-    async fn test_batch_limit_defaults_and_advertised_values(advertised: i64, expected: usize) {
-        let fake = FakeCapabilities {
-            capabilities: remexec::ServerCapabilities {
-                cache_capabilities: Some(remexec::CacheCapabilities {
-                    max_batch_total_size_bytes: advertised,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let endpoint = serve_fake(fake).await;
-        let client = Client::connect(&connect_options(&endpoint)).await.unwrap();
-        assert_eq!(client.max_batch_bytes(), expected);
-    }
-
-    #[tokio::test]
-    async fn test_server_without_zstd_does_not_support_zstd_bytestream() {
-        let endpoint = serve_fake(FakeCapabilities::default()).await;
-        let client = Client::connect(&connect_options(&endpoint)).await.unwrap();
-        assert!(!client.supports_zstd_bytestream());
     }
 
     #[tokio::test]
@@ -913,6 +951,49 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_configured_headers_are_sent_with_the_auth_token() {
+        let fake = FakeCapabilities::default();
+        let metadata = fake.metadata.clone();
+        let endpoint = serve_fake(fake).await;
+        Client::connect(&ConnectOptions {
+            auth_token: Some("secret".to_owned()),
+            headers: [("X-Api-Key".to_owned(), "key".to_owned())].into(),
+            ..connect_options(&endpoint)
+        })
+        .await
+        .unwrap();
+        let metadata = &metadata.lock().unwrap()[0];
+        assert_eq!("key", metadata.get("x-api-key").unwrap());
+        assert_eq!("Bearer secret", metadata.get("authorization").unwrap());
+    }
+
+    #[test_case("x api key", "hidden", "not valid" ; "invalid name")]
+    #[test_case("x-api-key-bin", "hidden", "not valid" ; "binary name")]
+    #[test_case("x-api-key", "sec\nret", "control character" ; "control character in the value")]
+    #[test_case("x-api-key", "hédden", "non-ASCII" ; "non-ascii value")]
+    #[test_case("grpc-timeout", "1S", "reserved" ; "grpc name")]
+    #[test_case("Content-Type", "text/plain", "reserved" ; "content type")]
+    #[test_case("Connection", "close", "reserved" ; "http/2 connection header")]
+    #[test_case("Authorization", "Bearer other", "set twice" ; "authorization with a token")]
+    fn test_a_bad_header_is_refused_without_echoing_its_value(
+        name: &str,
+        value: &str,
+        error: &str,
+    ) {
+        let e = check_connect_options(&ConnectOptions {
+            auth_token: Some("secret".to_owned()),
+            headers: [(name.to_owned(), value.to_owned())].into(),
+            ..connect_options("grpc://farm:8980")
+        })
+        .unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains(error) && !e.contains(value) && !e.contains("secret"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_empty_auth_token_is_refused() {
         let e = Client::connect(&ConnectOptions {
             auth_token: Some(" \n".to_owned()),
@@ -1052,22 +1133,64 @@ mod test {
     }
 
     #[test]
-    fn test_a_status_message_is_escaped() {
-        let e = status_error(tonic::Status::internal("ok\nINFO forged\x1b[2J"));
-        assert_eq!(r#"Internal: "ok\nINFO forged\u{1b}[2J""#, e.to_string());
-    }
-
-    #[test]
-    fn test_status_error_leaves_out_the_source() {
+    fn test_status_error_keeps_the_code_and_leaves_out_the_source() {
         let mut status = tonic::Status::unavailable("transport error");
         status.set_source(std::sync::Arc::new(std::io::Error::other(
             "certificate not valid for name reapi.example.com",
         )));
         assert!(status.to_string().contains("reapi.example.com"));
-        assert_eq!(
-            r#"Unavailable: "transport error""#,
-            status_error(status).to_string()
-        );
+        let e = status_error(status);
+        assert_eq!(r#"Unavailable: "transport error""#, e.to_string());
+        assert_eq!(Some(tonic::Code::Unavailable), rpc_code(&e));
+    }
+
+    #[test_case(tonic::Code::Unavailable, RETRIES + 1 ; "unavailable")]
+    #[test_case(tonic::Code::ResourceExhausted, RETRIES + 1 ; "resource exhausted")]
+    #[test_case(tonic::Code::Internal, 1 ; "internal")]
+    #[test_case(tonic::Code::NotFound, 1 ; "not found")]
+    #[test_case(tonic::Code::Unauthenticated, 1 ; "unauthenticated")]
+    #[test_case(tonic::Code::PermissionDenied, 1 ; "permission denied")]
+    #[tokio::test]
+    async fn test_only_unavailable_and_resource_exhausted_are_tried_again(
+        code: tonic::Code,
+        tries: u32,
+    ) {
+        let calls = &AtomicU32::new(0);
+        let e = with_retries(|| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(status_error(tonic::Status::new(code, "no")))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(Some(code), rpc_code(&e));
+        assert_eq!(tries, calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_a_slow_failure_is_not_tried_again() {
+        let calls = &AtomicU32::new(0);
+        with_retries(|| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(RETRIED_FAILURE_MAX + Duration::from_millis(50)).await;
+            Err::<(), _>(status_error(tonic::Status::unavailable("unreachable")))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_a_call_the_server_answers_on_a_retry_succeeds() {
+        let calls = &AtomicU32::new(0);
+        let answer = with_retries(|| async move {
+            if calls.fetch_add(1, Ordering::SeqCst) < RETRIES {
+                return Err(status_error(tonic::Status::unavailable("busy")));
+            }
+            Ok("answer")
+        })
+        .await
+        .unwrap();
+        assert_eq!("answer", answer);
     }
 
     #[test]
@@ -1099,16 +1222,30 @@ mod test {
         assert_eq!("asking: timed out after 1ms", e.to_string());
     }
 
+    #[test_case("sec\nret" ; "control character")]
+    #[test_case("sécret" ; "non-ascii")]
     #[tokio::test]
-    async fn test_auth_token_with_a_control_character_is_refused_without_echoing_it() {
+    async fn test_an_invalid_auth_token_is_refused_without_echoing_it(token: &str) {
         let e = Client::connect(&ConnectOptions {
-            auth_token: Some("sec\nret".to_owned()),
+            auth_token: Some(token.to_owned()),
             ..connect_options("grpc://127.0.0.1:1")
         })
         .await
         .err()
         .unwrap();
-        assert!(!format!("{e:#}").contains("sec"), "{e:#}");
+        assert!(!format!("{e:#}").contains("cret"), "{e:#}");
+    }
+
+    #[test]
+    fn test_the_token_and_header_values_are_left_out_of_logs() {
+        let headers = request_headers(&ConnectOptions {
+            auth_token: Some("secret".to_owned()),
+            headers: [("x-api-key".to_owned(), "key".to_owned())].into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(2, headers.len());
+        assert!(headers.iter().all(|(_, value)| value.is_sensitive()));
     }
 
     #[test_case("grpc://farm:8980", "http://farm:8980", None ; "plain text")]

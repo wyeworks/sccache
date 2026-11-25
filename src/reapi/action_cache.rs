@@ -15,8 +15,8 @@
 //! Looks actions up in a REAPI server's action cache.
 
 use super::client::{
-    AuthChannel, Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, status_error, with_retries,
-    with_timeout,
+    Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, RUSTC_MNEMONIC, ReapiChannel,
+    action_request, status_error, with_retries, with_timeout,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
@@ -25,7 +25,8 @@ use remexec::action_cache_client::ActionCacheClient;
 /// The action cache of the REAPI server behind a [`Client`].
 pub(crate) struct ActionCache {
     instance_name: String,
-    action_cache_client: ActionCacheClient<AuthChannel>,
+    action_cache_client: ActionCacheClient<ReapiChannel>,
+    request_metadata: remexec::RequestMetadata,
 }
 
 impl ActionCache {
@@ -34,6 +35,7 @@ impl ActionCache {
             instance_name: client.instance_name().to_owned(),
             action_cache_client: ActionCacheClient::new(client.channel())
                 .max_decoding_message_size(MAX_ACTION_RESULT_RESPONSE_BYTES),
+            request_metadata: client.request_metadata().clone(),
         }
     }
 
@@ -60,7 +62,12 @@ impl ActionCache {
                 match self
                     .action_cache_client
                     .clone()
-                    .get_action_result(request.clone())
+                    .get_action_result(action_request(
+                        request.clone(),
+                        &self.request_metadata,
+                        action_digest,
+                        RUSTC_MNEMONIC,
+                    ))
                     .await
                 {
                     Ok(response) => Ok(Some(response.into_inner())),
@@ -120,6 +127,13 @@ mod test {
                 .get_action_result(&action_digest)
                 .await
                 .unwrap()
+        );
+        assert_eq!(
+            vec![(
+                "GetActionResult",
+                FakeServer::request_metadata_for(Some(&action_digest))
+            )],
+            *server.request_metadata.lock().unwrap()
         );
     }
 
@@ -214,7 +228,7 @@ mod test {
         let server = Arc::new(FakeServer::default());
         let client = Client::connect(&ConnectOptions {
             endpoint: server.serve().await,
-            auth_token: Some("test-token".into()),
+            auth_token: Some("test-token".to_owned()),
             ..Default::default()
         })
         .await

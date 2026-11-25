@@ -15,7 +15,7 @@
 //! CAS uploads and downloads with size limits and digest verification.
 
 use super::client::{
-    AuthChannel, Client, RPC_TIMEOUT, RpcError, status_error, with_retries, with_timeout,
+    Client, RPC_TIMEOUT, ReapiChannel, RpcError, status_error, with_retries, with_timeout,
 };
 use super::digest;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
@@ -202,8 +202,8 @@ fn zstd_window_log_max(size_bytes: u64) -> u32 {
 
 pub(crate) struct Cas {
     instance_name: String,
-    bytestream_client: ByteStreamClient<AuthChannel>,
-    cas_client: ContentAddressableStorageClient<AuthChannel>,
+    bytestream_client: ByteStreamClient<ReapiChannel>,
+    cas_client: ContentAddressableStorageClient<ReapiChannel>,
     max_batch_bytes: usize,
     present_blobs: Mutex<HashSet<remexec::Digest>>,
     max_present_blobs: usize,
@@ -1092,7 +1092,7 @@ mod test {
         let client = Client::connect(&ConnectOptions {
             endpoint: server.serve().await,
             instance_name: server.instance_name.clone(),
-            auth_token: Some(" token ".into()),
+            auth_token: Some(" token ".to_owned()),
             ..Default::default()
         })
         .await
@@ -1490,7 +1490,7 @@ mod test {
         let client = Client::connect(&ConnectOptions {
             endpoint: server.serve().await,
             instance_name: server.instance_name.clone(),
-            auth_token: Some("test-token".into()),
+            auth_token: Some("test-token".to_owned()),
             ..Default::default()
         })
         .await

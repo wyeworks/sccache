@@ -149,7 +149,14 @@ impl ReapiExecutor {
                     CompileLocallyReason::HashingInputsFailed
                 })?;
                 let response = self
-                    .upload_and_execute(apis, execution, &action, false, out_pretty)
+                    .upload_and_execute(
+                        apis,
+                        execution,
+                        &action,
+                        super::client::RUSTC_VERSION_MNEMONIC,
+                        false,
+                        out_pretty,
+                    )
                     .await?;
                 let result = response
                     .result
@@ -185,6 +192,7 @@ impl ReapiExecutor {
         apis: &ServerApis,
         execution: &Execution,
         action: &super::remote_compile::ActionBlobs,
+        mnemonic: &str,
         skip_cache_lookup: bool,
         out_pretty: &str,
     ) -> std::result::Result<
@@ -201,15 +209,21 @@ impl ReapiExecutor {
                         if error.is::<super::cas::UnreadableBlob>() {
                             CompileLocallyReason::UnreadableInput
                         } else {
-                            if rpc_code(&error) == Some(tonic::Code::PermissionDenied) {
-                                CompileLocallyReason::ExecutionsRefused
-                            } else {
-                                CompileLocallyReason::UploadFailed
+                            match rpc_code(&error) {
+                                Some(tonic::Code::PermissionDenied) => {
+                                    CompileLocallyReason::ExecutionsRefused
+                                }
+                                _ => CompileLocallyReason::UploadFailed,
                             }
                         }
                     })?;
                 match execution
-                    .execute_action(&action.action_digest, skip_cache_lookup, self.queue_timeout)
+                    .execute_action(
+                        &action.action_digest,
+                        mnemonic,
+                        skip_cache_lookup,
+                        self.queue_timeout,
+                    )
                     .await
                 {
                     Err(error) if error.is::<MissingActionBlobs>() => {
@@ -315,8 +329,15 @@ impl ReapiExecutor {
                         out_pretty,
                     )
                     .await?;
-                    self.upload_and_execute(&apis, execution, &action, cached.is_some(), out_pretty)
-                        .await
+                    self.upload_and_execute(
+                        &apis,
+                        execution,
+                        &action,
+                        super::client::RUSTC_MNEMONIC,
+                        cached.is_some(),
+                        out_pretty,
+                    )
+                    .await
                 }
                 .await;
                 let response = match response {
@@ -423,6 +444,8 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
         endpoint: config.endpoint.clone(),
         instance_name: config.instance_name.clone(),
         auth_token,
+        headers: config.headers.clone(),
+        tool_invocation_id: uuid::Uuid::new_v4().to_string(),
         tls_ca_certificates,
         tls_client_identity,
     };
