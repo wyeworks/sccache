@@ -303,7 +303,10 @@ impl ReapiExecutor {
                     .await
                     .map_err(|error| {
                         warn!("[{out_pretty}]: REAPI input upload failed: {error:#}");
-                        if error.is::<super::cas::UnreadableBlob>() {
+                        if let Some(super::cas::ChangedBlob(path)) = error.downcast_ref() {
+                            self.digest_cache.forget(path);
+                            CompileLocallyReason::InputChangedAfterHashing
+                        } else if error.is::<super::cas::UnreadableBlob>() {
                             CompileLocallyReason::UnreadableInput
                         } else {
                             match rpc_code(&error) {
@@ -482,6 +485,9 @@ impl ReapiExecutor {
                         }
                         if reason == CompileLocallyReason::ExecutionsRefused {
                             self.executions_refused.store(true, Ordering::Relaxed);
+                        }
+                        if reason == CompileLocallyReason::InputChangedAfterHashing {
+                            self.toolchains.forget(&reapi_compile.toolchain).await;
                         }
                         if matches!(
                             reason,
@@ -1138,6 +1144,42 @@ mod test {
         );
         let (outcome, _) = fixture.compile_with(&executor);
         assert_eq!(outcome, DistType::Reapi(ReapiOutcome::ActionCacheHit));
+    }
+
+    #[test_case("ws/src/lib.rs" ; "source file")]
+    #[test_case("sysroot/bin/rustc" ; "toolchain file")]
+    fn test_a_stale_digest_compiles_locally_then_executes(path: &str) {
+        let fixture = Fixture::with_server(
+            Eligibility::Eligible,
+            tokio::runtime::Runtime::new().unwrap(),
+            FakeServer {
+                executes_actions: true,
+                worker_rustc_commit_hash: Mutex::new(Some("abc123".into())),
+                worker_outputs: Mutex::new(
+                    [(
+                        ".sccache-build/debug/deps/libfoo.rlib".to_owned(),
+                        b"remote rlib".to_vec(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let mut executor = fixture.executor();
+        executor.linux_toolchain = true;
+
+        let stale = super::super::digest::of_bytes(b"stale contents").hash;
+        executor
+            .digest_cache
+            .cache_stale_hash(&fixture.dir.path().join(path), &stale);
+        assert_eq!(
+            fixture.compile_with(&executor).0,
+            compiled_locally("input changed after it was hashed")
+        );
+        assert_eq!(
+            fixture.compile_with(&executor).0,
+            DistType::Reapi(ReapiOutcome::Executed)
+        );
     }
 
     #[test_case(tonic::Code::Unauthenticated ; "unauthenticated")]

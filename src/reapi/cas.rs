@@ -68,6 +68,44 @@ impl std::fmt::Display for UnreadableBlob {
 
 impl std::error::Error for UnreadableBlob {}
 
+/// Error for a local file whose bytes don't match its upload digest, as when the file changed
+/// after sccache hashed it.
+#[derive(Debug)]
+pub(crate) struct ChangedBlob(pub(crate) PathBuf);
+
+impl std::fmt::Display for ChangedBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} changed after it was hashed", self.0.display())
+    }
+}
+
+impl std::error::Error for ChangedBlob {}
+
+#[derive(Debug)]
+struct DigestMismatch;
+
+impl std::fmt::Display for DigestMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("blob digest mismatch")
+    }
+}
+
+impl std::error::Error for DigestMismatch {}
+
+fn blob_read_error(path: Option<PathBuf>, error: io::Error) -> Error {
+    match path {
+        Some(path)
+            if error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<DigestMismatch>()) =>
+        {
+            ChangedBlob(path).into()
+        }
+        Some(path) => Error::from(error).context(UnreadableBlob(path)),
+        None => error.into(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Blob {
     Bytes(Vec<u8>),
@@ -82,10 +120,9 @@ impl Blob {
         };
         let mut reader = VerifiedReader::new(self.open()?, digest.clone());
         let mut bytes = vec![];
-        reader.read_to_end(&mut bytes).map_err(|error| match path {
-            Some(path) => Error::from(error).context(UnreadableBlob(path)),
-            None => error.into(),
-        })?;
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| blob_read_error(path, error))?;
         Ok(bytes)
     }
 
@@ -105,6 +142,7 @@ struct VerifiedReader<R> {
     expected: remexec::Digest,
     hasher: Sha256,
     size: u64,
+    verified: bool,
 }
 
 impl<R: Read> VerifiedReader<R> {
@@ -114,32 +152,37 @@ impl<R: Read> VerifiedReader<R> {
             expected,
             hasher: Sha256::new(),
             size: 0,
+            verified: false,
         }
     }
 }
 
 impl<R: Read> Read for VerifiedReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
+        if buffer.is_empty() || self.verified {
             return Ok(0);
         }
-        // Bound reads even if a file grew after its digest was computed.
-        let remaining = (self.expected.size_bytes as u64).saturating_sub(self.size);
+        let expected_size = self.expected.size_bytes as u64;
+        let remaining = expected_size - self.size;
         let limit = buffer
             .len()
-            .min(usize::try_from(remaining.saturating_add(1)).unwrap_or(usize::MAX));
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let count = self.inner.read(&mut buffer[..limit])?;
         self.size += count as u64;
         self.hasher.update(&buffer[..count]);
-        if self.size > self.expected.size_bytes as u64
-            || (count == 0
-                && (self.size != self.expected.size_bytes as u64
-                    || format!("{:x}", self.hasher.clone().finalize()) != self.expected.hash))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "blob digest mismatch",
-            ));
+        if self.size == expected_size {
+            // Some servers commit by size. Verify before releasing the last bytes.
+            match self.inner.read_exact(&mut [0]) {
+                Ok(()) => return Err(io::Error::new(io::ErrorKind::InvalidData, DigestMismatch)),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                Err(error) => return Err(error),
+            }
+            if format!("{:x}", self.hasher.clone().finalize()) != self.expected.hash {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, DigestMismatch));
+            }
+            self.verified = true;
+        } else if count == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, DigestMismatch));
         }
         Ok(count)
     }
@@ -186,10 +229,7 @@ impl ChunkReader {
             .take(BYTESTREAM_WRITE_CHUNK_BYTES as u64)
             .read_to_end(&mut data)
         {
-            return Err(match file {
-                Some(path) => Error::from(e).context(UnreadableBlob(path)),
-                None => e.into(),
-            });
+            return Err(blob_read_error(file, e));
         }
         Ok((ChunkReader::Open { reader, file }, data))
     }
@@ -680,11 +720,11 @@ impl Cas {
             },
         )
         .await;
-        // Duplicate uploads may finish early; local read errors matter only if the RPC failed.
-        let committed_size = match response {
-            Ok(response) => response.into_inner().committed_size,
-            Err(e) => return Err(read_error.lock().unwrap().take().unwrap_or(e)),
-        };
+        // Servers may report the bytes received even when the stream ended on a read error.
+        if let Some(error) = read_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        let committed_size = response?.into_inner().committed_size;
         let stream_finished = finished.load(Ordering::Acquire);
         let sent_bytes = sent_bytes.load(Ordering::Relaxed);
         let valid_size = if self.supports_zstd_bytestream {
@@ -1027,6 +1067,43 @@ mod test {
         );
         let e = cas.ensure_uploaded(vec![missing]).await.unwrap_err();
         assert!(e.is::<UnreadableBlob>(), "{e:#}");
+    }
+
+    #[test_case(100, false, 0, false ; "in a batch")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES + 10, false, 0, false ; "through bytestream")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES + 10, true, 0, false ; "through zstd bytestream")]
+    #[test_case(2 * BYTESTREAM_WRITE_CHUNK_BYTES, false, 0, false ; "of whole chunks")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES, false, 10, false ; "that grew")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES + 10, false, 0, true ; "through bytestream, to a server that answers unfinished writes")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES + 10, true, 0, true ; "through zstd bytestream, to a server that answers unfinished writes")]
+    #[test_case(2 * BYTESTREAM_WRITE_CHUNK_BYTES, false, 0, true ; "of whole chunks, to a server that answers unfinished writes")]
+    #[tokio::test]
+    async fn test_a_file_changed_after_hashing_fails_the_upload(
+        size: usize,
+        supports_zstd_bytestream: bool,
+        growth: usize,
+        answers_unfinished_writes: bool,
+    ) {
+        let (cas, server) = cas_with_small_batches(FakeServer {
+            supports_zstd_bytestream,
+            stores_mismatched_blobs: true,
+            answers_unfinished_writes,
+            ..Default::default()
+        })
+        .await;
+        let hashed = incompressible_bytes_of_len(size);
+        let mut changed = hashed.clone();
+        changed[size - 1] ^= 1;
+        changed.resize(size + growth, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, &changed).unwrap();
+        let e = cas
+            .ensure_uploaded(vec![(digest::of_bytes(&hashed), Blob::File(file))])
+            .await
+            .unwrap_err();
+        assert!(e.is::<ChangedBlob>(), "{e:#}");
+        assert!(!server.has_blob(&hashed));
     }
 
     #[tokio::test]

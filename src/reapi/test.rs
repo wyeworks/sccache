@@ -125,6 +125,8 @@ pub(crate) struct FakeServer {
     pub(crate) batched_blob_count: AtomicUsize,
     pub(crate) bytestream_write_resource_names: Mutex<Vec<String>>,
     pub(crate) early_committed_size: Option<i64>,
+    pub(crate) stores_mismatched_blobs: bool,
+    pub(crate) answers_unfinished_writes: bool,
     pub(crate) without_caching: bool,
     pub(crate) capabilities_error: Mutex<Option<tonic::Code>>,
     pub(crate) capabilities_calls: AtomicUsize,
@@ -490,7 +492,8 @@ impl ContentAddressableStorage for FakeServer {
                         message: "refused blob".into(),
                         details: vec![],
                     })
-                } else if digest::of_bytes(&request.data) == digest {
+                } else if self.stores_mismatched_blobs || digest::of_bytes(&request.data) == digest
+                {
                     self.blobs
                         .lock()
                         .unwrap()
@@ -739,17 +742,26 @@ impl ByteStream for FakeServer {
                 break;
             }
         }
-        if !finished {
-            return Err(Status::invalid_argument("no finish_write"));
-        }
         let committed_size = data.len() as i64;
         let ResourceName { digest, is_zstd } =
             self.parse_write_resource_name(&resource_name.unwrap_or_default())?;
+        if !finished {
+            if !self.answers_unfinished_writes {
+                return Err(Status::invalid_argument("no finish_write"));
+            }
+            if !is_zstd && committed_size == digest.size_bytes {
+                self.blobs
+                    .lock()
+                    .unwrap()
+                    .insert((digest.hash, digest.size_bytes), data);
+            }
+            return Ok(Response::new(WriteResponse { committed_size }));
+        }
         if is_zstd {
             data = zstd::bulk::decompress(&data, digest.size_bytes as usize)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
-        if digest::of_bytes(&data) != digest {
+        if !self.stores_mismatched_blobs && digest::of_bytes(&data) != digest {
             return Err(Status::invalid_argument("digest mismatch"));
         }
         self.blobs
