@@ -120,6 +120,7 @@ tonic = { version = "0.14", optional = true, default-features = false, features 
   "tls-aws-lc",
   "tls-native-roots",
 ] }
+rustls = { version = "0.23.31", optional = true, default-features = false, features = ["std"] }
 tower-service = "0.3"
 typed-path = "0.13.0"
 url = { version = "2", optional = true }
@@ -277,7 +278,7 @@ dist-server = [
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
 # Enables a Remote Execution API (REAPI) support.
-reapi = ["flate2", "dep:bazel-remote-apis", "dep:prost", "dep:tonic", "sha2"]
+reapi = ["flate2", "dep:bazel-remote-apis", "dep:prost", "dep:rustls", "dep:tonic", "sha2"]
 
 [workspace]
 exclude = ["tests/test-crate"]

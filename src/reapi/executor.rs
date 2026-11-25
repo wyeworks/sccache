@@ -604,7 +604,11 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
         endpoint: config.endpoint.clone(),
         instance_name: config.instance_name.clone(),
         auth_token,
-        headers: config.headers.clone(),
+        headers: config
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().to_owned()))
+            .collect(),
         credential_helper,
         tool_invocation_id: uuid::Uuid::new_v4().to_string(),
         tls_ca_certificates,

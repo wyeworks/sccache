@@ -810,10 +810,34 @@ pub struct ReapiConfig {
     pub tls_client_certificate_file: Option<PathBuf>,
     pub tls_client_key_file: Option<PathBuf>,
     #[serde(default)]
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, ReapiHeaderValue>,
     pub queue_timeout_secs: Option<u64>,
     pub local_slots: Option<std::num::NonZeroUsize>,
     pub remote_slots: Option<std::num::NonZeroUsize>,
+}
+
+/// A `[reapi.headers]` value, which `Debug` leaves out, since it may be a credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReapiHeaderValue(String);
+
+impl ReapiHeaderValue {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for ReapiHeaderValue {
+    fn from(value: &str) -> Self {
+        ReapiHeaderValue(value.to_owned())
+    }
+}
+
+impl fmt::Debug for ReapiHeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReapiHeaderValue(<redacted>)")
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3908,4 +3932,28 @@ endpoint = "grpc://127.0.0.1:1"
         select_execution_backend(&config.dist, config.reapi.as_ref()).unwrap(),
         expected
     );
+}
+
+#[test]
+fn test_reapi_header_values_are_left_out_of_debug_and_kept_by_serialize() {
+    let config: FileConfig = toml::from_str(
+        r#"
+[reapi]
+endpoint = "grpcs://farm.example.com:443"
+
+[reapi.headers]
+x-api-key = "secret-key"
+"#,
+    )
+    .unwrap();
+    for debug in [format!("{config:?}"), format!("{config:#?}")] {
+        assert!(
+            debug.contains("x-api-key") && !debug.contains("secret-key"),
+            "{debug}"
+        );
+    }
+    let reapi = config.reapi.unwrap();
+    assert_eq!("secret-key", reapi.headers["x-api-key"].as_str());
+    let written = toml::to_string(&reapi).unwrap();
+    assert_eq!(reapi, toml::from_str(&written).unwrap());
 }
