@@ -398,7 +398,7 @@ pub struct RustCompilation {
     /// The path to the rustc executable, not the rustup proxy.
     executable: PathBuf,
     #[cfg(feature = "reapi")]
-    env_deps: Vec<(OsString, OsString)>,
+    env_deps: Vec<(OsString, Option<OsString>)>,
     /// The host triple for this rustc.
     host: String,
     /// The sysroot for this rustc
@@ -452,7 +452,7 @@ async fn get_source_files_and_env_deps<T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
-) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>, String)>
+) -> Result<(Vec<PathBuf>, Vec<(OsString, Option<OsString>)>, String)>
 where
     T: CommandCreatorSync,
 {
@@ -503,7 +503,7 @@ where
 fn parse_dep_file<T, U>(
     file: T,
     cwd: U,
-) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>, String)>
+) -> Result<(Vec<PathBuf>, Vec<(OsString, Option<OsString>)>, String)>
 where
     T: AsRef<Path>,
     U: AsRef<Path>,
@@ -565,16 +565,19 @@ where
     deps
 }
 
-fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
+fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, Option<OsString>)> {
     let mut env_deps = Vec::new();
     for line in dep_info.lines() {
         if let Some(env_dep) = line.strip_prefix("# env-dep:") {
             let mut split = env_dep.splitn(2, '=');
             match (split.next(), split.next()) {
                 (Some(var), Some(val)) => {
-                    env_deps.push((unescape_dep_env(var).into(), unescape_dep_env(val).into()));
+                    env_deps.push((
+                        unescape_dep_env(var).into(),
+                        Some(unescape_dep_env(val).into()),
+                    ));
                 }
-                _ => env_deps.push((unescape_dep_env(env_dep).into(), "".into())),
+                _ => env_deps.push((unescape_dep_env(env_dep).into(), None)),
             }
         }
     }
@@ -1924,7 +1927,16 @@ where
         env_deps.sort();
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
+            // Preserve the distinction option_env! makes between None and Some("").
+            let Some(val) = val else {
+                m.update(b"\0");
+                continue;
+            };
             m.update(b"=");
+            if val.is_empty() {
+                // Older versions could store an unset result under the empty value's key.
+                m.update(b"\0");
+            }
             strip_basedirs_os(val, basedirs).hash(&mut HashToDigest { digest: &mut m });
         }
         let mut env_vars: Vec<_> = env_vars
@@ -4353,9 +4365,9 @@ bar.rs:
         assert_eq!(
             parse_env_dep_info(deps),
             [
-                ("OUT_DIR".into(), r"C:\dir\out".into()),
-                ("X".into(), "a\nb\rc=d".into()),
-                ("Y".into(), "".into()),
+                ("OUT_DIR".into(), Some(r"C:\dir\out".into())),
+                ("X".into(), Some("a\nb\rc=d".into())),
+                ("Y".into(), None),
             ]
         );
     }
@@ -4774,7 +4786,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     fn mock_dep_info_with_env(
         creator: &Arc<Mutex<MockCommandCreator>>,
         dep_srcs: &[&str],
-        env_deps: &[(&str, OsString)],
+        env_deps: &[(&str, Option<OsString>)],
     ) {
         // Mock the `rustc --emit=dep-info` process by writing
         // a dep-info file.
@@ -4785,7 +4797,10 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         sorted_deps.sort();
         let env_deps = env_deps
             .iter()
-            .map(|(var, val)| format!("# env-dep:{var}={}", escape_dep_env(val)))
+            .map(|(var, val)| match val {
+                Some(val) => format!("# env-dep:{var}={}", escape_dep_env(val)),
+                None => format!("# env-dep:{var}"),
+            })
             .collect::<Vec<String>>();
         next_command_calls(creator, move |args| {
             let mut dep_info_path = None;
@@ -5065,7 +5080,7 @@ foo.rs:
         f: &TestFixture,
         args: &[A],
         env_vars: &[(OsString, OsString)],
-        env_deps: &[(&str, OsString)],
+        env_deps: &[(&str, Option<OsString>)],
         pre_func: F,
         storage: MockStorage,
     ) -> String
@@ -5171,7 +5186,7 @@ foo.rs:
                     ("CARGO_MANIFEST_DIR".into(), root.into()),
                     ("CARGO_OUTSIDE".into(), outside.into()),
                 ],
-                &[("OUT_DIR", root.join("target").join("out").into())],
+                &[("OUT_DIR", Some(root.join("target").join("out").into()))],
                 nothing,
                 MockStorage::new(None, false).with_basedirs(basedirs),
             )
@@ -5195,7 +5210,7 @@ foo.rs:
     fn test_hash_env_dep_equal_to_basedir_is_not_unset() {
         let f = TestFixture::new();
         let root = f.tempdir.path().to_owned();
-        let key = |val: OsString| {
+        let key = |val: Option<OsString>| {
             hash_key_with(
                 &f,
                 &[
@@ -5215,7 +5230,9 @@ foo.rs:
                 MockStorage::new(None, false).with_basedirs(vec![basedir(&root)]),
             )
         };
-        assert_ne!(key("".into()), key(root.clone().into()));
+        assert_ne!(key(None), key(Some(OsString::new())));
+        assert_ne!(key(None), key(Some(root.clone().into())));
+        assert_ne!(key(Some(OsString::new())), key(Some(root.clone().into())));
     }
 
     #[test_case(true ; "with preprocessor cache")]
@@ -5780,10 +5797,7 @@ foo.rs:
                 .iter()
                 .map(|dep| {
                     let value = vars.iter().find(|(name, _)| name == dep);
-                    (
-                        dep.into(),
-                        value.map_or_else(OsString::new, |(_, v)| v.clone()),
-                    )
+                    (dep.into(), value.map(|(_, v)| v.clone()))
                 })
                 .collect();
             compilation.env_vars = vars;
@@ -6127,7 +6141,7 @@ foo.rs:
             let mut compilation = compilation(&[]);
             compilation
                 .env_deps
-                .push((OsString::from_vec(vec![0xff]), OsString::new()));
+                .push((OsString::from_vec(vec![0xff]), None));
             let error = map_for_reapi(&compilation).unwrap_err();
             assert_eq!(CompileLocallyReason::NonUtf8EnvVar, error.reason);
         }
@@ -6274,10 +6288,7 @@ foo.rs:
             mock_dep_info_with_env(
                 &creator,
                 &["foo.rs"],
-                &[
-                    ("BUILD_MODE", "release".into()),
-                    ("OPTIONAL", OsString::new()),
-                ],
+                &[("BUILD_MODE", Some("release".into())), ("OPTIONAL", None)],
             );
             mock_file_names(&creator, &["libfoo.rlib"]);
             let runtime = single_threaded_runtime();
