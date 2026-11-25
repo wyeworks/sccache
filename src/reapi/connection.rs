@@ -17,6 +17,7 @@
 use super::action_cache::ActionCache;
 use super::cas::Cas;
 use super::client::{Client, ConnectOptions, CredentialsRefused, IncompatibleServer};
+use super::execution::Execution;
 use super::mapping::CompileLocallyReason;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -30,6 +31,8 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 pub(super) struct ServerApis {
     pub(super) cas: Cas,
     pub(super) action_cache: ActionCache,
+    #[expect(dead_code, reason = "compiles do not execute yet")]
+    pub(super) execution: Option<Execution>,
 }
 
 enum State {
@@ -117,6 +120,7 @@ impl Connection {
                 State::Connected(Arc::new(ServerApis {
                     cas: Cas::new(&client),
                     action_cache: ActionCache::new(&client),
+                    execution: client.executes_actions().then(|| Execution::new(&client)),
                 }))
             }
             Err(e) if e.is::<IncompatibleServer>() || e.is::<CredentialsRefused>() => {

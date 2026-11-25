@@ -105,6 +105,7 @@ pub(crate) struct Client {
     channel: AuthChannel,
     max_batch_bytes: usize,
     supports_zstd_bytestream: bool,
+    executes_actions: bool,
 }
 
 impl Client {
@@ -191,14 +192,24 @@ impl Client {
             Ok(bytes) if bytes > 0 => bytes,
             _ => DEFAULT_MAX_BATCH_BYTES,
         };
+        // Servers from before `digest_functions` existed set `digest_function` only.
+        let executes_actions = capabilities
+            .execution_capabilities
+            .is_some_and(|execution| {
+                execution.exec_enabled
+                    && (execution.digest_function == sha256
+                        || execution.digest_functions.contains(&sha256))
+            });
         info!(
-            "REAPI: connected (zstd ByteStream: {supports_zstd_bytestream}, max batch: {max_batch_bytes} bytes)"
+            "REAPI: connected (executes actions: {executes_actions}, \
+             zstd ByteStream: {supports_zstd_bytestream}, max batch: {max_batch_bytes} bytes)"
         );
         Ok(Client {
             instance_name: options.instance_name.clone(),
             channel,
             max_batch_bytes,
             supports_zstd_bytestream,
+            executes_actions,
         })
     }
 
@@ -217,6 +228,10 @@ impl Client {
 
     pub(crate) fn supports_zstd_bytestream(&self) -> bool {
         self.supports_zstd_bytestream
+    }
+
+    pub(crate) fn executes_actions(&self) -> bool {
+        self.executes_actions
     }
 }
 
@@ -549,6 +564,38 @@ mod test {
         assert_eq!(vec!["main".to_owned()], *instance_names.lock().unwrap());
         assert!(client.supports_zstd_bytestream());
         assert_eq!(client.max_batch_bytes(), 4 * 1024 * 1024);
+    }
+
+    const SHA256: i32 = remexec::digest_function::Value::Sha256 as i32;
+    const MD5: i32 = remexec::digest_function::Value::Md5 as i32;
+
+    #[test_case(true, 0, vec![SHA256], true ; "sha256 in the list")]
+    #[test_case(true, SHA256, vec![], true ; "sha256 in the old field")]
+    #[test_case(false, SHA256, vec![SHA256], false ; "execution disabled")]
+    #[test_case(true, MD5, vec![MD5], false ; "without sha256")]
+    #[tokio::test]
+    async fn test_executes_actions_needs_execution_enabled_with_sha256(
+        exec_enabled: bool,
+        digest_function: i32,
+        digest_functions: Vec<i32>,
+        executes_actions: bool,
+    ) {
+        let endpoint = serve_fake(FakeCapabilities {
+            capabilities: remexec::ServerCapabilities {
+                cache_capabilities: Some(Default::default()),
+                execution_capabilities: Some(remexec::ExecutionCapabilities {
+                    exec_enabled,
+                    digest_function,
+                    digest_functions,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+        let client = Client::connect(&connect_options(&endpoint)).await.unwrap();
+        assert_eq!(executes_actions, client.executes_actions());
     }
 
     #[test_case(0, DEFAULT_MAX_BATCH_BYTES ; "not advertised")]
