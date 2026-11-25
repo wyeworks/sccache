@@ -26,11 +26,12 @@ use super::remote_compile::{
     ActionOptions, action_blobs, digest_input_root_files, materialize, materialize_failure_reason,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
+use super::worker_toolchains::WorkerToolchains;
 use crate::compiler::{
     CacheControl, Cacheable, Compilation, CompileExecutor, CompileOutcome, CompileRequest,
     DistType, PreparedCompile, ReapiOutcome,
 };
-use crate::config::{ReapiConfig, ReapiOnMiss};
+use crate::config::{DistToolchainConfig, ReapiConfig, ReapiOnMiss};
 use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
@@ -41,7 +42,7 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tonic::transport::{Certificate, Identity};
 
@@ -61,15 +62,24 @@ pub(crate) struct ReapiExecutor {
     execution_pause: LookupPause,
     on_miss: ReapiOnMiss,
     linux_toolchain: bool,
+    worker_toolchains: WorkerToolchains,
+    local_slots: Option<Arc<Semaphore>>,
+    remote_slots: Option<Arc<Semaphore>>,
     queue_timeout: Duration,
     executions_refused: AtomicBool,
     rustc_checks: Mutex<HashMap<ToolchainKey, Arc<RustcCheck>>>,
     action_options: Arc<ActionOptions>,
 }
 
+const SLOTS_NEVER_CLOSE: &str = "REAPI slot semaphores are never closed";
+enum Slot {
+    Local(OwnedSemaphorePermit),
+    Remote(Option<OwnedSemaphorePermit>),
+}
+
 impl ReapiExecutor {
     /// TLS files are read at startup.
-    pub(crate) fn new(config: &ReapiConfig) -> Self {
+    pub(crate) fn new(config: &ReapiConfig, archives: &[DistToolchainConfig]) -> Self {
         let connection = match read_connect_options(config) {
             Ok(options) => Some(Connection::new(options)),
             Err(error) => {
@@ -95,6 +105,16 @@ impl ReapiExecutor {
             execution_pause: LookupPause::default(),
             on_miss: config.on_miss,
             linux_toolchain: cfg!(target_os = "linux"),
+            worker_toolchains: WorkerToolchains::new(
+                archives,
+                config.cache_dir.join("reapi-worker-toolchains"),
+            ),
+            local_slots: config
+                .local_slots
+                .map(|slots| Arc::new(Semaphore::new(slots.get().min(Semaphore::MAX_PERMITS)))),
+            remote_slots: config
+                .remote_slots
+                .map(|slots| Arc::new(Semaphore::new(slots.get().min(Semaphore::MAX_PERMITS)))),
             queue_timeout: Duration::from_secs(config.queue_timeout_secs.unwrap_or(60).min(3600)),
             executions_refused: AtomicBool::new(false),
             rustc_checks: Mutex::default(),
@@ -104,8 +124,8 @@ impl ReapiExecutor {
 
     async fn prepare_lookup(
         &self,
-        compile: &ReapiCompile,
-    ) -> std::result::Result<(Arc<ServerApis>, ToolchainFiles), CompileLocallyReason> {
+        compile: &mut ReapiCompile,
+    ) -> std::result::Result<(Arc<ServerApis>, ToolchainFiles, bool), CompileLocallyReason> {
         let connection = self
             .connection
             .as_ref()
@@ -114,10 +134,65 @@ impl ReapiExecutor {
             return Err(CompileLocallyReason::ActionCacheLookupsPaused);
         }
         let deadline = Instant::now() + self.ready_wait;
-        tokio::try_join!(
-            connection.server_apis(deadline),
-            self.toolchains.files(&compile.toolchain, deadline)
-        )
+        let toolchain = async {
+            if !self.linux_toolchain
+                && let Some(key) = self
+                    .worker_toolchains
+                    .toolchain(&compile.toolchain, deadline)
+                    .await?
+            {
+                if compile.input_root_files.iter().any(|path| {
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| matches!(ext, "dylib" | "so" | "dll"))
+                }) {
+                    return Err(CompileLocallyReason::ProcMacroForClientOs);
+                }
+                compile.toolchain = key;
+                return Ok((
+                    self.toolchains.files(&compile.toolchain, deadline).await?,
+                    true,
+                ));
+            }
+            Ok((
+                self.toolchains.files(&compile.toolchain, deadline).await?,
+                self.linux_toolchain,
+            ))
+        };
+        let (apis, (files, can_execute)) =
+            tokio::try_join!(connection.server_apis(deadline), toolchain)?;
+        Ok((apis, files, can_execute))
+    }
+
+    async fn local_or_remote_slot(&self) -> Slot {
+        if let Some(slot) =
+            (self.local_slots.clone()).and_then(|slots| slots.try_acquire_owned().ok())
+        {
+            return Slot::Local(slot);
+        }
+        let Some(remote_slots) = self.remote_slots.clone() else {
+            return Slot::Remote(None);
+        };
+        match self.local_slots.clone() {
+            Some(local_slots) => tokio::select! {
+                slot = remote_slots.acquire_owned() => {
+                    Slot::Remote(Some(slot.expect(SLOTS_NEVER_CLOSE)))
+                }
+                slot = local_slots.acquire_owned() => {
+                    Slot::Local(slot.expect(SLOTS_NEVER_CLOSE))
+                }
+            },
+            None => Slot::Remote(Some(
+                remote_slots.acquire_owned().await.expect(SLOTS_NEVER_CLOSE),
+            )),
+        }
+    }
+
+    /// The next free local slot, so that local compiles don't oversubscribe the cores while
+    /// other compiles execute on workers; `None` without `local_slots`.
+    async fn local_slot(&self) -> Option<OwnedSemaphorePermit> {
+        let local_slots = self.local_slots.clone()?;
+        Some(local_slots.acquire_owned().await.expect(SLOTS_NEVER_CLOSE))
     }
 
     async fn check_rustc(
@@ -266,6 +341,8 @@ impl ReapiExecutor {
         reapi_compile: ReapiCompile,
         apis: Arc<ServerApis>,
         toolchain: ToolchainFiles,
+        can_execute: bool,
+        local_slot: &mut Option<OwnedSemaphorePermit>,
         out_pretty: &str,
     ) -> std::result::Result<(ReapiOutcome, process::Output), CompileLocallyReason> {
         let digest_cache = self.digest_cache.clone();
@@ -326,12 +403,22 @@ impl ReapiExecutor {
                 if self.on_miss == ReapiOnMiss::Local {
                     return Err(CompileLocallyReason::NotInActionCache);
                 }
-                if !self.linux_toolchain {
+                if !can_execute {
                     return Err(CompileLocallyReason::NonLinuxToolchain);
                 }
                 if self.executions_refused.load(Ordering::Relaxed) {
                     return Err(CompileLocallyReason::ExecutionsRefused);
                 }
+                let slot = tokio::time::timeout(self.queue_timeout, self.local_or_remote_slot())
+                    .await
+                    .map_err(|_| CompileLocallyReason::NoFreeRemoteSlot)?;
+                let _remote_slot = match slot {
+                    Slot::Local(slot) => {
+                        *local_slot = Some(slot);
+                        return Err(CompileLocallyReason::LocalSlotFree);
+                    }
+                    Slot::Remote(slot) => slot,
+                };
                 let permit = self
                     .execution_pause
                     .try_lookup()
@@ -532,7 +619,9 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
     }
 
     async fn execute(&self, mut request: CompileRequest<'_, T>) -> Result<CompileOutcome> {
+        let mut local_slot = None;
         if request.cache_control != CacheControl::Default {
+            let _slot = self.local_slot().await;
             return compile_locally(request, CompileLocallyReason::CacheBypassed).await;
         }
         let compilation = request.compilation;
@@ -548,10 +637,17 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
             Ok(Ok(_)) if request.local_compile_changes.args.is_empty() => {
                 Err(CompileLocallyReason::LocalCompileUnchanged)
             }
-            Ok(Ok(compile)) => match self.prepare_lookup(&compile).await {
-                Ok((apis, toolchain)) => {
-                    self.look_up(compile, apis, toolchain, &request.output_name)
-                        .await
+            Ok(Ok(mut compile)) => match self.prepare_lookup(&mut compile).await {
+                Ok((apis, toolchain, can_execute)) => {
+                    self.look_up(
+                        compile,
+                        apis,
+                        toolchain,
+                        can_execute,
+                        &mut local_slot,
+                        &request.output_name,
+                    )
+                    .await
                 }
                 Err(reason) => Err(reason),
             },
@@ -582,7 +678,13 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
                 execution: DistType::Reapi(outcome),
                 output,
             }),
-            Err(reason) => compile_locally(request, reason).await,
+            Err(reason) => {
+                let _slot = match local_slot {
+                    Some(slot) => Some(slot),
+                    None => self.local_slot().await,
+                };
+                compile_locally(request, reason).await
+            }
         }
     }
 }
@@ -811,7 +913,7 @@ mod test {
         /// Runs the compile through the executor. A local compile writes `out` to stdout and
         /// `err` to stderr.
         fn compile(&self) -> (DistType, process::Output) {
-            self.compile_with(&ReapiExecutor::new(&self.config))
+            self.compile_with(&ReapiExecutor::new(&self.config, &[]))
         }
 
         fn advance_time(&self, duration: Duration) {
@@ -985,7 +1087,7 @@ mod test {
                 ..Default::default()
             },
         );
-        let mut executor = ReapiExecutor::new(&fixture.config);
+        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
         executor.linux_toolchain = true;
         let (outcome, _) = fixture.compile_with(&executor);
         assert_eq!(outcome, DistType::Reapi(ReapiOutcome::Executed));
@@ -1009,7 +1111,7 @@ mod test {
                 ..Default::default()
             },
         );
-        let mut executor = ReapiExecutor::new(&fixture.config);
+        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
         executor.linux_toolchain = true;
         for _ in 0..2 {
             let (outcome, _) = fixture.compile_with(&executor);
@@ -1020,6 +1122,59 @@ mod test {
         }
         assert_eq!(fixture.server.execute_calls.load(Ordering::SeqCst), 1);
         assert!(!fixture.server.has_blob(b"pub fn f() {}"));
+    }
+
+    #[test]
+    fn test_a_free_local_slot_takes_precedence_over_remote_execution() {
+        let mut fixture = Fixture::with_server(
+            Eligibility::Eligible,
+            tokio::runtime::Runtime::new().unwrap(),
+            FakeServer {
+                executes_actions: true,
+                ..Default::default()
+            },
+        );
+        fixture.config.local_slots = std::num::NonZeroUsize::new(1);
+        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
+        executor.linux_toolchain = true;
+        for _ in 0..2 {
+            assert_eq!(
+                fixture.compile_with(&executor).0,
+                DistType::Reapi(ReapiOutcome::CompiledLocally(
+                    CompileLocallyReason::LocalSlotFree.to_string()
+                ))
+            );
+        }
+        assert_eq!(fixture.server.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_a_miss_falls_back_if_the_remote_slot_stays_busy() {
+        let mut fixture = Fixture::with_server(
+            Eligibility::Eligible,
+            tokio::runtime::Runtime::new().unwrap(),
+            FakeServer {
+                executes_actions: true,
+                ..Default::default()
+            },
+        );
+        fixture.config.remote_slots = std::num::NonZeroUsize::new(1);
+        fixture.config.queue_timeout_secs = Some(0);
+        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
+        executor.linux_toolchain = true;
+        let _slot = executor
+            .remote_slots
+            .as_ref()
+            .unwrap()
+            .try_acquire()
+            .unwrap();
+        assert_eq!(
+            fixture.compile_with(&executor).0,
+            DistType::Reapi(ReapiOutcome::CompiledLocally(
+                CompileLocallyReason::NoFreeRemoteSlot.to_string()
+            ))
+        );
+        assert_eq!(fixture.server.execute_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1043,7 +1198,7 @@ mod test {
         let fixture = Fixture::clock_controlled();
         fixture.put_result_in_action_cache(|_| {});
         *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
-        let executor = ReapiExecutor::new(&fixture.config);
+        let executor = ReapiExecutor::new(&fixture.config, &[]);
         for _ in 0..FAILURES_TO_PAUSE {
             assert_eq!(
                 compiled_locally("action cache lookup failed"),
@@ -1085,7 +1240,7 @@ mod test {
     #[test]
     fn test_cache_misses_reset_consecutive_rpc_failures() {
         let fixture = Fixture::new(Eligibility::Eligible);
-        let executor = ReapiExecutor::new(&fixture.config);
+        let executor = ReapiExecutor::new(&fixture.config, &[]);
         *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE - 1 {
             assert_eq!(
@@ -1116,7 +1271,7 @@ mod test {
     fn test_input_hashing_failures_do_not_reserve_the_recovery_probe() {
         let fixture = Fixture::clock_controlled();
         fixture.put_result_in_action_cache(|_| {});
-        let executor = ReapiExecutor::new(&fixture.config);
+        let executor = ReapiExecutor::new(&fixture.config, &[]);
         *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE {
             fixture.compile_with(&executor);
@@ -1150,7 +1305,7 @@ mod test {
     ) {
         let fixture = Fixture::new(Eligibility::Eligible);
         fixture.put_result_in_action_cache(change);
-        let executor = ReapiExecutor::new(&fixture.config);
+        let executor = ReapiExecutor::new(&fixture.config, &[]);
         for _ in 0..=FAILURES_TO_PAUSE {
             let (execution, output) = fixture.compile_with(&executor);
             assert_eq!(compiled_locally(reason), execution);
@@ -1309,7 +1464,7 @@ mod test {
 
     #[test]
     fn test_ready_wait_is_capped() {
-        let executor = ReapiExecutor::new(&config("grpc://127.0.0.1:1".into(), u64::MAX));
+        let executor = ReapiExecutor::new(&config("grpc://127.0.0.1:1".into(), u64::MAX), &[]);
         assert_eq!(executor.ready_wait, MAX_READY_WAIT);
     }
 
@@ -1338,7 +1493,7 @@ mod test {
 
     #[test]
     fn test_local_compiles_get_the_sysroot_copies_dir_under_the_reapi_cache_dir() {
-        let executor = ReapiExecutor::new(&config("grpc://127.0.0.1:1".into(), 0));
+        let executor = ReapiExecutor::new(&config("grpc://127.0.0.1:1".into(), 0), &[]);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let changes = runtime
             .block_on(CompileExecutor::<Creator>::prepare(

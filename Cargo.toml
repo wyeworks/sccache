@@ -277,7 +277,7 @@ dist-server = [
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
 # Enables a Remote Execution API (REAPI) support.
-reapi = ["dep:bazel-remote-apis", "dep:prost", "dep:tonic", "sha2"]
+reapi = ["flate2", "dep:bazel-remote-apis", "dep:prost", "dep:tonic", "sha2"]
 
 [workspace]
 exclude = ["tests/test-crate"]

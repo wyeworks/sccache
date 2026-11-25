@@ -28,6 +28,7 @@ mod connection;
 mod credential_helper;
 mod terminal_output;
 mod toolchains;
+mod worker_toolchains;
 
 #[allow(dead_code)]
 mod digest;

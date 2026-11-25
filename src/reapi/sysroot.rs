@@ -132,7 +132,7 @@ fn validate_copy(copy: &Path, sysroot: &Path, entries: &[Vec<OsString>]) -> Resu
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -147,7 +147,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 

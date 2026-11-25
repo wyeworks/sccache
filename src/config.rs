@@ -812,6 +812,8 @@ pub struct ReapiConfig {
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     pub queue_timeout_secs: Option<u64>,
+    pub local_slots: Option<std::num::NonZeroUsize>,
+    pub remote_slots: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

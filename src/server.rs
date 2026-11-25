@@ -163,7 +163,7 @@ fn reapi_executor(config: &Config) -> Option<Arc<ReapiExecutor>> {
     config
         .reapi
         .as_ref()
-        .map(|reapi| Arc::new(ReapiExecutor::new(reapi)))
+        .map(|reapi| Arc::new(ReapiExecutor::new(reapi, &config.dist.toolchains)))
 }
 
 #[cfg(not(feature = "reapi"))]

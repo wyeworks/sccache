@@ -193,10 +193,12 @@ instance_name = ""                         # optional
 ready_wait_secs = 0                        # readiness wait; 0 does not wait, max 3600
 on_miss = "execute"                        # use "local" for cache-only access
 queue_timeout_secs = 60                    # how long to wait for a queued action
+# local_slots = 2                          # maximum concurrent local compiles
+# remote_slots = 8                         # maximum concurrent remote compiles
 ```
 
 REAPI support is under development. Eligible Rust compiles can reuse results
-from the farm's Action Cache and CAS. On a miss, eligible Linux clients upload
+from the farm's Action Cache and CAS. On a miss, eligible clients with a Linux worker toolchain upload
 inputs and execute on workers when the server supports execution. Remote failures
 fall back to local compilation. An action that stays queued past
 `queue_timeout_secs` also falls back. Workers get up to nine minutes to run it.
