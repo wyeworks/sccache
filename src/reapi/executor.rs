@@ -14,9 +14,10 @@
 
 //! Remote cache lookup and execution with local fallback.
 
-use super::client::rpc_code;
-use super::client::{ConnectOptions, check_connect_options};
+use super::auth_token::{self, AuthToken};
+use super::client::{ConnectOptions, check_connect_options, credential_helper_uri, rpc_code};
 use super::connection::{Connection, ServerApis};
+use super::credential_helper::{self, CredentialHelper};
 use super::digest::DigestCache;
 use super::execution::{Execution, MissingActionBlobs, QueuedTooLong};
 use super::lookup_pause::LookupPause;
@@ -67,7 +68,7 @@ pub(crate) struct ReapiExecutor {
 }
 
 impl ReapiExecutor {
-    /// Credentials are read once; changes require a server restart.
+    /// TLS files are read at startup.
     pub(crate) fn new(config: &ReapiConfig) -> Self {
         let connection = match read_connect_options(config) {
             Ok(options) => Some(Connection::new(options)),
@@ -213,6 +214,9 @@ impl ReapiExecutor {
                                 Some(tonic::Code::PermissionDenied) => {
                                     CompileLocallyReason::ExecutionsRefused
                                 }
+                                Some(tonic::Code::Unauthenticated) => {
+                                    CompileLocallyReason::CredentialsRefused
+                                }
                                 _ => CompileLocallyReason::UploadFailed,
                             }
                         }
@@ -235,6 +239,9 @@ impl ReapiExecutor {
                             CompileLocallyReason::ExecutionQueuedTooLong
                         } else {
                             match rpc_code(&error) {
+                                Some(tonic::Code::Unauthenticated) => {
+                                    CompileLocallyReason::CredentialsRefused
+                                }
                                 Some(tonic::Code::PermissionDenied) => {
                                     CompileLocallyReason::ExecutionsRefused
                                 }
@@ -293,6 +300,15 @@ impl ReapiExecutor {
             }
             Err(e) => {
                 warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+                if matches!(
+                    rpc_code(&e),
+                    Some(tonic::Code::Unauthenticated | tonic::Code::PermissionDenied)
+                ) {
+                    if let Some(connection) = &self.connection {
+                        connection.credentials_refused(&apis).await;
+                    }
+                    return Err(CompileLocallyReason::CredentialsRefused);
+                }
                 if let Some(pause) = permit.failed() {
                     warn!(
                         "REAPI: action cache lookups are failing; compiling locally for {pause:?}"
@@ -346,6 +362,11 @@ impl ReapiExecutor {
                         response
                     }
                     Err(reason) => {
+                        if reason == CompileLocallyReason::CredentialsRefused
+                            && let Some(connection) = &self.connection
+                        {
+                            connection.credentials_refused(&apis).await;
+                        }
                         if reason == CompileLocallyReason::ExecutionsRefused {
                             self.executions_refused.store(true, Ordering::Relaxed);
                         }
@@ -379,6 +400,14 @@ impl ReapiExecutor {
                 Ok((outcome, output))
             }
             Err(e) => {
+                if matches!(
+                    rpc_code(&e),
+                    Some(tonic::Code::Unauthenticated | tonic::Code::PermissionDenied)
+                ) && let Some(connection) = &self.connection
+                {
+                    connection.credentials_refused(&apis).await;
+                    return Err(CompileLocallyReason::CredentialsRefused);
+                }
                 let reason = materialize_failure_reason(&e);
                 // Avoid repeated warnings for unusable cached results.
                 let log_level = match reason {
@@ -410,18 +439,31 @@ async fn compile_locally<T: CommandCreatorSync>(
 }
 
 fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
+    if config.auth_token_file.is_some() && config.credential_helper.is_some() {
+        bail!("[reapi] can't have both auth_token_file and credential_helper");
+    }
     let auth_token = config
         .auth_token_file
-        .as_ref()
-        .map(|file| {
-            std::fs::read_to_string(file).with_context(|| {
-                format!(
-                    "failed to read the REAPI auth token from {}",
-                    file.display()
-                )
-            })
-        })
-        .transpose()?;
+        .clone()
+        .map(|file| AuthToken::from_file(file, auth_token::CHECK_INTERVAL))
+        .transpose()?
+        .map(Arc::new);
+    // The sccache server's cwd and PATH are those of whichever client started it, so a
+    // relative path could name another program from one run to the next.
+    if let Some(program) = &config.credential_helper
+        && program.is_relative()
+        && program.components().count() > 1
+    {
+        bail!("[reapi] credential_helper must be an absolute path or a name on PATH");
+    }
+    let credential_helper = match &config.credential_helper {
+        Some(program) => Some(Arc::new(CredentialHelper::new(
+            program.clone(),
+            credential_helper_uri(&config.endpoint)?,
+            credential_helper::HELPER_TIMEOUT,
+        ))),
+        None => None,
+    };
     let tls_ca_certificates = config
         .tls_ca_file
         .as_deref()
@@ -445,6 +487,7 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
         instance_name: config.instance_name.clone(),
         auth_token,
         headers: config.headers.clone(),
+        credential_helper,
         tool_invocation_id: uuid::Uuid::new_v4().to_string(),
         tls_ca_certificates,
         tls_client_identity,

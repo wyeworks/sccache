@@ -144,6 +144,7 @@ pub(crate) enum CompileLocallyReason {
     ConnectFailed,
     IncompatibleServer,
     CredentialsRefused,
+    CredentialHelperFailed,
     NonUtf8ToolchainPath,
     MissingRustcOrStd,
     HashingToolchainFailed,
@@ -221,6 +222,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::HashingToolchainFailed => "failed to hash the toolchain",
             Self::MissingRustcOrStd => "missing rustc or std",
             Self::NonUtf8ToolchainPath => "non-UTF-8 toolchain path",
+            Self::CredentialHelperFailed => "credential helper failed",
             Self::CredentialsRefused => "REAPI server refused the credentials",
         })
     }

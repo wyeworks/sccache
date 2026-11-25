@@ -210,10 +210,21 @@ for example after changing the worker environment. Use `[reapi.platform]` for
 worker properties such as `OSFamily = "linux"`. Both settings are optional and
 changing either changes the action digest.
 
-The token file is read when the sccache server starts. Restart the server after
-changing it. Transient connection failures are retried on later cache misses
-after a backoff of 5 to 60 seconds. Refused credentials or incompatible server
-capabilities keep compiles local until the server restarts.
+Use `auth_token_file` for a bearer token or `credential_helper` for a
+[Bazel credential helper](https://github.com/EngFlow/credential-helper-spec).
+The helper must be an absolute path or a program on the server's `PATH`.
+Replace token files atomically. The server checks for changes at most every
+10 seconds and keeps the last valid token after a failed read.
+
+Use `tls_ca_file` to trust a custom CA with a `grpcs://` endpoint. For mutual TLS
+set both `tls_client_certificate_file` and `tls_client_key_file`. TLS files
+are read at server startup. Static request headers go under `[reapi.headers]`.
+Keep credentials in the token file or helper to avoid exposing them in TOML
+parse errors.
+
+Blocked connections retry after 5 to 60 seconds. Refused credentials are
+checked again when they change. Incompatible server capabilities require a
+server restart.
 
 After three consecutive Action Cache RPC failures, lookups pause for 5 seconds.
 One compile probes after the pause. Failed probes double the pause up to 60 seconds;

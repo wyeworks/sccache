@@ -1092,7 +1092,9 @@ mod test {
         let client = Client::connect(&ConnectOptions {
             endpoint: server.serve().await,
             instance_name: server.instance_name.clone(),
-            auth_token: Some(" token ".to_owned()),
+            auth_token: Some(Arc::new(
+                crate::reapi::auth_token::AuthToken::fixed(" token ").unwrap(),
+            )),
             ..Default::default()
         })
         .await
@@ -1490,7 +1492,9 @@ mod test {
         let client = Client::connect(&ConnectOptions {
             endpoint: server.serve().await,
             instance_name: server.instance_name.clone(),
-            auth_token: Some("test-token".to_owned()),
+            auth_token: Some(Arc::new(
+                crate::reapi::auth_token::AuthToken::fixed("test-token").unwrap(),
+            )),
             ..Default::default()
         })
         .await

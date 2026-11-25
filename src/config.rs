@@ -805,12 +805,13 @@ pub struct ReapiConfig {
     pub platform: BTreeMap<String, String>,
     #[serde(default)]
     pub on_miss: ReapiOnMiss,
-    pub queue_timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
+    pub credential_helper: Option<PathBuf>,
     pub tls_ca_file: Option<PathBuf>,
     pub tls_client_certificate_file: Option<PathBuf>,
     pub tls_client_key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    pub queue_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

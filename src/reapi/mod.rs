@@ -23,7 +23,9 @@ mod cas;
 #[allow(dead_code)]
 mod client;
 
+mod auth_token;
 mod connection;
+mod credential_helper;
 mod terminal_output;
 mod toolchains;
 

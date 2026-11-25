@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::auth_token::AuthToken;
+use super::credential_helper::CredentialHelper;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use prost::Message;
@@ -71,10 +73,13 @@ pub(crate) struct ConnectOptions {
     /// root certificates, or against `tls_ca_certificates` when set.
     pub(crate) endpoint: String,
     pub(crate) instance_name: String,
-    /// Sent as a bearer token with every request. Surrounding whitespace is ignored.
-    pub(crate) auth_token: Option<String>,
+    /// Sent as a bearer token with every request.
+    pub(crate) auth_token: Option<Arc<AuthToken>>,
     /// Sent with every request.
     pub(crate) headers: BTreeMap<String, String>,
+    /// Prints headers that are sent with every request, in place of `headers` of the same
+    /// name.
+    pub(crate) credential_helper: Option<Arc<CredentialHelper>>,
     /// Sent in every request's `RequestMetadata`, so that the server can tell this sccache
     /// server's calls from those of earlier runs and other clients.
     pub(crate) tool_invocation_id: String,
@@ -86,11 +91,13 @@ pub(crate) struct ConnectOptions {
 
 pub(crate) type ReapiChannel = InterceptedService<Channel, HeadersInterceptor>;
 
-/// Adds `headers` to every request, and `request_metadata` to a request that has no
-/// `RequestMetadata` of its own.
+/// Adds the auth token, `headers` and the credential helper's headers to every request, and
+/// `request_metadata` to a request that has no `RequestMetadata` of its own.
 #[derive(Clone)]
 pub(crate) struct HeadersInterceptor {
+    auth_token: Option<Arc<AuthToken>>,
     headers: Arc<[(AsciiMetadataKey, AsciiMetadataValue)]>,
+    credential_helper: Option<Arc<CredentialHelper>>,
     request_metadata: BinaryMetadataValue,
 }
 
@@ -99,8 +106,23 @@ impl Interceptor for HeadersInterceptor {
         &mut self,
         mut request: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        if let Some(auth_token) = &self.auth_token {
+            request
+                .metadata_mut()
+                .insert("authorization", auth_token.header());
+        }
         for (name, value) in self.headers.iter() {
             request.metadata_mut().insert(name.clone(), value.clone());
+        }
+        if let Some(credential_helper) = &self.credential_helper {
+            let headers = credential_helper.headers();
+            for (i, (name, value)) in headers.iter().enumerate() {
+                if headers[..i].iter().any(|(earlier, _)| earlier == name) {
+                    request.metadata_mut().append(name.clone(), value.clone());
+                } else {
+                    request.metadata_mut().insert(name.clone(), value.clone());
+                }
+            }
         }
         if !request.metadata().contains_key(REQUEST_METADATA_HEADER) {
             request
@@ -194,7 +216,11 @@ impl Client {
             .tcp_keepalive(Some(TCP_KEEPALIVE_IDLE))
             .tcp_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL))
             .tcp_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
-        if tls_domain.is_none() && (options.auth_token.is_some() || !options.headers.is_empty()) {
+        if tls_domain.is_none()
+            && (options.auth_token.is_some()
+                || !options.headers.is_empty()
+                || options.credential_helper.is_some())
+        {
             warn!("REAPI: sending the auth token or headers without TLS");
         }
         let headers = request_headers(options)?.into();
@@ -220,7 +246,9 @@ impl Client {
         let channel = InterceptedService::new(
             channel,
             HeadersInterceptor {
+                auth_token: options.auth_token.clone(),
                 headers,
+                credential_helper: options.credential_helper.clone(),
                 request_metadata: BinaryMetadataValue::from_bytes(
                     &request_metadata.encode_to_vec(),
                 ),
@@ -345,8 +373,7 @@ pub(super) fn action_request<T>(
     request
 }
 
-/// Fails if `options` has an invalid endpoint, auth token, header or TLS file, without
-/// connecting.
+/// Fails if `options` has an invalid endpoint, header or TLS file, without connecting.
 /// The system's root certificates aren't loaded: a store that is missing or slow to read is a
 /// reason to retry the connection, not an invalid config.
 pub(super) fn check_connect_options(options: &ConnectOptions) -> Result<()> {
@@ -355,36 +382,17 @@ pub(super) fn check_connect_options(options: &ConnectOptions) -> Result<()> {
     Ok(())
 }
 
-/// The headers for every request: the bearer token's `authorization`, then `options.headers`.
-/// A header's value is left out of errors, since it may be a credential.
+/// `options.headers`, for every request. A header's value is left out of errors, since it may
+/// be a credential.
 fn request_headers(
     options: &ConnectOptions,
 ) -> Result<Vec<(AsciiMetadataKey, AsciiMetadataValue)>> {
     let mut headers = Vec::new();
-    if let Some(auth_header) = auth_header(options.auth_token.as_deref())? {
-        headers.push((AsciiMetadataKey::from_static("authorization"), auth_header));
-    }
     for (name, value) in &options.headers {
-        let key = AsciiMetadataKey::from_bytes(name.as_bytes())
-            .with_context(|| format!("the REAPI header name {name:?} is not valid"))?;
-        // gRPC and HTTP/2 own these: tonic drops or replaces some, and HTTP/2 refuses
-        // requests that have the others.
-        if key.as_str().starts_with("grpc-")
-            || [
-                "te",
-                "content-type",
-                "user-agent",
-                "connection",
-                "keep-alive",
-                "proxy-connection",
-                "transfer-encoding",
-                "upgrade",
-            ]
-            .contains(&key.as_str())
+        let key = header_key(name)?;
+        if headers.iter().any(|(existing, _)| *existing == key)
+            || (key == "authorization" && options.auth_token.is_some())
         {
-            bail!("the REAPI header {name:?} is reserved for gRPC or HTTP/2");
-        }
-        if headers.iter().any(|(existing, _)| *existing == key) {
             bail!("the REAPI header {name:?} is set twice, or with auth_token_file");
         }
         let value = sensitive_ascii_value(value).with_context(|| {
@@ -393,6 +401,44 @@ fn request_headers(
         headers.push((key, value));
     }
     Ok(headers)
+}
+
+/// The URI a credential helper gets for `endpoint`: `https://<host>[:<port>]` without port
+/// 443. One helper run covers every gRPC service, so the URI has no path. Bazel adds the
+/// service's name as the path and runs the helper separately for each service.
+pub(super) fn credential_helper_uri(endpoint: &str) -> Result<String> {
+    let uri: http::Uri = parse_endpoint(endpoint)?.http_url.parse()?;
+    let authority = uri
+        .authority()
+        .context("the REAPI endpoint has no host")?
+        .as_str();
+    Ok(format!(
+        "https://{}",
+        authority.strip_suffix(":443").unwrap_or(authority)
+    ))
+}
+
+/// `name` as a header name, if it's valid and gRPC or HTTP/2 doesn't own it.
+pub(super) fn header_key(name: &str) -> Result<AsciiMetadataKey> {
+    let key = AsciiMetadataKey::from_bytes(name.as_bytes())
+        .with_context(|| format!("the REAPI header name {name:?} is not valid"))?;
+    // tonic drops or replaces some, and HTTP/2 refuses requests that have the others.
+    if key.as_str().starts_with("grpc-")
+        || [
+            "te",
+            "content-type",
+            "user-agent",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "transfer-encoding",
+            "upgrade",
+        ]
+        .contains(&key.as_str())
+    {
+        bail!("the REAPI header {name:?} is reserved for gRPC or HTTP/2");
+    }
+    Ok(key)
 }
 
 /// The tonic endpoint for `options`, with TLS set up for `grpcs://`, and the host name TLS
@@ -428,20 +474,9 @@ fn channel_endpoint(
     Ok((channel_builder, parsed.tls_domain))
 }
 
-/// The bearer `authorization` header for `auth_token`, if any.
-fn auth_header(auth_token: Option<&str>) -> Result<Option<AsciiMetadataValue>> {
-    match auth_token.map(str::trim) {
-        Some("") => bail!("the REAPI auth token is empty"),
-        Some(token) => sensitive_ascii_value(&format!("Bearer {token}"))
-            .context("the REAPI auth token contains a non-ASCII or control character")
-            .map(Some),
-        None => Ok(None),
-    }
-}
-
 /// `value` as a header value that tonic leaves out of logs, or `None` if it has a non-ASCII or
 /// control character. tonic takes bytes above 0x7f, which servers may not.
-fn sensitive_ascii_value(value: &str) -> Option<AsciiMetadataValue> {
+pub(super) fn sensitive_ascii_value(value: &str) -> Option<AsciiMetadataValue> {
     let mut value = AsciiMetadataValue::try_from(value)
         .ok()
         .filter(|_| value.is_ascii())?;
@@ -583,6 +618,9 @@ fn check_api_version(capabilities: &remexec::ServerCapabilities) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::auth_token::test::{read_again_now, token_file};
+    #[cfg(unix)]
+    use crate::reapi::credential_helper::test::script_helper;
     use crate::reapi::proto::build::bazel::semver::SemVer;
     use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -698,6 +736,10 @@ mod test {
         format!("grpcs://{addr}")
     }
 
+    fn auth_token(token: &str) -> Arc<AuthToken> {
+        Arc::new(AuthToken::fixed(token).unwrap())
+    }
+
     fn connect_options(endpoint: &str) -> ConnectOptions {
         ConnectOptions {
             endpoint: endpoint.to_owned(),
@@ -799,7 +841,7 @@ mod test {
         let authorization_headers = fake.authorization_headers.clone();
         let endpoint = serve_fake(fake).await;
         Client::connect(&ConnectOptions {
-            auth_token: Some("secret\n".to_owned()),
+            auth_token: Some(auth_token("secret\n")),
             ..connect_options(&endpoint)
         })
         .await
@@ -817,7 +859,7 @@ mod test {
         let authorization_headers = fake.authorization_headers.clone();
         let endpoint = serve_fake(fake).await.replace("grpc://", "grpcs://");
         let e = Client::connect(&ConnectOptions {
-            auth_token: Some("secret".to_owned()),
+            auth_token: Some(auth_token("secret")),
             ..connect_options(&endpoint)
         })
         .await;
@@ -832,7 +874,7 @@ mod test {
         let authorization_headers = fake.authorization_headers.clone();
         let endpoint = serve_fake_over_tls(fake, false).await;
         Client::connect(&ConnectOptions {
-            auth_token: Some("secret".to_owned()),
+            auth_token: Some(auth_token("secret")),
             tls_ca_certificates: Some(Certificate::from_pem(tls_file("ca.pem"))),
             ..connect_options(&endpoint)
         })
@@ -951,12 +993,40 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_a_changed_token_is_sent_from_then_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_token, write_token) = token_file(dir.path(), Duration::ZERO);
+        let fake = FakeCapabilities::default();
+        let authorization_headers = fake.authorization_headers.clone();
+        let endpoint = serve_fake(fake).await;
+        let client = Client::connect(&ConnectOptions {
+            auth_token: Some(auth_token.clone()),
+            ..connect_options(&endpoint)
+        })
+        .await
+        .unwrap();
+        write_token("second");
+        read_again_now(&auth_token).await;
+        CapabilitiesClient::new(client.channel())
+            .get_capabilities(remexec::GetCapabilitiesRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            vec![
+                Some("Bearer first".to_owned()),
+                Some("Bearer second".to_owned())
+            ],
+            *authorization_headers.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn test_configured_headers_are_sent_with_the_auth_token() {
         let fake = FakeCapabilities::default();
         let metadata = fake.metadata.clone();
         let endpoint = serve_fake(fake).await;
         Client::connect(&ConnectOptions {
-            auth_token: Some("secret".to_owned()),
+            auth_token: Some(auth_token("secret")),
             headers: [("X-Api-Key".to_owned(), "key".to_owned())].into(),
             ..connect_options(&endpoint)
         })
@@ -965,6 +1035,46 @@ mod test {
         let metadata = &metadata.lock().unwrap()[0];
         assert_eq!("key", metadata.get("x-api-key").unwrap());
         assert_eq!("Bearer secret", metadata.get("authorization").unwrap());
+    }
+
+    #[test_case("grpcs://farm.example.com:443", "https://farm.example.com" ; "default port")]
+    #[test_case("grpc://10.0.0.1:8980", "https://10.0.0.1:8980" ; "plain text")]
+    #[test_case("grpcs://[::1]:8443/", "https://[::1]:8443" ; "ipv6 with a slash")]
+    fn test_the_credential_helper_gets_the_endpoint_as_an_https_uri(endpoint: &str, uri: &str) {
+        assert_eq!(uri, credential_helper_uri(endpoint).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_the_credential_helpers_headers_replace_configured_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential_helper = Arc::new(script_helper(
+            dir.path(),
+            r#"{"headers": {"x-api-key": ["a", "b"]}}"#,
+        ));
+        credential_helper.renew().await.unwrap();
+        let fake = FakeCapabilities::default();
+        let metadata = fake.metadata.clone();
+        let endpoint = serve_fake(fake).await;
+        Client::connect(&ConnectOptions {
+            headers: [
+                ("x-api-key".to_owned(), "configured".to_owned()),
+                ("x-tenant".to_owned(), "t".to_owned()),
+            ]
+            .into(),
+            credential_helper: Some(credential_helper),
+            ..connect_options(&endpoint)
+        })
+        .await
+        .unwrap();
+        let metadata = &metadata.lock().unwrap()[0];
+        let api_keys: Vec<_> = metadata
+            .get_all("x-api-key")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(vec!["a", "b"], api_keys);
+        assert_eq!("t", metadata.get("x-tenant").unwrap());
     }
 
     #[test_case("x api key", "hidden", "not valid" ; "invalid name")]
@@ -981,7 +1091,7 @@ mod test {
         error: &str,
     ) {
         let e = check_connect_options(&ConnectOptions {
-            auth_token: Some("secret".to_owned()),
+            auth_token: Some(auth_token("secret")),
             headers: [(name.to_owned(), value.to_owned())].into(),
             ..connect_options("grpc://farm:8980")
         })
@@ -991,18 +1101,6 @@ mod test {
             e.contains(error) && !e.contains(value) && !e.contains("secret"),
             "{e}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_empty_auth_token_is_refused() {
-        let e = Client::connect(&ConnectOptions {
-            auth_token: Some(" \n".to_owned()),
-            ..connect_options("grpc://127.0.0.1:1")
-        })
-        .await
-        .err()
-        .unwrap();
-        assert!(e.to_string().contains("auth token is empty"), "{e}");
     }
 
     #[test_case(3, "v3 to v3" ; "newer only")]
@@ -1222,30 +1320,14 @@ mod test {
         assert_eq!("asking: timed out after 1ms", e.to_string());
     }
 
-    #[test_case("sec\nret" ; "control character")]
-    #[test_case("sécret" ; "non-ascii")]
-    #[tokio::test]
-    async fn test_an_invalid_auth_token_is_refused_without_echoing_it(token: &str) {
-        let e = Client::connect(&ConnectOptions {
-            auth_token: Some(token.to_owned()),
-            ..connect_options("grpc://127.0.0.1:1")
-        })
-        .await
-        .err()
-        .unwrap();
-        assert!(!format!("{e:#}").contains("cret"), "{e:#}");
-    }
-
     #[test]
-    fn test_the_token_and_header_values_are_left_out_of_logs() {
+    fn test_header_values_are_left_out_of_logs() {
         let headers = request_headers(&ConnectOptions {
-            auth_token: Some("secret".to_owned()),
             headers: [("x-api-key".to_owned(), "key".to_owned())].into(),
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(2, headers.len());
-        assert!(headers.iter().all(|(_, value)| value.is_sensitive()));
+        assert!(headers[0].1.is_sensitive());
     }
 
     #[test_case("grpc://farm:8980", "http://farm:8980", None ; "plain text")]
@@ -1286,17 +1368,12 @@ mod test {
         assert!(!format!("{e:#}").contains("secret"), "{e:#}");
     }
 
-    #[test_case("grpcs://farm:443", Some("token"), true ; "valid")]
-    #[test_case("farm:443", None, false ; "bad endpoint")]
-    #[test_case("grpcs://farm:443", Some(" "), false ; "empty token")]
-    fn test_connect_options_are_checked_without_connecting(
-        endpoint: &str,
-        auth_token: Option<&str>,
-        valid: bool,
-    ) {
+    #[test_case("grpcs://farm:443", true ; "valid")]
+    #[test_case("farm:443", false ; "bad endpoint")]
+    fn test_connect_options_are_checked_without_connecting(endpoint: &str, valid: bool) {
         let options = ConnectOptions {
             endpoint: endpoint.to_owned(),
-            auth_token: auth_token.map(str::to_owned),
+            auth_token: Some(auth_token("token")),
             ..Default::default()
         };
         assert_eq!(valid, check_connect_options(&options).is_ok());
