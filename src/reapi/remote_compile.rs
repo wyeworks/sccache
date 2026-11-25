@@ -189,6 +189,10 @@ fn build_action(
         input_root_digest: Some(input_root_digest),
         platform: options.platform.clone(),
         salt: options.salt.clone(),
+        timeout: Some(super::proto::google::protobuf::Duration {
+            seconds: 540,
+            nanos: 0,
+        }),
         ..Default::default()
     };
     (command_bytes, action)

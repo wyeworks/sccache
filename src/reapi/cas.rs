@@ -14,7 +14,9 @@
 
 //! CAS uploads and downloads with size limits and digest verification.
 
-use super::client::{AuthChannel, Client, RPC_TIMEOUT, status_error, with_timeout};
+use super::client::{
+    AuthChannel, Client, RPC_TIMEOUT, RpcError, status_error, with_retries, with_timeout,
+};
 use super::digest;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -324,17 +326,21 @@ impl Cas {
             digest.hash, digest.size_bytes
         );
         let download_result = with_timeout(&description, download_timeout(size_bytes), async {
-            let mut stream = self
-                .bytestream_client
-                .clone()
-                .read(ReadRequest {
-                    resource_name,
-                    read_offset: 0,
-                    read_limit: 0,
-                })
-                .await
-                .map_err(status_error)?
-                .into_inner();
+            // Only opening the stream is tried again. Its chunks go straight to `out`, so a
+            // broken stream isn't read again.
+            let mut stream = with_retries(|| async {
+                self.bytestream_client
+                    .clone()
+                    .read(ReadRequest {
+                        resource_name: resource_name.clone(),
+                        read_offset: 0,
+                        read_limit: 0,
+                    })
+                    .await
+                    .map_err(status_error)
+            })
+            .await?
+            .into_inner();
             while let Some(chunk) = stream.message().await.map_err(status_error)? {
                 // Writer errors are returned when joining the blocking task below.
                 if tx.send(chunk.data).await.is_err() {
@@ -360,7 +366,8 @@ impl Cas {
 }
 
 impl Cas {
-    pub(super) fn forget_present_blobs(&self) {
+    /// Makes the next uploads look every blob up, after the CAS evicted some.
+    pub(crate) fn forget_present_blobs(&self) {
         self.present_blobs.lock().unwrap().clear();
     }
 
@@ -371,7 +378,8 @@ impl Cas {
 
     /// Uploads whichever of `blobs` the CAS doesn't have, in batches, or through ByteStream
     /// if too large for one. A local file that can't be read fails with [`UnreadableBlob`].
-    /// Recheck presence after taking an upload permit.
+    /// A blob that another call uploads while this one waits for an upload permit isn't
+    /// uploaded again.
     pub(crate) async fn ensure_uploaded(&self, blobs: Vec<(remexec::Digest, Blob)>) -> Result<()> {
         for (digest, _) in &blobs {
             digest::check(digest)?;
@@ -423,13 +431,17 @@ impl Cas {
             futures::future::try_join_all(large_blobs.into_iter().map(|large_blob| {
                 self.upload_with_permit(vec![large_blob], |blobs| async move {
                     for (digest, blob) in blobs {
-                        self.write_blob(digest, blob).await?;
+                        with_retries(|| self.write_blob(digest.clone(), blob.clone())).await?;
                     }
                     Ok(())
                 })
             })),
         )?;
-        self.remember_present(digests);
+        let mut present_blobs = self.present_blobs.lock().unwrap();
+        if present_blobs.len() + digests.len() > self.max_present_blobs {
+            present_blobs.clear();
+        }
+        present_blobs.extend(digests.into_iter().take(self.max_present_blobs));
         Ok(())
     }
 
@@ -484,13 +496,13 @@ impl Cas {
             let response = with_timeout(
                 "failed to ask the REAPI CAS which blobs it lacks",
                 RPC_TIMEOUT,
-                async {
+                with_retries(|| async {
                     self.cas_client
                         .clone()
-                        .find_missing_blobs(request)
+                        .find_missing_blobs(request.clone())
                         .await
                         .map_err(status_error)
-                },
+                }),
             )
             .await?;
             let requested: HashSet<_> = chunk.iter().collect();
@@ -536,13 +548,18 @@ impl Cas {
             "failed to upload a batch of {} blobs to the REAPI CAS",
             unanswered.len()
         );
-        let response = with_timeout(&description, upload_timeout(bytes), async {
-            self.cas_client
-                .clone()
-                .batch_update_blobs(request)
-                .await
-                .map_err(status_error)
-        })
+        // A blob the server refuses in its answer isn't sent again.
+        let response = with_timeout(
+            &description,
+            upload_timeout(bytes),
+            with_retries(|| async {
+                self.cas_client
+                    .clone()
+                    .batch_update_blobs(request.clone())
+                    .await
+                    .map_err(status_error)
+            }),
+        )
         .await?
         .into_inner();
         for response in response.responses {
@@ -553,13 +570,16 @@ impl Cas {
                 bail!("BatchUpdateBlobs returned a duplicate or unrequested digest");
             }
             if let Some(status) = response.status.filter(|status| status.code != 0) {
-                bail!(
-                    "{description}: the REAPI server refused blob {}/{}: {:?}: {}",
-                    digest.hash,
-                    digest.size_bytes,
-                    tonic::Code::from(status.code),
-                    status.message
-                );
+                return Err(Error::new(RpcError {
+                    code: tonic::Code::from(status.code),
+                    message: status.message,
+                }))
+                .with_context(|| {
+                    format!(
+                        "{description}: the REAPI server refused blob {}/{}",
+                        digest.hash, digest.size_bytes
+                    )
+                });
             }
         }
         if let Some(digest) = unanswered.iter().next() {
@@ -731,7 +751,7 @@ impl<W: Write> Write for HashingWriter<W> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::reapi::client::ConnectOptions;
+    use crate::reapi::client::{ConnectOptions, RETRIES, rpc_code};
     use crate::reapi::test::FakeServer;
     use rand::{RngCore, SeedableRng};
     use std::sync::Arc;
@@ -1012,13 +1032,45 @@ mod test {
     #[tokio::test]
     async fn test_a_refused_blob_fails_the_upload() {
         let (cas, server) = cas_with(FakeServer::default()).await;
-        // A digest that doesn't match the bytes.
-        let wrong = || (digest::of_bytes(b"one"), Blob::Bytes(b"two".to_vec()));
-        let e = cas.ensure_uploaded(vec![wrong()]).await.unwrap_err();
-        assert!(format!("{e:#}").contains("digest mismatch"), "{e:#}");
-        // The refused blob isn't remembered as present.
-        assert!(cas.ensure_uploaded(vec![wrong()]).await.is_err());
+        *server.refused_blob.lock().unwrap() = Some(digest::of_bytes(b"one"));
+        let e = cas.ensure_uploaded(vec![blob(b"one")]).await.unwrap_err();
+        assert_eq!(Some(tonic::Code::Unavailable), rpc_code(&e));
+        assert_eq!(1, server.batch_update_blobs_calls.load(Ordering::SeqCst));
+        assert!(cas.ensure_uploaded(vec![blob(b"one")]).await.is_err());
         assert_eq!(2, server.find_missing_blobs_calls.load(Ordering::SeqCst));
+    }
+
+    #[test_case("FindMissingBlobs" ; "find missing blobs")]
+    #[test_case("BatchUpdateBlobs" ; "batch update blobs")]
+    #[tokio::test]
+    async fn test_upload_calls_are_tried_again_while_the_server_is_busy(method: &'static str) {
+        let (cas, server) = cas_with(FakeServer::default()).await;
+        server.answer_busy(method, RETRIES as usize);
+        cas.ensure_uploaded(vec![blob(b"new")]).await.unwrap();
+        assert!(server.has_blob(b"new"));
+        assert!(server.gave_every_busy_answer());
+    }
+
+    #[tokio::test]
+    async fn test_bytestream_writes_are_tried_again_while_the_server_is_busy() {
+        let (cas, server) = cas_with_small_batches(FakeServer::default()).await;
+        let large = incompressible_bytes_of_len(BYTESTREAM_WRITE_CHUNK_BYTES + 10);
+        server.answer_busy("Write", RETRIES as usize);
+        cas.ensure_uploaded(vec![(digest::of_bytes(&large), Blob::Bytes(large.clone()))])
+            .await
+            .unwrap();
+        assert!(server.has_blob(&large));
+        assert!(server.gave_every_busy_answer());
+    }
+
+    #[tokio::test]
+    async fn test_downloads_are_tried_again_while_the_server_is_busy() {
+        let (cas, server) = cas_and_server(false).await;
+        let data = incompressible_bytes();
+        let digest = server.insert_blob(&data);
+        server.answer_busy("Read", RETRIES as usize);
+        assert_eq!(data, cas.download_blob(&digest, MAX_BYTES).await.unwrap());
+        assert!(server.gave_every_busy_answer());
     }
 
     #[tokio::test]
@@ -1313,9 +1365,9 @@ mod test {
         assert!(server.batch_requests.lock().unwrap().is_empty());
     }
 
-    #[test_case(FakeServer { find_missing_error: Some(tonic::Code::Unavailable), ..Default::default() }, 100 ; "find missing")]
-    #[test_case(FakeServer { batch_error: Some(tonic::Code::Unavailable), ..Default::default() }, 100 ; "batch update")]
-    #[test_case(FakeServer { write_error: Some(tonic::Code::Unavailable), ..Default::default() }, 100 * 1024 ; "bytestream")]
+    #[test_case(FakeServer { find_missing_error: Some(tonic::Code::Internal), ..Default::default() }, 100 ; "find missing")]
+    #[test_case(FakeServer { batch_error: Some(tonic::Code::Internal), ..Default::default() }, 100 ; "batch update")]
+    #[test_case(FakeServer { write_error: Some(tonic::Code::Internal), ..Default::default() }, 100 * 1024 ; "bytestream")]
     #[tokio::test]
     async fn test_upload_rpc_errors_leave_presence_unknown(server: FakeServer, size: usize) {
         let (cas, server) = cas_with_small_batches(server).await;
@@ -1324,7 +1376,7 @@ mod test {
                 .ensure_uploaded(vec![blob(&vec![0; size])])
                 .await
                 .unwrap_err();
-            assert!(format!("{error:#}").contains("Unavailable"), "{error:#}");
+            assert!(format!("{error:#}").contains("Internal"), "{error:#}");
         }
         assert_eq!(server.find_missing_blobs_calls.load(Ordering::SeqCst), 2);
     }
@@ -1437,7 +1489,7 @@ mod test {
         let client = Client::connect(&ConnectOptions {
             endpoint: server.serve().await,
             instance_name: server.instance_name.clone(),
-            auth_token: Some("test-token".to_owned()),
+            auth_token: Some("test-token".into()),
         })
         .await
         .unwrap();

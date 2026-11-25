@@ -14,7 +14,10 @@
 
 //! Looks actions up in a REAPI server's action cache.
 
-use super::client::{AuthChannel, Client, RPC_TIMEOUT, status_error, with_timeout};
+use super::client::{
+    AuthChannel, Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, status_error, with_retries,
+    with_timeout,
+};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use remexec::action_cache_client::ActionCacheClient;
@@ -29,7 +32,8 @@ impl ActionCache {
     pub(crate) fn new(client: &Client) -> Self {
         ActionCache {
             instance_name: client.instance_name().to_owned(),
-            action_cache_client: ActionCacheClient::new(client.channel()),
+            action_cache_client: ActionCacheClient::new(client.channel())
+                .max_decoding_message_size(MAX_ACTION_RESULT_RESPONSE_BYTES),
         }
     }
 
@@ -52,18 +56,18 @@ impl ActionCache {
                 action_digest.hash, action_digest.size_bytes
             ),
             RPC_TIMEOUT,
-            async {
+            with_retries(|| async {
                 match self
                     .action_cache_client
                     .clone()
-                    .get_action_result(request)
+                    .get_action_result(request.clone())
                     .await
                 {
                     Ok(response) => Ok(Some(response.into_inner())),
                     Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
                     Err(status) => Err(status_error(status)),
                 }
-            },
+            }),
         )
         .await
     }
@@ -72,7 +76,7 @@ impl ActionCache {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::reapi::client::ConnectOptions;
+    use crate::reapi::client::{ConnectOptions, RETRIES};
     use crate::reapi::digest;
     use crate::reapi::test::FakeServer;
     use std::sync::Arc;
@@ -117,6 +121,42 @@ mod test {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_result_with_more_than_4_mib_inlined_is_found() {
+        let server = Arc::new(FakeServer::default());
+        let action_cache = ActionCache::new(&server.serve_and_connect().await);
+        let action_digest = digest::of_bytes(b"action");
+        let result = remexec::ActionResult {
+            stderr_raw: vec![b'w'; 5 << 20],
+            ..Default::default()
+        };
+        server.insert_action_result(&action_digest, result.clone());
+        assert_eq!(
+            Some(result),
+            action_cache
+                .get_action_result(&action_digest)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lookups_are_tried_again_while_the_server_is_busy() {
+        let server = Arc::new(FakeServer::default());
+        let action_cache = ActionCache::new(&server.serve_and_connect().await);
+        let action_digest = digest::of_bytes(b"action");
+        server.insert_action_result(&action_digest, remexec::ActionResult::default());
+        server.answer_busy("GetActionResult", RETRIES as usize);
+        assert!(
+            action_cache
+                .get_action_result(&action_digest)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(server.gave_every_busy_answer());
     }
 
     #[tokio::test]
@@ -174,7 +214,7 @@ mod test {
         let server = Arc::new(FakeServer::default());
         let client = Client::connect(&ConnectOptions {
             endpoint: server.serve().await,
-            auth_token: Some("test-token".to_owned()),
+            auth_token: Some("test-token".into()),
             ..Default::default()
         })
         .await

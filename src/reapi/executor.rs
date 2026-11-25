@@ -14,10 +14,11 @@
 
 //! Remote cache lookup and execution with local fallback.
 
+use super::client::rpc_code;
 use super::client::{ConnectOptions, check_connect_options};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
-use super::execution::{Execution, MissingActionBlobs};
+use super::execution::{Execution, MissingActionBlobs, QueuedTooLong};
 use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile, ToolchainKey};
 use super::remote_compile::{
@@ -36,6 +37,7 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -57,6 +59,8 @@ pub(crate) struct ReapiExecutor {
     execution_pause: LookupPause,
     on_miss: ReapiOnMiss,
     linux_toolchain: bool,
+    queue_timeout: Duration,
+    executions_refused: AtomicBool,
     rustc_checks: Mutex<HashMap<ToolchainKey, Arc<RustcCheck>>>,
     action_options: Arc<ActionOptions>,
 }
@@ -89,6 +93,8 @@ impl ReapiExecutor {
             execution_pause: LookupPause::default(),
             on_miss: config.on_miss,
             linux_toolchain: cfg!(target_os = "linux"),
+            queue_timeout: Duration::from_secs(config.queue_timeout_secs.unwrap_or(60).min(3600)),
+            executions_refused: AtomicBool::new(false),
             rustc_checks: Mutex::default(),
             action_options: Arc::new(ActionOptions::new(config)),
         }
@@ -141,8 +147,9 @@ impl ReapiExecutor {
                     warn!("[{out_pretty}]: failed to prepare the worker rustc check: {error:#}");
                     CompileLocallyReason::HashingInputsFailed
                 })?;
-                let response =
-                    Self::upload_and_execute(apis, execution, &action, false, out_pretty).await?;
+                let response = self
+                    .upload_and_execute(apis, execution, &action, false, out_pretty)
+                    .await?;
                 let result = response
                     .result
                     .ok_or(CompileLocallyReason::ExecutionFailed)?;
@@ -173,6 +180,7 @@ impl ReapiExecutor {
     }
 
     async fn upload_and_execute(
+        &self,
         apis: &ServerApis,
         execution: &Execution,
         action: &super::remote_compile::ActionBlobs,
@@ -192,11 +200,15 @@ impl ReapiExecutor {
                         if error.is::<super::cas::UnreadableBlob>() {
                             CompileLocallyReason::UnreadableInput
                         } else {
-                            CompileLocallyReason::UploadFailed
+                            if rpc_code(&error) == Some(tonic::Code::PermissionDenied) {
+                                CompileLocallyReason::ExecutionsRefused
+                            } else {
+                                CompileLocallyReason::UploadFailed
+                            }
                         }
                     })?;
                 match execution
-                    .execute_action(&action.action_digest, skip_cache_lookup)
+                    .execute_action(&action.action_digest, skip_cache_lookup, self.queue_timeout)
                     .await
                 {
                     Err(error) if error.is::<MissingActionBlobs>() => {
@@ -204,7 +216,19 @@ impl ReapiExecutor {
                     }
                     Err(error) => {
                         warn!("[{out_pretty}]: REAPI execution failed: {error:#}");
-                        return Err(CompileLocallyReason::ExecutionFailed);
+                        return Err(if error.is::<QueuedTooLong>() {
+                            CompileLocallyReason::ExecutionQueuedTooLong
+                        } else {
+                            match rpc_code(&error) {
+                                Some(tonic::Code::PermissionDenied) => {
+                                    CompileLocallyReason::ExecutionsRefused
+                                }
+                                Some(tonic::Code::DeadlineExceeded) => {
+                                    CompileLocallyReason::ExecutionTimedOut
+                                }
+                                _ => CompileLocallyReason::ExecutionFailed,
+                            }
+                        });
                     }
                     Ok(response) => return Ok(response),
                 }
@@ -274,6 +298,9 @@ impl ReapiExecutor {
                 if !self.linux_toolchain {
                     return Err(CompileLocallyReason::NonLinuxToolchain);
                 }
+                if self.executions_refused.load(Ordering::Relaxed) {
+                    return Err(CompileLocallyReason::ExecutionsRefused);
+                }
                 let permit = self
                     .execution_pause
                     .try_lookup()
@@ -287,14 +314,8 @@ impl ReapiExecutor {
                         out_pretty,
                     )
                     .await?;
-                    Self::upload_and_execute(
-                        &apis,
-                        execution,
-                        &action,
-                        cached.is_some(),
-                        out_pretty,
-                    )
-                    .await
+                    self.upload_and_execute(&apis, execution, &action, cached.is_some(), out_pretty)
+                        .await
                 }
                 .await;
                 let response = match response {
@@ -303,6 +324,9 @@ impl ReapiExecutor {
                         response
                     }
                     Err(reason) => {
+                        if reason == CompileLocallyReason::ExecutionsRefused {
+                            self.executions_refused.store(true, Ordering::Relaxed);
+                        }
                         if matches!(
                             reason,
                             CompileLocallyReason::UploadFailed
@@ -583,6 +607,7 @@ mod test {
             salt: String::new(),
             platform: Default::default(),
             on_miss: Default::default(),
+            queue_timeout_secs: None,
         }
     }
 
@@ -846,11 +871,13 @@ mod test {
             FakeServer {
                 executes_actions: true,
                 worker_rustc_commit_hash: Mutex::new(Some("abc123".into())),
-                worker_outputs: [(
-                    ".sccache-build/debug/deps/libfoo.rlib".to_owned(),
-                    b"remote rlib".to_vec(),
-                )]
-                .into(),
+                worker_outputs: Mutex::new(
+                    [(
+                        ".sccache-build/debug/deps/libfoo.rlib".to_owned(),
+                        b"remote rlib".to_vec(),
+                    )]
+                    .into(),
+                ),
                 ..Default::default()
             },
         );
@@ -901,7 +928,7 @@ mod test {
     #[test]
     fn test_a_failed_lookup_compiles_locally() {
         let fixture = Fixture::new(Eligibility::Eligible);
-        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         let (dist_type, output) = fixture.compile();
         assert_eq!(compiled_locally("action cache lookup failed"), dist_type);
         assert_eq!(b"out".as_slice(), output.stdout);
@@ -911,7 +938,7 @@ mod test {
     fn test_compiles_resume_after_a_cooldown_and_reset_the_backoff() {
         let fixture = Fixture::clock_controlled();
         fixture.put_result_in_action_cache(|_| {});
-        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         let executor = ReapiExecutor::new(&fixture.config);
         for _ in 0..FAILURES_TO_PAUSE {
             assert_eq!(
@@ -934,7 +961,7 @@ mod test {
         );
         assert_eq!(fixture.server.lookup_requests.lock().unwrap().len(), 4);
 
-        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE {
             assert_eq!(
                 compiled_locally("action cache lookup failed"),
@@ -955,7 +982,7 @@ mod test {
     fn test_cache_misses_reset_consecutive_rpc_failures() {
         let fixture = Fixture::new(Eligibility::Eligible);
         let executor = ReapiExecutor::new(&fixture.config);
-        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE - 1 {
             assert_eq!(
                 compiled_locally("action cache lookup failed"),
@@ -967,7 +994,7 @@ mod test {
             compiled_locally("not in the action cache"),
             fixture.compile_with(&executor).0
         );
-        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE {
             assert_eq!(
                 compiled_locally("action cache lookup failed"),
@@ -986,7 +1013,7 @@ mod test {
         let fixture = Fixture::clock_controlled();
         fixture.put_result_in_action_cache(|_| {});
         let executor = ReapiExecutor::new(&fixture.config);
-        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE {
             fixture.compile_with(&executor);
         }

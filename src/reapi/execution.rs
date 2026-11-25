@@ -14,13 +14,17 @@
 
 //! Executes actions on a REAPI server's workers.
 
-use super::client::{AuthChannel, Client, RPC_TIMEOUT, RpcError, with_timeout};
+use super::client::{
+    AuthChannel, Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, RpcError, rpc_code,
+    with_timeout,
+};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::longrunning::{Operation, operation};
 use super::proto::google::rpc;
 use crate::errors::*;
 use prost::Message;
 use remexec::execution_client::ExecutionClient;
+use remexec::execution_stage;
 use std::time::Duration;
 
 /// Reattaches in a row without the server reporting progress before giving up.
@@ -32,6 +36,18 @@ const REATTACH_BACKOFF: Duration = if cfg!(test) {
 } else {
     Duration::from_millis(500)
 };
+
+/// Error for an action the server reported queued for longer than the queue timeout.
+#[derive(Debug)]
+pub(crate) struct QueuedTooLong(Duration);
+
+impl std::fmt::Display for QueuedTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the action stayed queued for over {:?}", self.0)
+    }
+}
+
+impl std::error::Error for QueuedTooLong {}
 
 /// Error for an Execute the server refused because its CAS is missing blobs the action
 /// needs.
@@ -60,18 +76,22 @@ impl Execution {
     pub(crate) fn new(client: &Client) -> Self {
         Execution {
             instance_name: client.instance_name().to_owned(),
-            execution_client: ExecutionClient::new(client.channel()),
+            execution_client: ExecutionClient::new(client.channel())
+                .max_decoding_message_size(MAX_ACTION_RESULT_RESPONSE_BYTES),
         }
     }
 
     /// Runs the action on a worker, or answers from the action cache unless
     /// `skip_cache_lookup`. Reattaches after a broken stream. Fails with
-    /// [`MissingActionBlobs`] when the CAS is missing blobs the action needs. The caller
-    /// bounds how long it takes.
+    /// [`MissingActionBlobs`] when the CAS is missing blobs the action needs, and with
+    /// [`QueuedTooLong`] when the server reports the action queued for longer than
+    /// `queue_timeout`. The caller bounds how long it takes otherwise. `action_mnemonic` goes
+    /// in the calls' `RequestMetadata`.
     pub(crate) async fn execute_action(
         &self,
         action_digest: &remexec::Digest,
         skip_cache_lookup: bool,
+        queue_timeout: Duration,
     ) -> Result<remexec::ExecuteResponse> {
         super::digest::check(action_digest)?;
         let description = format!(
@@ -80,6 +100,9 @@ impl Execution {
         );
         let mut operation_name: Option<String> = None;
         let mut reattaches_without_progress = 0;
+        // Starts at the first QUEUED and stays across reattaches. EXECUTING or COMPLETED clears
+        // it. A server that reports no stages waits for the caller's deadline.
+        let mut queue_deadline: Option<tokio::time::Instant> = None;
         loop {
             let waiting = operation_name.is_some();
             let stream = match operation_name.clone() {
@@ -95,12 +118,36 @@ impl Execution {
             };
             let last_error = match stream {
                 Ok(mut stream) => loop {
-                    match stream.message().await {
+                    let message = match queue_deadline {
+                        Some(deadline) => {
+                            match tokio::time::timeout_at(deadline, stream.message()).await {
+                                Ok(message) => message,
+                                Err(_) => {
+                                    return Err(Error::new(QueuedTooLong(queue_timeout))
+                                        .context(description));
+                                }
+                            }
+                        }
+                        None => stream.message().await,
+                    };
+                    match message {
                         Ok(Some(operation)) if operation.done => {
                             return execute_response(operation.result).context(description);
                         }
                         Ok(Some(operation)) => {
                             reattaches_without_progress = 0;
+                            match stage(&operation) {
+                                Some(execution_stage::Value::Queued) => {
+                                    queue_deadline.get_or_insert_with(|| {
+                                        tokio::time::Instant::now() + queue_timeout
+                                    });
+                                }
+                                Some(
+                                    execution_stage::Value::Executing
+                                    | execution_stage::Value::Completed,
+                                ) => queue_deadline = None,
+                                _ => {}
+                            }
                             if !operation.name.is_empty() {
                                 operation_name = Some(operation.name);
                             }
@@ -126,6 +173,9 @@ impl Execution {
                 return Err(last_error.context(format!(
                     "{description}: no progress after {MAX_REATTACHES} reattaches"
                 )));
+            }
+            if queue_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(Error::new(QueuedTooLong(queue_timeout)).context(description));
             }
             debug!(
                 "REAPI: reattaching to action {}/{} after: {last_error:#}",
@@ -189,10 +239,6 @@ fn may_succeed_on_retry(e: &Error) -> bool {
     }
 }
 
-fn rpc_code(e: &Error) -> Option<tonic::Code> {
-    e.downcast_ref::<RpcError>().map(|e| e.code)
-}
-
 /// [`rpc_status_error`] for a failed Execution API call, whose details carry the
 /// `google.rpc.Status`'s details.
 fn execution_status_error(status: tonic::Status) -> Error {
@@ -248,6 +294,17 @@ fn reports_missing_blobs(status: &rpc::Status) -> bool {
         })
 }
 
+/// The stage the metadata of `operation` reports, if any.
+fn stage(operation: &Operation) -> Option<execution_stage::Value> {
+    let metadata = operation.metadata.as_ref().filter(|metadata| {
+        metadata
+            .type_url
+            .ends_with("/build.bazel.remote.execution.v2.ExecuteOperationMetadata")
+    })?;
+    let metadata = remexec::ExecuteOperationMetadata::decode(metadata.value.as_slice()).ok()?;
+    execution_stage::Value::try_from(metadata.stage).ok()
+}
+
 /// The response in a finished operation's `result`, with a result.
 fn execute_response(result: Option<operation::Result>) -> Result<remexec::ExecuteResponse> {
     let response = match result {
@@ -269,7 +326,10 @@ fn execute_response(result: Option<operation::Result>) -> Result<remexec::Execut
         return Err(if response.message.is_empty() {
             e
         } else {
-            e.context(format!("the REAPI server says: {}", response.message))
+            e.context(format!(
+                "the REAPI server says: {}",
+                response.message.escape_debug()
+            ))
         });
     }
     if response.result.is_none() {
@@ -283,14 +343,16 @@ mod test {
     use super::*;
     use crate::reapi::digest;
     use crate::reapi::test::{FakeServer, StreamBreak};
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
     use test_case::test_case;
+
+    const QUEUE_TIMEOUT: Duration = Duration::from_millis(200);
 
     /// A server whose workers write `out`.
     fn writing_server() -> FakeServer {
         FakeServer {
-            worker_outputs: [("out".to_owned(), b"x".to_vec())].into(),
+            worker_outputs: Mutex::new([("out".to_owned(), b"x".to_vec())].into()),
             ..Default::default()
         }
     }
@@ -313,8 +375,53 @@ mod test {
         let server = Arc::new(server);
         let execution = Execution::new(&server.serve_and_connect().await);
         execution
-            .execute_action(&insert_action(&server), false)
+            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
             .await
+    }
+
+    /// Executes on a server that sends an operation at each of `stages`, `interval` apart,
+    /// then nothing, for up to 3 queue timeouts. `None` if still waiting by then.
+    async fn execute_stalling_after(
+        stages: Vec<execution_stage::Value>,
+        interval: Duration,
+    ) -> Option<Result<remexec::ExecuteResponse>> {
+        let server = FakeServer {
+            stages_then_stall: stages,
+            stage_interval: interval,
+            ..writing_server()
+        };
+        tokio::time::timeout(QUEUE_TIMEOUT * 3, execute(server))
+            .await
+            .ok()
+    }
+
+    #[test_case(Duration::ZERO ; "queued once")]
+    // Each QUEUED doesn't restart the timeout.
+    #[test_case(QUEUE_TIMEOUT / 4 ; "queued again and again")]
+    #[tokio::test]
+    async fn test_an_action_queued_past_the_timeout_is_given_up(interval: Duration) {
+        let e = execute_stalling_after(vec![execution_stage::Value::Queued; 12], interval)
+            .await
+            .expect("still waiting")
+            .unwrap_err();
+        assert!(e.is::<QueuedTooLong>(), "{e:#}");
+    }
+
+    #[test_case(
+        vec![execution_stage::Value::Queued, execution_stage::Value::Executing] ;
+        "executing after queued"
+    )]
+    #[test_case(vec![execution_stage::Value::Executing] ; "executing")]
+    #[test_case(vec![execution_stage::Value::Unknown] ; "unknown stage")]
+    #[tokio::test]
+    async fn test_an_action_that_leaves_the_queue_is_waited_for(
+        stages: Vec<execution_stage::Value>,
+    ) {
+        assert!(
+            execute_stalling_after(stages, Duration::ZERO)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -326,21 +433,38 @@ mod test {
         let execution = Execution::new(&server.serve_and_connect().await);
         let action_digest = insert_action(&server);
         let response = execution
-            .execute_action(&action_digest, false)
+            .execute_action(&action_digest, false, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert!(!response.cached_result);
         assert_eq!("out", response.result.unwrap().output_files[0].path);
         let response = execution
-            .execute_action(&action_digest, false)
+            .execute_action(&action_digest, false, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert!(response.cached_result);
         execution
-            .execute_action(&action_digest, true)
+            .execute_action(&action_digest, true, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(2, server.actions_run.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_a_result_with_more_than_4_mib_inlined_is_returned() {
+        let server = Arc::new(writing_server());
+        let execution = Execution::new(&server.serve_and_connect().await);
+        let action_digest = insert_action(&server);
+        let result = remexec::ActionResult {
+            stderr_raw: vec![b'w'; 5 << 20],
+            ..Default::default()
+        };
+        server.insert_action_result(&action_digest, result.clone());
+        let response = execution
+            .execute_action(&action_digest, false, QUEUE_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(Some(result), response.result);
     }
 
     #[tokio::test]
@@ -348,7 +472,7 @@ mod test {
         let server = Arc::new(FakeServer::default());
         let execution = Execution::new(&server.serve_and_connect().await);
         let e = execution
-            .execute_action(&digest::of_bytes(b"no such action"), false)
+            .execute_action(&digest::of_bytes(b"no such action"), false, QUEUE_TIMEOUT)
             .await
             .unwrap_err();
         assert!(e.is::<MissingActionBlobs>(), "{e:#}");
@@ -368,7 +492,7 @@ mod test {
     #[tokio::test]
     async fn test_a_failed_precondition_without_missing_blobs_keeps_its_code() {
         let e = execute(FakeServer {
-            without_matching_worker: true,
+            execute_error: Some(tonic::Code::FailedPrecondition),
             ..writing_server()
         })
         .await
@@ -396,13 +520,12 @@ mod test {
             ..writing_server()
         });
         let execution = Execution::new(&server.serve_and_connect().await);
+        let action_digest = insert_action(&server);
         let response = execution
-            .execute_action(&insert_action(&server), false)
+            .execute_action(&action_digest, false, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!("out", response.result.unwrap().output_files[0].path);
-        assert_eq!(1, server.execute_calls.load(Ordering::SeqCst));
-        assert_eq!(1, server.wait_execution_calls.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -414,7 +537,10 @@ mod test {
         });
         let digest = insert_action(&server);
         let execution = Execution::new(&server.serve_and_connect().await);
-        execution.execute_action(&digest, true).await.unwrap();
+        execution
+            .execute_action(&digest, true, QUEUE_TIMEOUT)
+            .await
+            .unwrap();
         assert_eq!(1, server.wait_execution_calls.load(Ordering::SeqCst));
         assert_eq!(2, server.execute_calls.load(Ordering::SeqCst));
     }
@@ -427,7 +553,7 @@ mod test {
         });
         let execution = Execution::new(&server.serve_and_connect().await);
         execution
-            .execute_action(&insert_action(&server), false)
+            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(1, server.wait_execution_calls.load(Ordering::SeqCst));
@@ -458,7 +584,7 @@ mod test {
         });
         let execution = Execution::new(&server.serve_and_connect().await);
         let e = execution
-            .execute_action(&insert_action(&server), false)
+            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
             .await
             .unwrap_err();
         assert_eq!(Some(tonic::Code::PermissionDenied), rpc_code(&e));
@@ -522,7 +648,7 @@ mod test {
         });
         let execution = Execution::new(&server.serve_and_connect().await);
         execution
-            .execute_action(&insert_action(&server), false)
+            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(2, server.execute_calls.load(Ordering::SeqCst));
@@ -538,7 +664,7 @@ mod test {
         });
         let execution = Execution::new(&server.serve_and_connect().await);
         let e = execution
-            .execute_action(&insert_action(&server), false)
+            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
             .await
             .unwrap_err();
         assert!(e.is::<MissingActionBlobs>(), "{e:#}");

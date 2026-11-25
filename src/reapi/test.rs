@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};
 use tonic::transport::server::TcpIncoming;
@@ -47,18 +48,38 @@ type RpcResult<T> = std::result::Result<Response<T>, Status>;
 /// In-memory REAPI server for unit tests.
 #[derive(Default)]
 pub(crate) struct FakeServer {
-    /// The files each execution writes, by output path; only declared ones count.
-    pub(crate) worker_rustc_commit_hash: Mutex<Option<String>>,
     pub(crate) executes_actions: bool,
-    pub(crate) worker_outputs: HashMap<String, Vec<u8>>,
+    pub(crate) lookups_miss: bool,
+    pub(crate) busy_answers: Mutex<HashMap<&'static str, usize>>,
+    pub(crate) upload_error: Mutex<Option<tonic::Code>>,
+    /// The `RequestMetadata` of each FindMissingBlobs, GetActionResult, Execute and
+    /// WaitExecution call, after the method's name.
+
+    /// The files each execution writes, by output path; only declared ones count.
+    pub(crate) worker_outputs: Mutex<HashMap<String, Vec<u8>>>,
+    pub(crate) worker_exit_code: i32,
+    /// The commit hash `rustc -vV` prints on the workers; `None` fails it, as on a worker
+    /// that can't run the toolchain.
+    pub(crate) worker_rustc_commit_hash: Mutex<Option<String>>,
+    /// Forgets every blob at the next Execute, as a CAS that evicted them.
+    pub(crate) forget_blobs_at_next_execute: AtomicBool,
     pub(crate) execute_calls: AtomicUsize,
     pub(crate) actions_run: AtomicUsize,
     /// Finishes each Execute with a missing-blobs status in the ExecuteResponse.
     pub(crate) missing_blobs_in_response: bool,
-    /// Refuses each Execute with FAILED_PRECONDITION, as when no worker matches the platform.
-    pub(crate) without_matching_worker: bool,
+    /// Refuses each Execute with this code, such as FAILED_PRECONDITION when no worker
+    /// matches the platform.
+    pub(crate) execute_error: Option<tonic::Code>,
+    /// Sends each Execute an operation at each of these stages, then nothing, as a server
+    /// whose action waits at the last one.
+    pub(crate) stages_then_stall: Vec<remexec::execution_stage::Value>,
+    /// The wait before each operation of `stages_then_stall`.
+    pub(crate) stage_interval: Duration,
     /// Finishes each Execute with an operation error.
     pub(crate) fail_operations: bool,
+    /// Finishes each Execute with DEADLINE_EXCEEDED in the ExecuteResponse, as for an action
+    /// that ran past its timeout.
+    pub(crate) actions_time_out: bool,
     /// Breaks this many Execute and WaitExecution streams, after a first, unfinished
     /// operation unless `break_before_operation`.
     pub(crate) streams_to_break: AtomicUsize,
@@ -320,18 +341,18 @@ impl Capabilities for FakeServer {
             vec![]
         };
         Ok(Response::new(remexec::ServerCapabilities {
-            execution_capabilities: self
-                .executes_actions
-                .then(|| remexec::ExecutionCapabilities {
-                    exec_enabled: true,
-                    digest_functions: vec![remexec::digest_function::Value::Sha256 as i32],
-                    ..Default::default()
-                }),
             cache_capabilities: (!self.without_caching).then(|| remexec::CacheCapabilities {
                 supported_compressors,
                 max_batch_total_size_bytes: self.max_batch_bytes,
                 ..Default::default()
             }),
+            execution_capabilities: self
+                .executes_actions
+                .then(|| remexec::ExecutionCapabilities {
+                    exec_enabled: true,
+                    digest_function: remexec::digest_function::Value::Sha256 as i32,
+                    ..Default::default()
+                }),
             ..Default::default()
         }))
     }
@@ -344,6 +365,9 @@ impl ContentAddressableStorage for FakeServer {
         request: Request<remexec::FindMissingBlobsRequest>,
     ) -> RpcResult<remexec::FindMissingBlobsResponse> {
         self.find_missing_blobs_calls.fetch_add(1, Ordering::SeqCst);
+        if self.take_busy_answer("FindMissingBlobs") {
+            return Err(Status::unavailable("busy"));
+        }
         self.find_authorization_headers.lock().unwrap().push(
             request
                 .metadata()
@@ -386,6 +410,9 @@ impl ContentAddressableStorage for FakeServer {
         request: Request<remexec::BatchUpdateBlobsRequest>,
     ) -> RpcResult<remexec::BatchUpdateBlobsResponse> {
         self.batch_update_blobs_calls.fetch_add(1, Ordering::SeqCst);
+        if self.take_busy_answer("BatchUpdateBlobs") {
+            return Err(Status::unavailable("busy"));
+        }
         self.upload_authorization_headers.lock().unwrap().push(
             request
                 .metadata()
@@ -404,6 +431,9 @@ impl ContentAddressableStorage for FakeServer {
         }
         if request.instance_name != self.instance_name {
             return Err(Status::invalid_argument(request.instance_name));
+        }
+        if let Some(code) = *self.upload_error.lock().unwrap() {
+            return Err(Status::new(code, "upload_error"));
         }
         self.batched_blob_count
             .fetch_add(request.requests.len(), Ordering::SeqCst);
@@ -507,6 +537,9 @@ impl ActionCache for FakeServer {
         &self,
         request: Request<remexec::GetActionResultRequest>,
     ) -> RpcResult<remexec::ActionResult> {
+        if self.take_busy_answer("GetActionResult") {
+            return Err(Status::unavailable("busy"));
+        }
         self.authorization_headers.lock().unwrap().push(
             request
                 .metadata()
@@ -528,6 +561,9 @@ impl ActionCache for FakeServer {
         let Some(action_digest) = request.action_digest else {
             return Err(Status::invalid_argument("no action_digest"));
         };
+        if self.lookups_miss {
+            return Err(Status::not_found("no result"));
+        }
         let action_results = self.action_results.lock().unwrap();
         match action_results.get(&(action_digest.hash, action_digest.size_bytes)) {
             Some(result) => Ok(Response::new(result.clone())),
@@ -548,6 +584,9 @@ impl ByteStream for FakeServer {
     type ReadStream = Pin<Box<dyn Stream<Item = std::result::Result<ReadResponse, Status>> + Send>>;
 
     async fn read(&self, request: Request<ReadRequest>) -> RpcResult<Self::ReadStream> {
+        if self.take_busy_answer("Read") {
+            return Err(Status::unavailable("busy"));
+        }
         self.read_authorization_headers.lock().unwrap().push(
             request
                 .metadata()
@@ -619,6 +658,9 @@ impl ByteStream for FakeServer {
     }
 
     async fn write(&self, request: Request<Streaming<WriteRequest>>) -> RpcResult<WriteResponse> {
+        if self.take_busy_answer("Write") {
+            return Err(Status::unavailable("busy"));
+        }
         self.upload_authorization_headers.lock().unwrap().push(
             request
                 .metadata()
@@ -722,6 +764,26 @@ fn finished_operation(result: operation::Result) -> Operation {
     }
 }
 
+/// An unfinished operation at `stage`.
+fn stage_operation(stage: remexec::execution_stage::Value) -> Operation {
+    let metadata = remexec::ExecuteOperationMetadata {
+        stage: stage as i32,
+        ..Default::default()
+    };
+    Operation {
+        name: "operation".to_owned(),
+        metadata: Some(super::proto::google::protobuf::Any {
+            type_url: concat!(
+                "type.googleapis.com/",
+                "build.bazel.remote.execution.v2.ExecuteOperationMetadata"
+            )
+            .to_owned(),
+            value: metadata.encode_to_vec(),
+        }),
+        ..Default::default()
+    }
+}
+
 fn response_operation(response: remexec::ExecuteResponse) -> Operation {
     let mut result = operation::Result::Response(Default::default());
     if let operation::Result::Response(any) = &mut result {
@@ -737,14 +799,38 @@ impl FakeServer {
         digest: Option<&remexec::Digest>,
     ) -> std::result::Result<M, Status> {
         let digest = digest.cloned().unwrap_or_default();
-        let blobs = self.blobs.lock().unwrap();
-        let bytes = blobs
-            .get(&(digest.hash.clone(), digest.size_bytes))
-            .ok_or_else(|| missing_blob_status(&digest))?;
+        let bytes = self.blob(&digest)?;
         M::decode(bytes.as_slice()).map_err(|e| Status::invalid_argument(e.to_string()))
     }
 
-    /// Writes the outputs `command` declares that are in `worker_outputs`.
+    fn blob(&self, digest: &remexec::Digest) -> std::result::Result<Vec<u8>, Status> {
+        if digest.size_bytes == 0 {
+            return Ok(vec![]);
+        }
+        let blobs = self.blobs.lock().unwrap();
+        blobs
+            .get(&(digest.hash.clone(), digest.size_bytes))
+            .cloned()
+            .ok_or_else(|| missing_blob_status(digest))
+    }
+
+    /// Fails as a server does when the CAS lacks a blob of the input root `directory`.
+    fn check_input_root(
+        &self,
+        directory: Option<&remexec::Digest>,
+    ) -> std::result::Result<(), Status> {
+        let directory: remexec::Directory = self.decode_blob(directory)?;
+        for file in &directory.files {
+            self.blob(&file.digest.clone().unwrap_or_default())?;
+        }
+        for subdirectory in &directory.directories {
+            self.check_input_root(subdirectory.digest.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Writes the outputs `command` declares that are in `worker_outputs`, or prints
+    /// `rustc -vV` into the CAS, as servers that don't inline stdout do.
     fn run(&self, command: &remexec::Command) -> remexec::ActionResult {
         self.actions_run.fetch_add(1, Ordering::SeqCst);
         if command
@@ -765,11 +851,12 @@ impl FakeServer {
                 },
             };
         }
+        let worker_outputs = self.worker_outputs.lock().unwrap();
         let output_files = command
             .output_paths
             .iter()
             .filter_map(|path| {
-                let data = self.worker_outputs.get(path)?;
+                let data = worker_outputs.get(path)?;
                 Some(remexec::OutputFile {
                     path: path.clone(),
                     digest: Some(self.insert_blob(data)),
@@ -779,6 +866,7 @@ impl FakeServer {
             .collect();
         remexec::ActionResult {
             output_files,
+            exit_code: self.worker_exit_code,
             stderr_raw: b"sccache-reapi-pwd:/worker\n".to_vec(),
             ..Default::default()
         }
@@ -799,6 +887,31 @@ fn take_one(counter: &AtomicUsize) -> bool {
 }
 
 impl FakeServer {
+    /// Answers the next `count` calls to `method` with UNAVAILABLE.
+    pub(crate) fn answer_busy(&self, method: &'static str, count: usize) {
+        self.busy_answers.lock().unwrap().insert(method, count);
+    }
+
+    /// Whether every busy answer `answer_busy` asked for was given, so a misspelled method
+    /// fails the test.
+    pub(crate) fn gave_every_busy_answer(&self) -> bool {
+        self.busy_answers
+            .lock()
+            .unwrap()
+            .values()
+            .all(|&count| count == 0)
+    }
+
+    fn take_busy_answer(&self, method: &str) -> bool {
+        match self.busy_answers.lock().unwrap().get_mut(method) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A stream that sends `operation`, or breaks per the switches.
     fn finishing_stream(&self, operation: Operation) -> OperationStream {
         if !take_one(&self.streams_to_break) {
@@ -844,16 +957,46 @@ impl Execution for FakeServer {
             return Err(Status::invalid_argument(request.instance_name));
         }
         let action_digest = request.action_digest.unwrap_or_default();
+        if self
+            .forget_blobs_at_next_execute
+            .swap(false, Ordering::SeqCst)
+        {
+            self.blobs.lock().unwrap().clear();
+        }
         let action: remexec::Action = self.decode_blob(Some(&action_digest))?;
         let command: remexec::Command = self.decode_blob(action.command_digest.as_ref())?;
-        if self.without_matching_worker {
-            return Err(Status::failed_precondition(
-                "no worker matches the platform",
-            ));
+        self.check_input_root(action.input_root_digest.as_ref())?;
+        if let Some(code) = self.execute_error {
+            return Err(Status::new(code, "execute_error"));
+        }
+        if !self.stages_then_stall.is_empty() {
+            let interval = self.stage_interval;
+            let operations = futures::stream::iter(self.stages_then_stall.clone()).then(
+                move |stage| async move {
+                    tokio::time::sleep(interval).await;
+                    Ok(stage_operation(stage))
+                },
+            );
+            return Ok(Response::new(Box::pin(
+                operations.chain(futures::stream::pending()),
+            )));
         }
         if self.missing_blobs_in_response {
             let response = remexec::ExecuteResponse {
                 status: Some(missing_blob_rpc_status(&action_digest)),
+                ..Default::default()
+            };
+            return Ok(Response::new(operation_stream(vec![Ok(
+                response_operation(response),
+            )])));
+        }
+        if self.actions_time_out {
+            let response = remexec::ExecuteResponse {
+                status: Some(rpc::Status {
+                    code: tonic::Code::DeadlineExceeded as i32,
+                    message: "the action timed out".to_owned(),
+                    details: vec![],
+                }),
                 ..Default::default()
             };
             return Ok(Response::new(operation_stream(vec![Ok(
@@ -871,7 +1014,7 @@ impl Execution for FakeServer {
             )])));
         }
         let key = (action_digest.hash.clone(), action_digest.size_bytes);
-        let cached_result = (!request.skip_cache_lookup)
+        let cached_result = (!request.skip_cache_lookup && !action.do_not_cache)
             .then(|| self.action_results.lock().unwrap().get(&key).cloned())
             .flatten();
         let response = match cached_result {
@@ -882,10 +1025,13 @@ impl Execution for FakeServer {
             },
             None => {
                 let result = self.run(&command);
-                self.action_results
-                    .lock()
-                    .unwrap()
-                    .insert(key, result.clone());
+                // Servers commonly leave failed results out of the action cache.
+                if result.exit_code == 0 && !action.do_not_cache {
+                    self.action_results
+                        .lock()
+                        .unwrap()
+                        .insert(key, result.clone());
+                }
                 remexec::ExecuteResponse {
                     result: Some(result),
                     ..Default::default()

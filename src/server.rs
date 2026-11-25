@@ -2776,6 +2776,7 @@ mod tests {
                 salt: String::new(),
                 platform: Default::default(),
                 on_miss: Default::default(),
+                queue_timeout_secs: None,
             }),
             ..Default::default()
         }

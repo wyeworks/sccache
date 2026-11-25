@@ -22,6 +22,23 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const MAX_ACTION_RESULT_RESPONSE_BYTES: usize = 32 << 20;
+/// Tries after the first for a call that a busy or restarting server refused.
+pub(super) const RETRIES: u32 = 2;
+/// The wait before the first retry, doubled before the next. Short in tests.
+const RETRY_BACKOFF: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_millis(200)
+};
+/// A call that took longer to fail isn't tried again: a busy server answers at once, while a
+/// server that can't be reached takes the connect timeout to fail each time. Short in tests.
+const RETRIED_FAILURE_MAX: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(1)
+};
+
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
@@ -61,6 +78,35 @@ impl Interceptor for AuthInterceptor {
         }
         Ok(request)
     }
+}
+
+/// Runs `call`, and again up to [`RETRIES`] times while it fails within
+/// [`RETRIED_FAILURE_MAX`] with UNAVAILABLE or RESOURCE_EXHAUSTED, which a busy or
+/// restarting server answers.
+pub(super) async fn with_retries<T, F, U>(mut call: F) -> Result<T>
+where
+    F: FnMut() -> U,
+    U: Future<Output = Result<T>>,
+{
+    let mut backoff = RETRY_BACKOFF;
+    for _ in 0..RETRIES {
+        let started = tokio::time::Instant::now();
+        match call().await {
+            Err(e)
+                if started.elapsed() <= RETRIED_FAILURE_MAX
+                    && matches!(
+                        rpc_code(&e),
+                        Some(tonic::Code::Unavailable | tonic::Code::ResourceExhausted)
+                    ) =>
+            {
+                debug!("REAPI: {e:#}; trying again in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            result => return result,
+        }
+    }
+    call().await
 }
 
 /// Adds `description` to the error if `future` fails or takes longer than `timeout`.
@@ -271,6 +317,10 @@ impl std::fmt::Display for RpcError {
 }
 
 impl std::error::Error for RpcError {}
+
+pub(super) fn rpc_code(error: &Error) -> Option<tonic::Code> {
+    error.downcast_ref::<RpcError>().map(|error| error.code)
+}
 
 pub(super) fn status_error(status: tonic::Status) -> Error {
     Error::new(RpcError {
