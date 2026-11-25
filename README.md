@@ -419,3 +419,5 @@ Storage Options
 * [WebDAV (Ccache/Bazel/Gradle compatible)](docs/Webdav.md)
 * [Alibaba OSS](docs/OSS.md)
 * [Tencent Cloud Object Storage](docs/COS.md)
+
+See [REAPI (experimental)](docs/Reapi.md) for remote Rust compilation.

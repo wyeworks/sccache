@@ -182,6 +182,8 @@ The latest `cache.XXX` entries may be found here: https://github.com/mozilla/scc
 
 ## Experimental REAPI
 
+See [REAPI](Reapi.md) for setup and worker toolchain archives.
+
 Build with `--features reapi` and add a `[reapi]` section:
 
 ```toml
