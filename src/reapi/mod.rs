@@ -24,6 +24,7 @@ mod cas;
 mod client;
 
 mod connection;
+mod terminal_output;
 mod toolchains;
 
 #[allow(dead_code)]

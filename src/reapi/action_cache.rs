@@ -250,7 +250,7 @@ mod test {
             .unwrap_err();
         assert_eq!(
             format!(
-                "failed to look up action {}/{} in the REAPI action cache: {code:?}: lookup_error",
+                "failed to look up action {}/{} in the REAPI action cache: {code:?}: \"lookup_error\"",
                 action_digest.hash, action_digest.size_bytes
             ),
             format!("{error:#}")

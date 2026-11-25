@@ -548,8 +548,8 @@ pub(super) async fn materialize(
         .context(UnwritableOutputs)??;
     Ok(process::Output {
         status: exit_status_from_code(exit_code),
-        stdout,
-        stderr,
+        stdout: super::terminal_output::without_terminal_controls(&stdout),
+        stderr: super::terminal_output::without_terminal_controls(&stderr),
     })
 }
 

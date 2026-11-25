@@ -1605,7 +1605,7 @@ mod test {
         let error = cas.download_blob(&digest, MAX_BYTES).await.unwrap_err();
         assert_eq!(
             format!(
-                "failed to download blob {}/4 from the REAPI CAS: {code:?}: read_error",
+                "failed to download blob {}/4 from the REAPI CAS: {code:?}: \"read_error\"",
                 digest.hash
             ),
             format!("{error:#}")
@@ -1622,7 +1622,7 @@ mod test {
         let digest = server.insert_blob(&incompressible_bytes());
         let error = cas.download_blob(&digest, MAX_BYTES).await.unwrap_err();
         assert!(
-            format!("{error:#}").contains("Unavailable: read_stream_error"),
+            format!("{error:#}").contains("Unavailable: \"read_stream_error\""),
             "{error:#}"
         );
     }
