@@ -48,6 +48,7 @@ type RpcResult<T> = std::result::Result<Response<T>, Status>;
 #[derive(Default)]
 pub(crate) struct FakeServer {
     /// The files each execution writes, by output path; only declared ones count.
+    pub(crate) worker_rustc_commit_hash: Mutex<Option<String>>,
     pub(crate) executes_actions: bool,
     pub(crate) worker_outputs: HashMap<String, Vec<u8>>,
     pub(crate) execute_calls: AtomicUsize,
@@ -746,6 +747,24 @@ impl FakeServer {
     /// Writes the outputs `command` declares that are in `worker_outputs`.
     fn run(&self, command: &remexec::Command) -> remexec::ActionResult {
         self.actions_run.fetch_add(1, Ordering::SeqCst);
+        if command
+            .arguments
+            .last()
+            .is_some_and(|script| script.ends_with("/bin/rustc -vV\n"))
+        {
+            return match &*self.worker_rustc_commit_hash.lock().unwrap() {
+                Some(commit_hash) => remexec::ActionResult {
+                    stdout_digest: Some(self.insert_blob(
+                        format!("rustc 1.0.0\ncommit-hash: {commit_hash}\n").as_bytes(),
+                    )),
+                    ..Default::default()
+                },
+                None => remexec::ActionResult {
+                    exit_code: 127,
+                    ..Default::default()
+                },
+            };
+        }
         let output_files = command
             .output_paths
             .iter()

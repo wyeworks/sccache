@@ -17,9 +17,9 @@
 use super::client::{ConnectOptions, check_connect_options};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
-use super::execution::MissingActionBlobs;
+use super::execution::{Execution, MissingActionBlobs};
 use super::lookup_pause::LookupPause;
-use super::mapping::{CompileLocallyReason, ReapiCompile};
+use super::mapping::{CompileLocallyReason, ReapiCompile, ToolchainKey};
 use super::remote_compile::{
     ActionOptions, action_blobs, digest_input_root_files, materialize, materialize_failure_reason,
 };
@@ -32,16 +32,20 @@ use crate::config::{ReapiConfig, ReapiOnMiss};
 use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::OnceCell;
 use tokio::time::Instant;
 
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
 const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
+
+type RustcCheck = OnceCell<std::result::Result<(), CompileLocallyReason>>;
 
 pub(crate) struct ReapiExecutor {
     connection: Option<Arc<Connection>>,
@@ -53,6 +57,7 @@ pub(crate) struct ReapiExecutor {
     execution_pause: LookupPause,
     on_miss: ReapiOnMiss,
     linux_toolchain: bool,
+    rustc_checks: Mutex<HashMap<ToolchainKey, Arc<RustcCheck>>>,
     action_options: Arc<ActionOptions>,
 }
 
@@ -84,6 +89,7 @@ impl ReapiExecutor {
             execution_pause: LookupPause::default(),
             on_miss: config.on_miss,
             linux_toolchain: cfg!(target_os = "linux"),
+            rustc_checks: Mutex::default(),
             action_options: Arc::new(ActionOptions::new(config)),
         }
     }
@@ -106,6 +112,109 @@ impl ReapiExecutor {
         )
     }
 
+    async fn check_rustc(
+        &self,
+        apis: &ServerApis,
+        execution: &Execution,
+        key: &ToolchainKey,
+        toolchain: &ToolchainFiles,
+        out_pretty: &str,
+    ) -> std::result::Result<(), CompileLocallyReason> {
+        let check = self
+            .rustc_checks
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        *check
+            .get_or_try_init(|| async {
+                let files = toolchain.clone();
+                let options = self.action_options.clone();
+                let action = tokio::task::spawn_blocking(move || {
+                    super::remote_compile::rustc_version_action_blobs(&files, &options)
+                })
+                .await
+                .map_err(Error::from)
+                .flatten()
+                .map_err(|error| {
+                    warn!("[{out_pretty}]: failed to prepare the worker rustc check: {error:#}");
+                    CompileLocallyReason::HashingInputsFailed
+                })?;
+                let response =
+                    Self::upload_and_execute(apis, execution, &action, false, out_pretty).await?;
+                let result = response
+                    .result
+                    .ok_or(CompileLocallyReason::ExecutionFailed)?;
+                if result.exit_code != 0 {
+                    return Ok(Err(CompileLocallyReason::RustcFailsOnWorkers));
+                }
+                let stdout = super::remote_compile::download_stdout_or_stderr(
+                    &apis.cas,
+                    &result.stdout_raw,
+                    result.stdout_digest.as_ref(),
+                )
+                .await
+                .map_err(|error| {
+                    warn!("[{out_pretty}]: failed to download worker rustc version: {error:#}");
+                    CompileLocallyReason::DownloadingOutputsFailed
+                })?;
+                let stdout = String::from_utf8_lossy(&stdout);
+                let commit = stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("commit-hash: "));
+                Ok(if commit == Some(key.commit_hash.as_str()) {
+                    Ok(())
+                } else {
+                    Err(CompileLocallyReason::RustcCommitDiffersOnWorkers)
+                })
+            })
+            .await?
+    }
+
+    async fn upload_and_execute(
+        apis: &ServerApis,
+        execution: &Execution,
+        action: &super::remote_compile::ActionBlobs,
+        skip_cache_lookup: bool,
+        out_pretty: &str,
+    ) -> std::result::Result<
+        super::proto::build::bazel::remote::execution::v2::ExecuteResponse,
+        CompileLocallyReason,
+    > {
+        tokio::time::timeout(Duration::from_secs(600), async {
+            for _ in 0..2 {
+                apis.cas
+                    .ensure_uploaded(action.blobs.clone())
+                    .await
+                    .map_err(|error| {
+                        warn!("[{out_pretty}]: REAPI input upload failed: {error:#}");
+                        if error.is::<super::cas::UnreadableBlob>() {
+                            CompileLocallyReason::UnreadableInput
+                        } else {
+                            CompileLocallyReason::UploadFailed
+                        }
+                    })?;
+                match execution
+                    .execute_action(&action.action_digest, skip_cache_lookup)
+                    .await
+                {
+                    Err(error) if error.is::<MissingActionBlobs>() => {
+                        apis.cas.forget_present_blobs();
+                    }
+                    Err(error) => {
+                        warn!("[{out_pretty}]: REAPI execution failed: {error:#}");
+                        return Err(CompileLocallyReason::ExecutionFailed);
+                    }
+                    Ok(response) => return Ok(response),
+                }
+            }
+            Err(CompileLocallyReason::ExecutionFailed)
+        })
+        .await
+        .unwrap_or(Err(CompileLocallyReason::ExecutionTimedOut))
+    }
+
     async fn look_up(
         &self,
         reapi_compile: ReapiCompile,
@@ -115,6 +224,7 @@ impl ReapiExecutor {
     ) -> std::result::Result<(ReapiOutcome, process::Output), CompileLocallyReason> {
         let digest_cache = self.digest_cache.clone();
         let action_options = self.action_options.clone();
+        let toolchain_files = toolchain.clone();
         let digested = tokio::task::spawn_blocking(move || {
             let files = digest_input_root_files(&reapi_compile, &digest_cache)?;
             let action = action_blobs(&reapi_compile, &files, &toolchain, &action_options)?;
@@ -168,46 +278,41 @@ impl ReapiExecutor {
                     .execution_pause
                     .try_lookup()
                     .ok_or(CompileLocallyReason::ExecutionsPaused)?;
-                let skip_cache_lookup = cached.is_some();
-                let deadline = Instant::now() + Duration::from_secs(600);
-                let mut retried = false;
-                let response = loop {
-                    match tokio::time::timeout_at(
-                        deadline,
-                        apis.cas.ensure_uploaded(action.blobs.clone()),
+                let response = async {
+                    self.check_rustc(
+                        &apis,
+                        execution,
+                        &reapi_compile.toolchain,
+                        &toolchain_files,
+                        out_pretty,
+                    )
+                    .await?;
+                    Self::upload_and_execute(
+                        &apis,
+                        execution,
+                        &action,
+                        cached.is_some(),
+                        out_pretty,
                     )
                     .await
-                    {
-                        Err(_) => return Err(CompileLocallyReason::ExecutionTimedOut),
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            warn!("[{out_pretty}]: REAPI input upload failed: {error:#}");
-                            if !error.is::<super::cas::UnreadableBlob>() {
-                                permit.failed();
-                            }
-                            return Err(CompileLocallyReason::UploadFailed);
-                        }
+                }
+                .await;
+                let response = match response {
+                    Ok(response) => {
+                        permit.succeeded();
+                        response
                     }
-                    match tokio::time::timeout_at(
-                        deadline,
-                        execution.execute_action(action_digest, skip_cache_lookup),
-                    )
-                    .await
-                    {
-                        Err(_) => return Err(CompileLocallyReason::ExecutionTimedOut),
-                        Ok(Err(error)) if !retried && error.is::<MissingActionBlobs>() => {
-                            apis.cas.forget_present_blobs();
-                            retried = true;
-                        }
-                        Ok(Err(error)) => {
-                            warn!("[{out_pretty}]: REAPI execution failed: {error:#}");
+                    Err(reason) => {
+                        if matches!(
+                            reason,
+                            CompileLocallyReason::UploadFailed
+                                | CompileLocallyReason::ExecutionFailed
+                        ) {
                             permit.failed();
-                            return Err(CompileLocallyReason::ExecutionFailed);
                         }
-                        Ok(Ok(response)) => break response,
+                        return Err(reason);
                     }
                 };
-                permit.succeeded();
                 let result = response
                     .result
                     .ok_or(CompileLocallyReason::ExecutionFailed)?;
@@ -372,6 +477,7 @@ mod test {
     use std::ffi::OsString;
     use std::path::Path;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
     use test_case::test_case;
 
     type Creator = Arc<Mutex<MockCommandCreator>>;
@@ -739,6 +845,7 @@ mod test {
             tokio::runtime::Runtime::new().unwrap(),
             FakeServer {
                 executes_actions: true,
+                worker_rustc_commit_hash: Mutex::new(Some("abc123".into())),
                 worker_outputs: [(
                     ".sccache-build/debug/deps/libfoo.rlib".to_owned(),
                     b"remote rlib".to_vec(),
@@ -758,6 +865,30 @@ mod test {
         );
         let (outcome, _) = fixture.compile_with(&executor);
         assert_eq!(outcome, DistType::Reapi(ReapiOutcome::ActionCacheHit));
+    }
+
+    #[test]
+    fn test_a_worker_rustc_mismatch_is_remembered() {
+        let fixture = Fixture::with_server(
+            Eligibility::Eligible,
+            tokio::runtime::Runtime::new().unwrap(),
+            FakeServer {
+                executes_actions: true,
+                worker_rustc_commit_hash: Mutex::new(Some("other".into())),
+                ..Default::default()
+            },
+        );
+        let mut executor = ReapiExecutor::new(&fixture.config);
+        executor.linux_toolchain = true;
+        for _ in 0..2 {
+            let (outcome, _) = fixture.compile_with(&executor);
+            assert_eq!(
+                outcome,
+                compiled_locally("worker rustc has a different commit hash")
+            );
+        }
+        assert_eq!(fixture.server.execute_calls.load(Ordering::SeqCst), 1);
+        assert!(!fixture.server.has_blob(b"pub fn f() {}"));
     }
 
     #[test]

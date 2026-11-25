@@ -173,11 +173,10 @@ impl ActionOptions {
 /// The command that runs `compile`, and the action that runs it on the input root
 /// `input_root_digest`.
 fn build_action(
-    compile: &ReapiCompile,
+    mut command: remexec::Command,
     input_root_digest: remexec::Digest,
     options: &ActionOptions,
-) -> Result<(Vec<u8>, remexec::Action)> {
-    let mut command = build_command(compile)?;
+) -> (Vec<u8>, remexec::Action) {
     // REAPI v2.2+ servers read the platform from the Action; the spec asks to set it on the
     // Command too, for older ones.
     #[expect(deprecated)]
@@ -192,7 +191,7 @@ fn build_action(
         salt: options.salt.clone(),
         ..Default::default()
     };
-    Ok((command_bytes, action))
+    (command_bytes, action)
 }
 
 /// The digest of an action, and every blob it needs: its input files, the directories of
@@ -209,9 +208,37 @@ pub(super) fn action_blobs(
     toolchain: &[(InputRootFile, PathBuf)],
     options: &ActionOptions,
 ) -> Result<ActionBlobs> {
-    let all_files = files.iter().chain(toolchain);
+    command_action_blobs(
+        build_command(compile)?,
+        files.iter().chain(toolchain),
+        options,
+        false,
+    )
+}
+
+pub(super) fn rustc_version_action_blobs(
+    toolchain: &[(InputRootFile, PathBuf)],
+    options: &ActionOptions,
+) -> Result<ActionBlobs> {
+    let script = format!(
+        "set -eu\ncd -P .\nexport LD_LIBRARY_PATH=\"$PWD\"/{TOOLCHAIN_DIR}/lib\nexec \"$PWD\"/{TOOLCHAIN_DIR}/bin/rustc -vV\n"
+    );
+    let command = remexec::Command {
+        arguments: vec!["/bin/sh".into(), "-c".into(), script],
+        ..Default::default()
+    };
+    command_action_blobs(command, toolchain.iter(), options, true)
+}
+
+fn command_action_blobs<'a>(
+    command: remexec::Command,
+    all_files: impl Iterator<Item = &'a (InputRootFile, PathBuf)> + Clone,
+    options: &ActionOptions,
+    do_not_cache: bool,
+) -> Result<ActionBlobs> {
     let input_root = InputRoot::build(all_files.clone().map(|(file, _)| file))?;
-    let (command_bytes, action) = build_action(compile, input_root.digest, options)?;
+    let (command_bytes, mut action) = build_action(command, input_root.digest, options);
+    action.do_not_cache = do_not_cache;
     let action_bytes = action.encode_to_vec();
     let action_digest = digest::of_bytes(&action_bytes);
     let mut blobs: Vec<(remexec::Digest, Blob)> = all_files
@@ -536,7 +563,7 @@ pub(super) fn materialize_failure_reason(e: &Error) -> CompileLocallyReason {
     }
 }
 
-async fn download_stdout_or_stderr(
+pub(super) async fn download_stdout_or_stderr(
     cas: &Cas,
     inline: &[u8],
     digest: Option<&remexec::Digest>,
@@ -847,11 +874,10 @@ Arch = "amd64"
         .unwrap();
         let compile = reapi_compile_in("/home/a/ws");
         let (command, action) = build_action(
-            &compile,
+            build_command(&compile).unwrap(),
             digest::of_bytes(b"input root"),
             &ActionOptions::new(&config),
-        )
-        .unwrap();
+        );
         assert_eq!(action.salt, b"v1");
         let command = remexec::Command::decode(command.as_slice()).unwrap();
         assert_eq!(action.platform, command.platform);
