@@ -1093,6 +1093,7 @@ mod test {
             endpoint: server.serve().await,
             instance_name: server.instance_name.clone(),
             auth_token: Some(" token ".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1490,6 +1491,7 @@ mod test {
             endpoint: server.serve().await,
             instance_name: server.instance_name.clone(),
             auth_token: Some("test-token".into()),
+            ..Default::default()
         })
         .await
         .unwrap();

@@ -785,7 +785,7 @@ pub struct DistConfig {
     pub rewrite_includes_only: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReapiConfig {
     /// `grpc://host:port`, or `grpcs://host:port` for TLS.
@@ -806,6 +806,9 @@ pub struct ReapiConfig {
     #[serde(default)]
     pub on_miss: ReapiOnMiss,
     pub queue_timeout_secs: Option<u64>,
+    pub tls_ca_file: Option<PathBuf>,
+    pub tls_client_certificate_file: Option<PathBuf>,
+    pub tls_client_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3144,8 +3147,7 @@ key_prefix = "cosprefix"
                 ready_wait_secs: 5,
                 salt: "v1".into(),
                 platform: [("OSFamily".into(), "linux".into())].into(),
-                on_miss: Default::default(),
-                queue_timeout_secs: None,
+                ..Default::default()
             }),
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3704,8 +3706,7 @@ endpoint = "grpcs://farm.example.com:443"
             ready_wait_secs: 0,
             salt: String::new(),
             platform: Default::default(),
-            on_miss: Default::default(),
-            queue_timeout_secs: None,
+            ..Default::default()
         }),
         config.reapi
     );

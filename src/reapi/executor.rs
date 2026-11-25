@@ -35,13 +35,14 @@ use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use tokio::time::Instant;
+use tonic::transport::{Certificate, Identity};
 
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
@@ -400,13 +401,51 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
             })
         })
         .transpose()?;
+    let tls_ca_certificates = config
+        .tls_ca_file
+        .as_deref()
+        .map(read_certificates)
+        .transpose()?;
+    let tls_client_identity = match (
+        &config.tls_client_certificate_file,
+        &config.tls_client_key_file,
+    ) {
+        (Some(cert_file), Some(key_file)) => Some(Identity::from_pem(
+            read_tls_file(cert_file, "client certificate")?,
+            read_tls_file(key_file, "client key")?,
+        )),
+        (None, None) => None,
+        _ => bail!(
+            "[reapi] needs both tls_client_certificate_file and tls_client_key_file, or neither"
+        ),
+    };
     let options = ConnectOptions {
         endpoint: config.endpoint.clone(),
         instance_name: config.instance_name.clone(),
         auth_token,
+        tls_ca_certificates,
+        tls_client_identity,
     };
     check_connect_options(&options)?;
     Ok(options)
+}
+
+/// The PEM certificates in `file`. Fails if it holds none, since TLS would then trust no
+/// server.
+fn read_certificates(file: &Path) -> Result<Certificate> {
+    let pem = read_tls_file(file, "CA file")?;
+    if !String::from_utf8_lossy(&pem).contains("-----BEGIN CERTIFICATE-----") {
+        bail!(
+            "the REAPI TLS CA file {} holds no PEM certificate",
+            file.display()
+        );
+    }
+    Ok(Certificate::from_pem(pem))
+}
+
+fn read_tls_file(file: &Path, what: &str) -> Result<Vec<u8>> {
+    std::fs::read(file)
+        .with_context(|| format!("failed to read the REAPI TLS {what} {}", file.display()))
 }
 
 #[async_trait]
@@ -606,8 +645,7 @@ mod test {
             ready_wait_secs,
             salt: String::new(),
             platform: Default::default(),
-            on_miss: Default::default(),
-            queue_timeout_secs: None,
+            ..Default::default()
         }
     }
 
