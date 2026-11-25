@@ -15,7 +15,7 @@
 use crate::dist;
 use fs_err as fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::str;
 
 use crate::errors::*;
@@ -25,6 +25,7 @@ use crate::errors::*;
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use self::toolchain_imp::*;
+pub use super::simplify_path::simplify_path;
 
 pub trait ToolchainPackager: Send {
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()>;
@@ -63,7 +64,7 @@ mod toolchain_imp {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod toolchain_imp {
-    use super::SimplifyPath;
+    use crate::dist::simplify_path::SimplifyPath;
     use fs_err as fs;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -219,6 +220,7 @@ mod toolchain_imp {
         fn tarify_path(&mut self, path: &Path) -> Result<PathBuf> {
             SimplifyPath {
                 resolved_symlinks: Some(&mut self.symlinks),
+                traversed_dirs: None,
             }
             .simplify(path)
             .map(tar_safe_path)
@@ -448,59 +450,4 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
     // TODO: should really use a `set_path_str` or similar
     file_header.set_path(dest)?;
     Ok(file_header)
-}
-
-/// Simplify a path to one without any relative components, erroring if it looks
-/// like there could be any symlink complexity that means a simplified path is not
-/// equivalent to the original (see the documentation of `fs::canonicalize` for an
-/// example).
-///
-/// So why avoid resolving symlinks? Any path that we are trying to simplify has
-/// (usually) been added to an archive because something will try access it, but
-/// resolving symlinks (be they for the actual file or directory components) can
-/// make the accessed path 'disappear' in favour of the canonical path.
-pub fn simplify_path(path: &Path) -> Result<PathBuf> {
-    SimplifyPath {
-        resolved_symlinks: None,
-    }
-    .simplify(path)
-}
-
-struct SimplifyPath<'a> {
-    pub resolved_symlinks: Option<&'a mut std::collections::BTreeMap<PathBuf, PathBuf>>,
-}
-
-impl SimplifyPath<'_> {
-    pub fn simplify(&mut self, path: &Path) -> Result<PathBuf> {
-        let mut final_path = PathBuf::new();
-        for component in path.components() {
-            match component {
-                c @ Component::RootDir | c @ Component::Prefix(_) | c @ Component::Normal(_) => {
-                    final_path.push(c);
-                    if self.resolved_symlinks.is_some() && final_path.is_symlink() {
-                        let parent = final_path.parent().expect("symlinks have parents");
-                        let link_target = final_path.read_link()?;
-                        let new_final_path = self.simplify(&parent.join(&link_target))?;
-                        let old_final_path =
-                            std::mem::replace(&mut final_path, new_final_path.clone());
-                        self.resolved_symlinks
-                            .as_mut()
-                            .unwrap()
-                            .insert(old_final_path, new_final_path);
-                    }
-                }
-                Component::ParentDir => {
-                    // If the path is doing funny symlink traversals, just give up.
-                    //
-                    // This case should only occur if `resolved_symlinks` is `None`.
-                    if final_path.is_symlink() {
-                        bail!("Cannot handle symlinks in parent paths")
-                    }
-                    final_path.pop();
-                }
-                Component::CurDir => continue,
-            }
-        }
-        Ok(final_path)
-    }
 }

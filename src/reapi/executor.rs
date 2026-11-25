@@ -812,6 +812,7 @@ mod test {
                 ),
                 env: Default::default(),
                 input_root_files: vec![ws.join("src/lib.rs")],
+                input_root_directories: vec![],
                 outputs: vec![ws.join(RLIB)],
             })
         }

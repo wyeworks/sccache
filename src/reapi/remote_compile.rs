@@ -216,6 +216,7 @@ pub(super) fn action_blobs(
     command_action_blobs(
         build_command(compile)?,
         files.iter().chain(toolchain),
+        &compile.input_root_directories,
         options,
         false,
     )
@@ -232,16 +233,17 @@ pub(super) fn rustc_version_action_blobs(
         arguments: vec!["/bin/sh".into(), "-c".into(), script],
         ..Default::default()
     };
-    command_action_blobs(command, toolchain.iter(), options, true)
+    command_action_blobs(command, toolchain.iter(), &[], options, true)
 }
 
 fn command_action_blobs<'a>(
     command: remexec::Command,
     all_files: impl Iterator<Item = &'a (InputRootFile, PathBuf)> + Clone,
+    directories: &[String],
     options: &ActionOptions,
     do_not_cache: bool,
 ) -> Result<ActionBlobs> {
-    let input_root = InputRoot::build(all_files.clone().map(|(file, _)| file))?;
+    let input_root = InputRoot::build(all_files.clone().map(|(file, _)| file), directories)?;
     let (command_bytes, mut action) = build_action(command, input_root.digest, options);
     action.do_not_cache = do_not_cache;
     let action_bytes = action.encode_to_vec();
@@ -836,6 +838,50 @@ fn exit_status_from_code(exit_code: u8) -> process::ExitStatus {
 
 #[cfg(test)]
 pub(super) mod test {
+    #[cfg(unix)]
+    #[test]
+    fn test_a_directory_an_input_steps_out_of_goes_into_the_input_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("ws");
+        let source = cwd.join("src/lib.rs");
+        std::fs::create_dir_all(cwd.join("src/bits")).unwrap();
+        std::fs::write(&source, "pub fn f() {}").unwrap();
+        let mut compile = reapi_compile_in(cwd.to_str().unwrap());
+        let input = compile
+            .path_mapper
+            .simplify_input(
+                &cwd.join("src/bits/../lib.rs"),
+                &mut compile.input_root_directories,
+            )
+            .unwrap()
+            .unwrap();
+        compile.input_root_files.push(input);
+        let cache = DigestCache::load(dir.path().join("digests.json"));
+        let files = digest_input_root_files(&compile, &cache).unwrap();
+        let action_blobs = action_blobs(&compile, &files, &[], &ActionOptions::default()).unwrap();
+        let blobs: std::collections::HashMap<_, _> = action_blobs.blobs.into_iter().collect();
+        let directory = |digest: &remexec::Digest| match &blobs[digest] {
+            Blob::Bytes(bytes) => remexec::Directory::decode(bytes.as_slice()).unwrap(),
+            Blob::File(path) => panic!("{path:?}"),
+        };
+        let action = match &blobs[&action_blobs.action_digest] {
+            Blob::Bytes(bytes) => remexec::Action::decode(bytes.as_slice()).unwrap(),
+            Blob::File(path) => panic!("{path:?}"),
+        };
+        let subdirectory = |parent: &remexec::Directory, name: &str| {
+            let node = (parent.directories.iter())
+                .find(|node| node.name == name)
+                .unwrap_or_else(|| panic!("no {name} in {parent:?}"));
+            directory(node.digest.as_ref().unwrap())
+        };
+        let src = subdirectory(
+            &directory(action.input_root_digest.as_ref().unwrap()),
+            "src",
+        );
+        assert_eq!(remexec::Directory::default(), subdirectory(&src, "bits"));
+        assert!(src.files.iter().any(|file| file.name == "lib.rs"));
+    }
+
     fn toolchain_key(sysroot: &Path, target: &str) -> ToolchainKey {
         ToolchainKey::new("abc123".to_owned(), sysroot.to_owned(), target.to_owned())
     }
@@ -882,6 +928,7 @@ pub(super) mod test {
                 unset_vars: vec!["HOSTNAME".to_owned(), "GIT_HASH".to_owned()],
             },
             input_root_files: vec![],
+            input_root_directories: vec![],
             outputs: vec![
                 format!("{cwd}/target/debug/deps/libfoo.rmeta").into(),
                 format!("{cwd}/target/debug/deps/libfoo.rlib").into(),
@@ -1941,7 +1988,7 @@ Arch = "amd64"
                     .into_iter()
                     .map(|(file, _)| file)
                     .collect();
-            InputRoot::build(&files).unwrap().digest
+            InputRoot::build(&files, &[]).unwrap().digest
         };
         assert_eq!(root_digest("first"), root_digest("second/elsewhere"));
     }

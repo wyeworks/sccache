@@ -19,6 +19,7 @@
 //! under its build root (cargo's target dir) go under [`BUILD_ROOT_DIR`].
 
 use super::digest::FileStamp;
+use crate::dist::simplify_path::simplify_path_and_dirs;
 use crate::errors::*;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -37,6 +38,7 @@ pub struct ReapiCompile {
     pub(crate) toolchain: ToolchainKey,
     pub(crate) env: ActionEnv,
     pub(crate) input_root_files: Vec<PathBuf>,
+    pub(crate) input_root_directories: Vec<String>,
     pub(crate) outputs: Vec<PathBuf>,
 }
 
@@ -116,6 +118,7 @@ pub(crate) enum CompileLocallyReason {
     UnexpectedCargoLayout,
     PathOutsideInputRoot,
     SourceOutsideInputRoot,
+    DotDotOutOfSymlink,
     AbsolutePathInOption,
     CustomTargetSpec,
     NativeCpu,
@@ -176,6 +179,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::UnexpectedCargoLayout => "unexpected cargo dir layout",
             Self::PathOutsideInputRoot => "path outside the cwd and build root",
             Self::SourceOutsideInputRoot => "source file outside the cwd and build root",
+            Self::DotDotOutOfSymlink => "input path that steps out of a symlink with `..`",
             Self::AbsolutePathInOption => "absolute path in a -C or -Z option",
             Self::CustomTargetSpec => "custom target spec",
             Self::NativeCpu => "-C target-cpu=native or -Z tune-cpu=native",
@@ -268,6 +272,50 @@ impl PathMapper {
         } else {
             relative
         })
+    }
+
+    /// Maps a source path while retaining the directories traversed by `..`.
+    pub(crate) fn simplify_input(
+        &self,
+        path: &Path,
+        directories: &mut Vec<String>,
+    ) -> std::result::Result<Option<PathBuf>, NotEligible> {
+        if let Some(normalized) = normalize_absolute(path) {
+            return Ok(self.to_input_root(&normalized).map(|_| normalized));
+        }
+        let outside = || {
+            NotEligible::new(
+                CompileLocallyReason::SourceOutsideInputRoot,
+                anyhow!("{}", path.display()),
+            )
+        };
+        if !path.is_absolute() {
+            return Err(outside());
+        }
+
+        let mut traversed = Vec::new();
+        let normalized = simplify_path_and_dirs(path, &mut traversed).map_err(|error| {
+            NotEligible::new(
+                CompileLocallyReason::DotDotOutOfSymlink,
+                error.context(path.display().to_string()),
+            )
+        })?;
+        self.to_input_root(&normalized).ok_or_else(outside)?;
+        let in_build_root = normalized.starts_with(&self.build_root);
+        let mut mapped_dirs = Vec::with_capacity(traversed.len());
+        for directory in traversed {
+            let mapped_dir = self.to_input_root(&directory).ok_or_else(outside)?;
+            if mapped_dir == "."
+                || mapped_dir == BUILD_ROOT_DIR
+                || directory.starts_with(&self.build_root) != in_build_root
+                || !directory.is_dir()
+            {
+                return Err(outside());
+            }
+            mapped_dirs.push(mapped_dir);
+        }
+        directories.extend(mapped_dirs);
+        Ok(Some(normalized))
     }
 
     /// Checks the inverse mapping before using a server-provided path locally.
@@ -450,6 +498,35 @@ mod test {
         assert_ne!(original, key("abc123", "other-target"));
         std::fs::create_dir_all(sysroot.join("lib/rustlib/target/lib")).unwrap();
         assert_ne!(original, key("abc123", "target"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parent_paths_cannot_leave_a_symlink_or_a_mapped_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path();
+        let build_root = cwd.join("target");
+        std::fs::create_dir_all(build_root.join("subdir")).unwrap();
+        std::os::unix::fs::symlink("target/subdir", cwd.join("link")).unwrap();
+        let mapper = PathMapper::new(cwd.to_owned(), build_root);
+        let mut directories = Vec::new();
+
+        for (path, reason) in [
+            ("link/../foo.rs", CompileLocallyReason::DotDotOutOfSymlink),
+            (
+                "target/subdir/../../foo.rs",
+                CompileLocallyReason::SourceOutsideInputRoot,
+            ),
+        ] {
+            assert_eq!(
+                mapper
+                    .simplify_input(&cwd.join(path), &mut directories)
+                    .unwrap_err()
+                    .reason,
+                reason
+            );
+            assert!(directories.is_empty());
+        }
     }
 
     fn path_mapper() -> PathMapper {
@@ -708,7 +785,7 @@ mod test {
             .collect();
         assert_eq!("src/lib.rs", files[0].path);
         assert_eq!(".sccache-build/debug/deps/libfoo.rlib", files[1].path);
-        assert!(InputRoot::build(&files).is_ok());
+        assert!(InputRoot::build(&files, &[]).is_ok());
     }
 
     #[cfg(unix)]
@@ -927,6 +1004,7 @@ mod test {
                 ..Default::default()
             },
             input_root_files: vec![],
+            input_root_directories: vec![],
             outputs: vec![local.join("target/debug/deps/libfoo.rlib")],
         };
         let command = build_command(&compile).unwrap();

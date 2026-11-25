@@ -34,6 +34,8 @@ mod cache;
 pub mod client_auth;
 #[cfg(any_dist)]
 pub mod http;
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
+pub(crate) mod simplify_path;
 #[cfg(test)]
 mod test;
 

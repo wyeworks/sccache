@@ -2654,9 +2654,10 @@ mod reapi_mapping {
             }
         }
         let mut input_root_files = Vec::with_capacity(absolute_inputs.len());
+        let mut input_root_directories = Vec::new();
         for path in absolute_inputs {
-            let normalized = normalize_absolute(&path)
-                .filter(|path| path_mapper.to_input_root(path).is_some())
+            let normalized = path_mapper
+                .simplify_input(&path, &mut input_root_directories)?
                 .ok_or_else(|| {
                     NotEligible::new(
                         CompileLocallyReason::SourceOutsideInputRoot,
@@ -2687,7 +2688,13 @@ mod reapi_mapping {
 
         let env = action_env(compilation, &path_mapper, &target_triple)?;
 
-        input_root_files.extend(dependency_files(compilation, &path_mapper)?);
+        input_root_files.extend(dependency_files(
+            compilation,
+            &path_mapper,
+            &mut input_root_directories,
+        )?);
+        input_root_directories.sort();
+        input_root_directories.dedup();
         input_root_files.sort();
         input_root_files.dedup();
         let mut outputs: Vec<_> = compilation
@@ -2711,12 +2718,14 @@ mod reapi_mapping {
             toolchain: ToolchainKey::new(commit_hash, compilation.sysroot.clone(), target_triple),
             env,
             input_root_files,
+            input_root_directories,
             outputs,
         })
     }
     fn dependency_files(
         compilation: &RustCompilation,
         path_mapper: &PathMapper,
+        input_root_directories: &mut Vec<String>,
     ) -> StdResult<Vec<PathBuf>, NotEligible> {
         let cwd = &compilation.cwd;
         let externs: Vec<_> = compilation
@@ -2810,24 +2819,19 @@ mod reapi_mapping {
                 ));
             }
             for path in parse_dep_info(&dep_info_text, cwd) {
-                let path = normalize_absolute(&path).ok_or_else(|| {
-                    NotEligible::new(
-                        CompileLocallyReason::SourceOutsideInputRoot,
-                        anyhow!(
-                            "dependency source contains parent components: {}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                if path_mapper.to_input_root(&path).is_none() {
+                let mut directories = Vec::new();
+                let Some(path) = path_mapper.simplify_input(&path, &mut directories)? else {
                     debug!(
                         "REAPI: dependency source outside the input root: {}",
                         path.display()
                     );
                     continue;
-                }
+                };
                 match fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => dep_sources.push(path),
+                    Ok(metadata) if metadata.is_file() => {
+                        dep_sources.push(path);
+                        input_root_directories.extend(directories);
+                    }
                     Ok(_) => {}
                     Err(e) if e.kind() == ErrorKind::NotFound => {}
                     Err(e) => {
@@ -6503,15 +6507,33 @@ foo.rs:
         }
 
         #[test]
-        fn test_dependency_sources_with_parent_components_compile_locally() {
+        fn test_dependency_sources_with_parent_components_keep_traversed_directories() {
             let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta", "foo-0.d"]);
-            fs::write(deps.join("foo-0.d"), "output: src/../lib.rs\n").unwrap();
+            let source = create_file(&root, "src/foo.rs", |_| Ok(())).unwrap();
+            fs::create_dir(root.join("src/bits")).unwrap();
+            fs::write(deps.join("foo-0.d"), "output: src/bits/../foo.rs\n").unwrap();
             let foo = deps.join("libfoo-0.rmeta");
             let mut compilation = compilation_with_externs(&root, &[&foo]);
             compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![])]));
+            let mapped = map_for_reapi(&compilation).unwrap();
+            assert!(mapped.input_root_files.contains(&source));
+            assert_eq!(["src/bits"], mapped.input_root_directories.as_slice());
+        }
+
+        #[test]
+        fn test_source_paths_keep_traversed_directories() {
+            let (_tempdir, root, _) = deps_dir_with(&[]);
+            let source = create_file(&root, "src/foo.rs", |_| Ok(())).unwrap();
+            fs::create_dir_all(root.join("src/sys/bits")).unwrap();
+            let mut compilation = compilation_with_externs(&root, &[]);
+            compilation
+                .inputs
+                .push(root.join("src/sys/bits/../../foo.rs"));
+            let mapped = map_for_reapi(&compilation).unwrap();
+            assert!(mapped.input_root_files.contains(&source));
             assert_eq!(
-                map_for_reapi(&compilation).unwrap_err().reason,
-                CompileLocallyReason::SourceOutsideInputRoot
+                ["src/sys", "src/sys/bits"],
+                mapped.input_root_directories.as_slice()
             );
         }
 
