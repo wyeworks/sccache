@@ -22,7 +22,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataValue};
+use tonic::GrpcMethod;
+use tonic::metadata::{
+    AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataKey, BinaryMetadataValue,
+};
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -77,8 +80,8 @@ pub(crate) struct ConnectOptions {
     pub(crate) auth_token: Option<Arc<AuthToken>>,
     /// Sent with every request.
     pub(crate) headers: BTreeMap<String, String>,
-    /// Prints headers that are sent with every request, in place of `headers` of the same
-    /// name.
+    /// Prints headers that are sent with every request to a gRPC service, in place of
+    /// `headers` of the same name.
     pub(crate) credential_helper: Option<Arc<CredentialHelper>>,
     /// Sent in every request's `RequestMetadata`, so that the server can tell this sccache
     /// server's calls from those of earlier runs and other clients.
@@ -115,7 +118,15 @@ impl Interceptor for HeadersInterceptor {
             request.metadata_mut().insert(name.clone(), value.clone());
         }
         if let Some(credential_helper) = &self.credential_helper {
-            let headers = credential_helper.headers();
+            // tonic's generated clients put each call's service in its extensions.
+            let service =
+                (request.extensions().get::<GrpcMethod<'static>>()).map(|method| method.service());
+            let service = service.unwrap_or_default();
+            let headers = credential_helper.headers(service).ok_or_else(|| {
+                tonic::Status::internal(format!(
+                    "no credential helper headers for the gRPC service {service:?}"
+                ))
+            })?;
             for (i, (name, value)) in headers.iter().enumerate() {
                 if headers[..i].iter().any(|(earlier, _)| earlier == name) {
                     request.metadata_mut().append(name.clone(), value.clone());
@@ -403,10 +414,9 @@ fn request_headers(
     Ok(headers)
 }
 
-/// The URI a credential helper gets for `endpoint`: `https://<host>[:<port>]` without port
-/// 443. One helper run covers every gRPC service, so the URI has no path. Bazel adds the
-/// service's name as the path and runs the helper separately for each service.
-pub(super) fn credential_helper_uri(endpoint: &str) -> Result<String> {
+/// `https://<host>[:<port>]` for `endpoint`, without port 443, as Bazel starts the URIs it
+/// gives a credential helper. Each gRPC service's URI adds the service's name as the path.
+pub(super) fn credential_helper_server_uri(endpoint: &str) -> Result<String> {
     let uri: http::Uri = parse_endpoint(endpoint)?.http_url.parse()?;
     let authority = uri
         .authority()
@@ -420,6 +430,9 @@ pub(super) fn credential_helper_uri(endpoint: &str) -> Result<String> {
 
 /// `name` as a header name, if it's valid and gRPC or HTTP/2 doesn't own it.
 pub(super) fn header_key(name: &str) -> Result<AsciiMetadataKey> {
+    if BinaryMetadataKey::from_bytes(name.as_bytes()).is_ok() {
+        bail!("the REAPI header {name:?} is binary, and sccache sends only text headers");
+    }
     let key = AsciiMetadataKey::from_bytes(name.as_bytes())
         .with_context(|| format!("the REAPI header name {name:?} is not valid"))?;
     // tonic drops or replaces some, and HTTP/2 refuses requests that have the others.
@@ -671,7 +684,7 @@ pub(super) mod test {
     use super::*;
     use crate::reapi::auth_token::test::{read_again_now, token_file};
     #[cfg(unix)]
-    use crate::reapi::credential_helper::test::script_helper;
+    use crate::reapi::credential_helper::test::{script_helper, uri_helper};
     use crate::reapi::proto::build::bazel::semver::SemVer;
     use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1091,8 +1104,8 @@ pub(super) mod test {
     #[test_case("grpcs://farm.example.com:443", "https://farm.example.com" ; "default port")]
     #[test_case("grpc://10.0.0.1:8980", "https://10.0.0.1:8980" ; "plain text")]
     #[test_case("grpcs://[::1]:8443/", "https://[::1]:8443" ; "ipv6 with a slash")]
-    fn test_the_credential_helper_gets_the_endpoint_as_an_https_uri(endpoint: &str, uri: &str) {
-        assert_eq!(uri, credential_helper_uri(endpoint).unwrap());
+    fn test_the_credential_helper_uris_start_with_the_endpoint_as_https(endpoint: &str, uri: &str) {
+        assert_eq!(uri, credential_helper_server_uri(endpoint).unwrap());
     }
 
     #[cfg(unix)]
@@ -1128,8 +1141,31 @@ pub(super) mod test {
         assert_eq!("t", metadata.get("x-tenant").unwrap());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_call_carries_the_headers_the_helper_printed_for_its_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential_helper = Arc::new(uri_helper(dir.path()));
+        credential_helper.renew().await.unwrap();
+        let fake = FakeCapabilities::default();
+        let metadata = fake.metadata.clone();
+        let endpoint = serve_fake(fake).await;
+        Client::connect(&ConnectOptions {
+            credential_helper: Some(credential_helper),
+            ..connect_options(&endpoint)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            "https://farm/build.bazel.remote.execution.v2.Capabilities",
+            metadata.lock().unwrap()[0].get("x-uri").unwrap()
+        );
+    }
+
+    // Header names are case-insensitive, so some cases give a name in mixed case.
     #[test_case("x api key", "hidden", "not valid" ; "invalid name")]
-    #[test_case("x-api-key-bin", "hidden", "not valid" ; "binary name")]
+    #[test_case("x api key-bin", "hidden", "not valid" ; "invalid binary name")]
+    #[test_case("X-Api-Key-Bin", "hidden", "only text headers" ; "binary name")]
     #[test_case("x-api-key", "sec\nret", "control character" ; "control character in the value")]
     #[test_case("x-api-key", "hédden", "non-ASCII" ; "non-ascii value")]
     #[test_case("grpc-timeout", "1S", "reserved" ; "grpc name")]

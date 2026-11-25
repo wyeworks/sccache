@@ -74,7 +74,8 @@ impl Connection {
     }
 
     /// The server's APIs, or why a compile runs locally instead. Waits for a connection
-    /// up to `deadline`.
+    /// up to `deadline`. Once connected, waits for the credential helper to renew expired
+    /// headers, up to the helper's timeout.
     pub(super) async fn server_apis(
         self: &Arc<Self>,
         deadline: Instant,
@@ -90,8 +91,13 @@ impl Connection {
                 let mut state = self.state.lock().await;
                 match &*state {
                     State::Connected(apis) => {
+                        let apis = apis.clone();
+                        drop(state);
+                        // The helper runs in spawned tasks, so dropping a compile's wait doesn't
+                        // kill the helper.
                         self.renew_helper_headers_in_background();
-                        return Ok(apis.clone());
+                        self.wait_for_expired_helper_headers().await;
+                        return Ok(apis);
                     }
                     State::Refused(CompileLocallyReason::CredentialsRefused)
                         if *self.refused_credentials_version.lock().unwrap()
@@ -186,6 +192,14 @@ impl Connection {
             + credential_helper.map_or(0, |credential_helper| credential_helper.version())
     }
 
+    /// Waits for the runs that [`Self::renew_helper_headers_in_background`] started for the
+    /// services whose headers expired.
+    async fn wait_for_expired_helper_headers(&self) {
+        if let Some(credential_helper) = &self.options.credential_helper {
+            credential_helper.wait_for_expired().await;
+        }
+    }
+
     /// Runs the credential helper in the background if its headers are due. While sccache
     /// isn't connected, `connect` runs it instead.
     fn renew_helper_headers_in_background(&self) {
@@ -265,7 +279,9 @@ mod test {
     use crate::reapi::auth_token::AuthToken;
     use crate::reapi::auth_token::test::{read_again_now, token_file};
     #[cfg(unix)]
-    use crate::reapi::credential_helper::test::{runs, script_helper};
+    use crate::reapi::credential_helper::SERVICES;
+    #[cfg(unix)]
+    use crate::reapi::credential_helper::test::{runs, script_body, script_helper};
     use crate::reapi::test::FakeServer;
 
     async fn serve(server: FakeServer) -> (Arc<FakeServer>, Arc<Connection>) {
@@ -498,7 +514,7 @@ mod test {
                 connection.server_apis(in_secs(10)).await.err()
             );
         }
-        assert_eq!(1, runs(dir.path()));
+        assert_eq!(SERVICES.len(), runs(dir.path()));
         assert_eq!(0, capabilities_calls(&server));
     }
 
@@ -509,11 +525,52 @@ mod test {
         let (server, connection) =
             serve_with_helper(FakeServer::default(), dir.path(), r#"{"headers": {}}"#).await;
         let apis = connection.server_apis(in_secs(10)).await.unwrap();
-        assert_eq!(1, runs(dir.path()));
+        assert_eq!(SERVICES.len(), runs(dir.path()));
         connection.credentials_refused(&apis).await;
         connection.server_apis(in_secs(10)).await.unwrap();
-        assert_eq!(2, runs(dir.path()));
+        assert_eq!(2 * SERVICES.len(), runs(dir.path()));
         assert_eq!(2, capabilities_calls(&server));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_compile_waits_for_the_helper_when_its_headers_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, connection) =
+            serve_with_helper(FakeServer::default(), dir.path(), r#"{"headers": {}}"#).await;
+        connection.server_apis(in_secs(10)).await.unwrap();
+        connection.expire_helper_headers();
+        connection.server_apis(Instant::now()).await.unwrap();
+        assert_eq!(2 * SERVICES.len(), runs(dir.path()));
+        assert_eq!(1, capabilities_calls(&server));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_compile_that_stops_waiting_leaves_the_helper_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = r#"{"headers": {}}"#;
+        let (_, connection) = serve_with_helper(FakeServer::default(), dir.path(), output).await;
+        connection.server_apis(in_secs(10)).await.unwrap();
+        let done = dir.path().join("done");
+        let body = script_body(dir.path(), output).replace("printf", "sleep 1\nprintf")
+            + &format!("echo >> '{}'\n", done.display());
+        std::fs::write(dir.path().join("helper"), body).unwrap();
+        connection.expire_helper_headers();
+        let compile = connection.server_apis(in_secs(10));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), compile)
+                .await
+                .is_err()
+        );
+        let finished = || std::fs::read_to_string(&done).map_or(0, |done| done.lines().count());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while finished() < SERVICES.len() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the helper was killed");
     }
 
     #[tokio::test]

@@ -207,7 +207,9 @@ fall back to local compilation. An action that stays queued past
 `SCCACHE_RECACHE` and `SCCACHE_NO_CACHE` bypass the remote cache.
 
 `ready_wait_secs` covers connection and toolchain hashing, which run in the
-background. Compiles that exhaust this wait budget run locally.
+background. Compiles that exhaust this wait budget run locally. Once connected,
+compiles can also wait up to 10 seconds for the credential helper to refresh
+expired headers.
 
 Set `salt` in `[reapi]` to start using a different set of Action Cache entries,
 for example after changing the worker environment. Use `[reapi.platform]` for
@@ -217,6 +219,7 @@ changing either changes the action digest.
 Use `auth_token_file` for a bearer token or `credential_helper` for a
 [Bazel credential helper](https://github.com/EngFlow/credential-helper-spec).
 The helper must be an absolute path or a program on the server's `PATH`.
+sccache asks it for headers for each gRPC service using Bazel's URI format.
 Replace token files atomically. The server checks for changes at most every
 10 seconds and keeps the last valid token after a failed read.
 
