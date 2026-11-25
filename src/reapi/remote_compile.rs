@@ -15,12 +15,13 @@
 //! Rust worker commands, toolchain inputs and output restoration.
 
 use super::cas::{Blob, Cas};
-use super::digest::{self, DigestCache};
+use super::digest::{self, DigestCache, FileStamp};
 use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{
     BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR, input_root_path,
     normalize_absolute,
 };
+use super::mapping::{StampedFile, ToolchainKey};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::config::ReapiConfig;
 use crate::errors::*;
@@ -285,14 +286,11 @@ impl std::fmt::Display for UnusableToolchain {
 
 impl std::error::Error for UnusableToolchain {}
 
-/// rustc, its shared libraries, and `target_triple`'s std and bundled linker from
-/// `sysroot`, as input root files under [`TOOLCHAIN_DIR`] paired with their local paths.
-/// Hashing and directory traversal block; call from a blocking thread.
-pub(super) fn toolchain_files(
+/// Lists and stamps the toolchain files that will be sent to the worker.
+pub(super) fn list_toolchain_files(
     sysroot: &Path,
     target_triple: &str,
-    digest_cache: &DigestCache,
-) -> Result<Vec<(InputRootFile, PathBuf)>> {
+) -> Result<Vec<StampedFile>> {
     let sysroot = normalize_absolute(sysroot)
         .context("the toolchain sysroot must be absolute and contain no parent components")?;
     let mut components = Path::new(target_triple).components();
@@ -303,24 +301,12 @@ pub(super) fn toolchain_files(
         bail!("invalid toolchain target triple");
     }
     let mut files = vec![];
-    let mut add = |local_path: PathBuf, is_executable: bool| -> Result<()> {
-        let path_in_sysroot = local_path
-            .strip_prefix(&sysroot)
-            .with_context(|| format!("{} outside {}", local_path.display(), sysroot.display()))?;
-        let path_in_sysroot = input_root_path(path_in_sysroot).ok_or_else(|| {
-            Error::new(UnusableToolchain(
-                CompileLocallyReason::NonUtf8ToolchainPath,
-            ))
-            .context(format!("non-UTF-8 toolchain path {}", local_path.display()))
-        })?;
-        // Flatten symlinks while preserving their names in the worker layout.
-        let digest = digest_cache.digest_and_pin(&local_path)?;
-        let file = InputRootFile {
-            path: format!("{TOOLCHAIN_DIR}/{path_in_sysroot}"),
-            digest,
+    let mut add = |path: PathBuf, is_executable| -> Result<()> {
+        files.push(StampedFile {
+            stamp: FileStamp::of(&path)?,
+            path,
             is_executable,
-        };
-        files.push((file, local_path));
+        });
         Ok(())
     };
     let require = |path: &Path, directory: bool, detail: String| -> Result<()> {
@@ -400,8 +386,44 @@ pub(super) fn toolchain_files(
                 .with_context(|| format!("reading toolchain directory {}", linker_dir.display()));
         }
     }
-    files.sort_by(|(a, _), (b, _)| a.path.cmp(&b.path));
+    files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+/// Hashes the files recorded in the toolchain key. Call from a blocking thread.
+pub(super) fn toolchain_files(
+    toolchain: &ToolchainKey,
+    digest_cache: &DigestCache,
+) -> Result<Vec<(InputRootFile, PathBuf)>> {
+    let sysroot = &toolchain.sysroot;
+    let Some(files) = &toolchain.files else {
+        list_toolchain_files(sysroot, &toolchain.target_triple)?;
+        bail!(
+            "the toolchain in {} changed while it was listed",
+            sysroot.display()
+        );
+    };
+    files
+        .iter()
+        .map(|file| {
+            let relative = file.path.strip_prefix(sysroot).with_context(|| {
+                format!("{} outside {}", file.path.display(), sysroot.display())
+            })?;
+            let relative = input_root_path(relative).ok_or_else(|| {
+                Error::new(UnusableToolchain(
+                    CompileLocallyReason::NonUtf8ToolchainPath,
+                ))
+                .context(format!("non-UTF-8 toolchain path {}", file.path.display()))
+            })?;
+            // Flatten symlinks while preserving their names in the worker layout.
+            let entry = InputRootFile {
+                path: format!("{TOOLCHAIN_DIR}/{relative}"),
+                digest: digest_cache.digest_and_pin(&file.path)?,
+                is_executable: file.is_executable,
+            };
+            Ok((entry, file.path.clone()))
+        })
+        .collect()
 }
 
 // Embedded worker paths make binary outputs unusable on the client.
@@ -814,6 +836,10 @@ fn exit_status_from_code(exit_code: u8) -> process::ExitStatus {
 
 #[cfg(test)]
 pub(super) mod test {
+    fn toolchain_key(sysroot: &Path, target: &str) -> ToolchainKey {
+        ToolchainKey::new("abc123".to_owned(), sysroot.to_owned(), target.to_owned())
+    }
+
     use super::*;
     use crate::reapi::test::FakeServer;
     use crate::reapi::{ActionEnv, PathMapper, ToolchainKey};
@@ -923,8 +949,11 @@ Arch = "amd64"
         let digest_cache = DigestCache::load(dir.join("digests.json"));
         change(&mut compile);
         let files = digest_input_root_files(&compile, &digest_cache).unwrap();
-        let toolchain =
-            toolchain_files(sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
+        let toolchain = toolchain_files(
+            &toolchain_key(sysroot, "x86_64-unknown-linux-gnu"),
+            &digest_cache,
+        )
+        .unwrap();
         action_blobs(&compile, &files, &toolchain, &ActionOptions::default())
             .unwrap()
             .action_digest
@@ -943,7 +972,8 @@ Arch = "amd64"
         compile.input_root_files.push(source);
         let cache = DigestCache::load(dir.path().join("digests.json"));
         let files = digest_input_root_files(&compile, &cache).unwrap();
-        let toolchain = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &cache).unwrap();
+        let toolchain =
+            toolchain_files(&toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"), &cache).unwrap();
         let action_blobs =
             action_blobs(&compile, &files, &toolchain, &ActionOptions::default()).unwrap();
         let blobs: std::collections::HashMap<_, _> = action_blobs.blobs.into_iter().collect();
@@ -1824,7 +1854,11 @@ Arch = "amd64"
         .unwrap();
         let digest_cache = DigestCache::load(dir.path().join("digests"));
 
-        let entries = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
+        let entries = toolchain_files(
+            &toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"),
+            &digest_cache,
+        )
+        .unwrap();
         for (file, local_path) in &entries {
             assert_eq!(
                 file.digest,
@@ -1863,7 +1897,11 @@ Arch = "amd64"
         let dir = tempfile::tempdir().unwrap();
         let sysroot = fake_sysroot(dir.path());
         let digest_cache = DigestCache::load(dir.path().join("digests"));
-        let e = toolchain_files(&sysroot, "aarch64-apple-darwin", &digest_cache).unwrap_err();
+        let e = toolchain_files(
+            &toolchain_key(&sysroot, "aarch64-apple-darwin"),
+            &digest_cache,
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("has no std"), "{e:#}");
         assert!(matches!(
             e.downcast_ref(),
@@ -1877,7 +1915,11 @@ Arch = "amd64"
         let sysroot = fake_sysroot(dir.path());
         fs::remove_file(sysroot.join("bin/rustc")).unwrap();
         let digest_cache = DigestCache::load(dir.path().join("digests"));
-        let e = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap_err();
+        let e = toolchain_files(
+            &toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"),
+            &digest_cache,
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("no rustc"), "{e:#}");
         assert!(matches!(
             e.downcast_ref(),
@@ -1893,11 +1935,12 @@ Arch = "amd64"
         let cache = DigestCache::load(dir.path().join("digests"));
         let root_digest = |location: &str| {
             let sysroot = fake_sysroot(&dir.path().join(location));
-            let files: Vec<_> = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &cache)
-                .unwrap()
-                .into_iter()
-                .map(|(file, _)| file)
-                .collect();
+            let files: Vec<_> =
+                toolchain_files(&toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"), &cache)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(file, _)| file)
+                    .collect();
             InputRoot::build(&files).unwrap().digest
         };
         assert_eq!(root_digest("first"), root_digest("second/elsewhere"));
@@ -1912,7 +1955,8 @@ Arch = "amd64"
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join("libstd-other.rlib"), b"other target").unwrap();
         let cache = DigestCache::load(dir.path().join("digests"));
-        let files = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &cache).unwrap();
+        let files =
+            toolchain_files(&toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"), &cache).unwrap();
         assert_eq!(files.len(), 4);
         assert!(files.iter().all(|(file, _)| !file.path.contains("aarch64") && !file.path.ends_with("rust-lld")));
     }
@@ -1927,7 +1971,7 @@ Arch = "amd64"
     fn test_invalid_target_paths_are_rejected(target: &str) {
         let dir = tempfile::tempdir().unwrap();
         let cache = DigestCache::load(dir.path().join("digests"));
-        let error = toolchain_files(dir.path(), target, &cache).unwrap_err();
+        let error = toolchain_files(&toolchain_key(dir.path(), target), &cache).unwrap_err();
         assert_eq!(error.to_string(), "invalid toolchain target triple");
     }
 
@@ -1936,7 +1980,8 @@ Arch = "amd64"
         let dir = tempfile::tempdir().unwrap();
         let cache = DigestCache::load(dir.path().join("digests"));
         for path in [PathBuf::from("sysroot"), dir.path().join("../sysroot")] {
-            let error = toolchain_files(&path, "x86_64-unknown-linux-gnu", &cache).unwrap_err();
+            let error = toolchain_files(&toolchain_key(&path, "x86_64-unknown-linux-gnu"), &cache)
+                .unwrap_err();
             assert!(
                 error
                     .to_string()
@@ -1967,7 +2012,8 @@ Arch = "amd64"
         )
         .unwrap();
         let cache = DigestCache::load(dir.path().join("digests"));
-        let error = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &cache).unwrap_err();
+        let error = toolchain_files(&toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"), &cache)
+            .unwrap_err();
         assert!(
             error.to_string().contains("non-UTF-8 toolchain path"),
             "{error:#}"
@@ -1993,7 +2039,8 @@ Arch = "amd64"
             _ => unreachable!(),
         }
         let cache = DigestCache::load(dir.path().join("digests"));
-        let error = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &cache).unwrap_err();
+        let error = toolchain_files(&toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"), &cache)
+            .unwrap_err();
         let expected = if kind == "driver" {
             "reading toolchain library"
         } else {

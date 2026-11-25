@@ -47,44 +47,30 @@ pub(crate) struct ToolchainKey {
     pub(crate) commit_hash: String,
     pub(crate) sysroot: PathBuf,
     pub(crate) target_triple: String,
-    stamps: Vec<(PathBuf, Option<FileStamp>)>,
+    pub(super) files: Option<Vec<StampedFile>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct StampedFile {
+    pub(super) path: PathBuf,
+    pub(super) stamp: FileStamp,
+    pub(super) is_executable: bool,
 }
 
 impl ToolchainKey {
     /// Reads the stamps, so call it from a blocking thread.
     pub(crate) fn new(commit_hash: String, sysroot: PathBuf, target_triple: String) -> Self {
-        let mut stamps = vec![];
-        let target = sysroot.join("lib/rustlib").join(&target_triple);
-        for (root, depth) in [
-            (sysroot.join("bin/rustc"), 0),
-            (sysroot.join("lib"), 1),
-            (target.join("lib"), usize::MAX),
-            (target.join("bin"), usize::MAX),
-        ] {
-            for entry in walkdir::WalkDir::new(root)
-                .follow_links(true)
-                .max_depth(depth)
-            {
-                let path = match entry {
-                    Ok(entry) => entry.into_path(),
-                    Err(error) => {
-                        if let Some(path) = error.path() {
-                            stamps.push((path.to_owned(), None));
-                        }
-                        continue;
-                    }
-                };
-                let stamp = FileStamp::of(&path).ok();
-                stamps.push((path, stamp));
-            }
-        }
-        stamps.sort_by(|a, b| a.0.cmp(&b.0));
-        ToolchainKey {
+        let files = super::remote_compile::list_toolchain_files(&sysroot, &target_triple).ok();
+        Self {
             commit_hash,
             sysroot,
             target_triple,
-            stamps,
+            files,
         }
+    }
+
+    pub(super) fn stamps(&self) -> impl Iterator<Item = &FileStamp> {
+        self.files.iter().flatten().map(|file| &file.stamp)
     }
 }
 
@@ -453,7 +439,7 @@ mod test {
     #[test]
     fn test_toolchain_key_tracks_added_targets_and_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let sysroot = dir.path().join("sysroot");
+        let sysroot = crate::reapi::remote_compile::test::fake_sysroot(dir.path());
         let key = |commit: &str, target: &str| {
             ToolchainKey::new(commit.into(), sysroot.clone(), target.into())
         };

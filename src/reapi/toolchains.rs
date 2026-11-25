@@ -102,16 +102,19 @@ impl Toolchains {
     fn spawn_hash(self: &Arc<Self>, key: ToolchainKey) {
         let this = self.clone();
         tokio::spawn(async move {
-            let (sysroot, target_triple, digest_cache) = (
-                key.sysroot.clone(),
-                key.target_triple.clone(),
-                this.digest_cache.clone(),
-            );
+            let settling_time = this.digest_cache.settling_time(key.stamps());
+            if !settling_time.is_zero() {
+                tokio::time::sleep(settling_time).await;
+            }
+            let digest_cache = this.digest_cache.clone();
             let expected_key = key.clone();
             let hashed = tokio::task::spawn_blocking(move || {
-                let files = toolchain_files(&sysroot, &target_triple, &digest_cache)?;
-                if ToolchainKey::new(expected_key.commit_hash.clone(), sysroot, target_triple)
-                    != expected_key
+                let files = toolchain_files(&expected_key, &digest_cache)?;
+                if ToolchainKey::new(
+                    expected_key.commit_hash.clone(),
+                    expected_key.sysroot.clone(),
+                    expected_key.target_triple.clone(),
+                ) != expected_key
                 {
                     bail!("toolchain changed while hashing");
                 }
@@ -186,6 +189,19 @@ mod test {
 
     fn in_secs(secs: u64) -> Instant {
         Instant::now() + Duration::from_secs(secs)
+    }
+
+    #[tokio::test]
+    async fn test_a_toolchain_that_just_changed_is_hashed_once_its_files_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(dir.path());
+        let settling_time = Duration::from_millis(500);
+        let digest_cache =
+            DigestCache::load(dir.path().join("digests.json")).with_min_age_to_cache(settling_time);
+        let toolchains = Toolchains::new(Arc::new(digest_cache));
+        let started = Instant::now();
+        toolchains.files(&key(&sysroot), in_secs(10)).await.unwrap();
+        assert!(started.elapsed() >= settling_time);
     }
 
     #[tokio::test]

@@ -922,12 +922,9 @@ mod test {
             let compile = self.compilation().map_for_reapi().unwrap();
             let digest_cache = DigestCache::load(self.dir.path().join("digests.json"));
             let files = digest_input_root_files(&compile, &digest_cache).unwrap();
-            let toolchain = crate::reapi::remote_compile::toolchain_files(
-                &self.dir.path().join("sysroot"),
-                TARGET_TRIPLE,
-                &digest_cache,
-            )
-            .unwrap();
+            let toolchain =
+                crate::reapi::remote_compile::toolchain_files(&compile.toolchain, &digest_cache)
+                    .unwrap();
             let action_digest = action_blobs(
                 &compile,
                 &files,
@@ -945,10 +942,18 @@ mod test {
             self.server.insert_action_result(&action_digest, result);
         }
 
+        fn executor(&self) -> ReapiExecutor {
+            let mut executor = ReapiExecutor::new(&self.config, &[]);
+            let digest_cache = DigestCache::load(self.config.cache_dir.join(DIGEST_CACHE_FILE));
+            executor.digest_cache = Arc::new(digest_cache.caching_new_files());
+            executor.toolchains = Toolchains::new(executor.digest_cache.clone());
+            executor
+        }
+
         /// Runs the compile through the executor. A local compile writes `out` to stdout and
         /// `err` to stderr.
         fn compile(&self) -> (DistType, process::Output) {
-            self.compile_with(&ReapiExecutor::new(&self.config, &[]))
+            self.compile_with(&self.executor())
         }
 
         fn advance_time(&self, duration: Duration) {
@@ -1122,7 +1127,7 @@ mod test {
                 ..Default::default()
             },
         );
-        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
+        let mut executor = fixture.executor();
         executor.linux_toolchain = true;
         let (outcome, _) = fixture.compile_with(&executor);
         assert_eq!(outcome, DistType::Reapi(ReapiOutcome::Executed));
@@ -1148,7 +1153,7 @@ mod test {
                 ..Default::default()
             },
         );
-        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
+        let mut executor = fixture.executor();
         executor.linux_toolchain = true;
         for _ in 0..2 {
             assert_eq!(
@@ -1177,7 +1182,7 @@ mod test {
                 ..Default::default()
             },
         );
-        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
+        let mut executor = fixture.executor();
         executor.linux_toolchain = true;
         for _ in 0..2 {
             let (outcome, _) = fixture.compile_with(&executor);
@@ -1201,7 +1206,7 @@ mod test {
             },
         );
         fixture.config.local_slots = std::num::NonZeroUsize::new(1);
-        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
+        let mut executor = fixture.executor();
         executor.linux_toolchain = true;
         for _ in 0..2 {
             assert_eq!(
@@ -1226,7 +1231,7 @@ mod test {
         );
         fixture.config.remote_slots = std::num::NonZeroUsize::new(1);
         fixture.config.queue_timeout_secs = Some(0);
-        let mut executor = ReapiExecutor::new(&fixture.config, &[]);
+        let mut executor = fixture.executor();
         executor.linux_toolchain = true;
         let _slot = executor
             .remote_slots
@@ -1264,7 +1269,7 @@ mod test {
         let fixture = Fixture::clock_controlled();
         fixture.put_result_in_action_cache(|_| {});
         *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
-        let executor = ReapiExecutor::new(&fixture.config, &[]);
+        let executor = fixture.executor();
         for _ in 0..FAILURES_TO_PAUSE {
             assert_eq!(
                 compiled_locally("action cache lookup failed"),
@@ -1306,7 +1311,7 @@ mod test {
     #[test]
     fn test_cache_misses_reset_consecutive_rpc_failures() {
         let fixture = Fixture::new(Eligibility::Eligible);
-        let executor = ReapiExecutor::new(&fixture.config, &[]);
+        let executor = fixture.executor();
         *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE - 1 {
             assert_eq!(
@@ -1337,7 +1342,7 @@ mod test {
     fn test_input_hashing_failures_do_not_reserve_the_recovery_probe() {
         let fixture = Fixture::clock_controlled();
         fixture.put_result_in_action_cache(|_| {});
-        let executor = ReapiExecutor::new(&fixture.config, &[]);
+        let executor = fixture.executor();
         *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE {
             fixture.compile_with(&executor);
@@ -1371,7 +1376,7 @@ mod test {
     ) {
         let fixture = Fixture::new(Eligibility::Eligible);
         fixture.put_result_in_action_cache(change);
-        let executor = ReapiExecutor::new(&fixture.config, &[]);
+        let executor = fixture.executor();
         for _ in 0..=FAILURES_TO_PAUSE {
             let (execution, output) = fixture.compile_with(&executor);
             assert_eq!(compiled_locally(reason), execution);
