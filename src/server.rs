@@ -1252,13 +1252,29 @@ where
 
     /// Get info and stats about the cache.
     async fn get_info(&self) -> Result<ServerInfo> {
-        let stats = self.stats.lock().await.clone();
+        let stats = {
+            let current = self.stats.lock().await;
+            #[allow(unused_mut)]
+            let mut snapshot = current.clone();
+            #[cfg(feature = "reapi")]
+            if let Some(executor) = &self.dist_client.reapi {
+                let reapi = snapshot.reapi.get_or_insert_default();
+                (reapi.action_cache_lookups, reapi.action_cache_misses) =
+                    executor.action_cache_counts();
+            }
+            snapshot
+        };
         ServerInfo::new(stats, Some(&*self.storage)).await
     }
 
     /// Zero stats about the cache.
     async fn zero_stats(&self) {
-        *self.stats.lock().await = ServerStats::default();
+        let mut stats = self.stats.lock().await;
+        *stats = ServerStats::default();
+        #[cfg(feature = "reapi")]
+        if let Some(executor) = &self.dist_client.reapi {
+            executor.zero_action_cache_counts();
+        }
     }
 
     /// Snapshot and reset the current stats (used by client-side processes before exit).
@@ -1919,11 +1935,17 @@ pub struct ReapiStats {
     pub executions: u64,
     /// Compilations that ran locally, by reason.
     pub local_compilations: HashMap<String, usize>,
+    #[serde(default)]
+    pub action_cache_lookups: u64,
+    #[serde(default)]
+    pub action_cache_misses: u64,
 }
 
 impl std::ops::AddAssign for ReapiStats {
     fn add_assign(&mut self, rhs: ReapiStats) {
         self.action_cache_hits += rhs.action_cache_hits;
+        self.action_cache_lookups += rhs.action_cache_lookups;
+        self.action_cache_misses += rhs.action_cache_misses;
         self.executions += rhs.executions;
         for (k, v) in rhs.local_compilations {
             *self.local_compilations.entry(k).or_default() += v;
@@ -2200,7 +2222,22 @@ impl ServerStats {
             "Failed distributed compilations"
         );
         if let Some(reapi) = &self.reapi {
+            set_stat!(
+                stats_vec,
+                reapi.action_cache_lookups,
+                "REAPI action cache lookups"
+            );
+            set_stat!(
+                stats_vec,
+                reapi.action_cache_misses,
+                "REAPI action cache misses"
+            );
             set_stat!(stats_vec, reapi.executions, "REAPI executions");
+            set_stat!(
+                stats_vec,
+                reapi.local_compilations.values().sum::<usize>(),
+                "REAPI local fallbacks"
+            );
             set_stat!(
                 stats_vec,
                 reapi.action_cache_hits,

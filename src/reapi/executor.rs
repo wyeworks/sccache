@@ -52,6 +52,12 @@ const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 
 type RustcCheck = OnceCell<std::result::Result<(), CompileLocallyReason>>;
 
+#[derive(Clone, Copy, Default)]
+struct ActionCacheCounts {
+    lookups: u64,
+    misses: u64,
+}
+
 pub(crate) struct ReapiExecutor {
     connection: Option<Arc<Connection>>,
     toolchains: Arc<Toolchains>,
@@ -59,6 +65,7 @@ pub(crate) struct ReapiExecutor {
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
     lookup_pause: LookupPause,
+    action_cache_counts: Mutex<ActionCacheCounts>,
     execution_pause: LookupPause,
     on_miss: ReapiOnMiss,
     linux_toolchain: bool,
@@ -102,6 +109,7 @@ impl ReapiExecutor {
             ready_wait,
             sysroot_copies_dir: config.cache_dir.join(SYSROOT_COPIES_DIR),
             lookup_pause: LookupPause::default(),
+            action_cache_counts: Mutex::default(),
             execution_pause: LookupPause::default(),
             on_miss: config.on_miss,
             linux_toolchain: cfg!(target_os = "linux"),
@@ -120,6 +128,15 @@ impl ReapiExecutor {
             rustc_checks: Mutex::default(),
             action_options: Arc::new(ActionOptions::new(config)),
         }
+    }
+
+    pub(crate) fn action_cache_counts(&self) -> (u64, u64) {
+        let counts = self.action_cache_counts.lock().unwrap();
+        (counts.lookups, counts.misses)
+    }
+
+    pub(crate) fn zero_action_cache_counts(&self) {
+        *self.action_cache_counts.lock().unwrap() = ActionCacheCounts::default();
     }
 
     async fn prepare_lookup(
@@ -374,7 +391,15 @@ impl ReapiExecutor {
             .lookup_pause
             .try_lookup()
             .ok_or(CompileLocallyReason::ActionCacheLookupsPaused)?;
-        let cached = match apis.action_cache.get_action_result(action_digest).await {
+        let lookup = apis.action_cache.get_action_result(action_digest).await;
+        {
+            let mut counts = self.action_cache_counts.lock().unwrap();
+            counts.lookups += 1;
+            if matches!(lookup, Ok(None)) {
+                counts.misses += 1;
+            }
+        }
+        let cached = match lookup {
             Ok(cached) => {
                 permit.succeeded();
                 cached

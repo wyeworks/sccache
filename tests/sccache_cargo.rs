@@ -109,6 +109,14 @@ fn main() {
             ("SCCACHE_CLIENT_SIDE".into(), "true".into()),
         ]),
     )?;
+    let output = test_info.show_stats()?;
+    let stats: serde_json::Value = serde_json::from_slice(&output.get_output().stdout)?;
+    assert_eq!(stats["stats"]["reapi"]["action_cache_lookups"], 0);
+    assert_eq!(stats["stats"]["reapi"]["action_cache_misses"], 0);
+    test_info
+        .show_text_stats(false)?
+        .try_stdout(predicate::str::contains("REAPI action cache lookups"))?;
+
     let target = cargo_build(&test_info, &checkout)?;
     let original = fs::read(target.join("debug/libreapi_smoke.rlib"))?;
     assert!(reapi_cache.join("reapi-sysroot-copies").is_dir());
@@ -119,6 +127,8 @@ fn main() {
     let stats = test_info.show_stats()?;
     let stats: serde_json::Value = serde_json::from_slice(&stats.get_output().stdout)?;
     assert_eq!(stats["stats"]["cache_misses"]["counts"]["Rust"], 1);
+    assert_eq!(stats["stats"]["reapi"]["action_cache_lookups"], 1);
+    assert_eq!(stats["stats"]["reapi"]["action_cache_misses"], 1);
     assert_eq!(
         stats["stats"]["reapi"]["local_compilations"]["not in the action cache"],
         1
@@ -170,6 +180,8 @@ fn main() {
     let stats = test_info.show_stats()?;
     let stats: serde_json::Value = serde_json::from_slice(&stats.get_output().stdout)?;
     assert_eq!(stats["stats"]["reapi"]["action_cache_hits"], 1);
+    assert_eq!(stats["stats"]["reapi"]["action_cache_lookups"], 1);
+    assert_eq!(stats["stats"]["reapi"]["action_cache_misses"], 0);
     assert_eq!(farm.lookup_requests.lock().unwrap().len(), 2);
     assert_eq!(farm.read_requests.lock().unwrap().len(), 2);
     assert_eq!(
@@ -211,6 +223,16 @@ fn main() {
         *farm.capabilities_requests.lock().unwrap(),
         vec![("smoke".to_owned(), Some("Bearer test-token".to_owned())); 2]
     );
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg("--zero-stats")
+        .envs(test_info.env.iter().cloned())
+        .assert()
+        .try_success()?;
+    let output = test_info.show_stats()?;
+    let stats: serde_json::Value = serde_json::from_slice(&output.get_output().stdout)?;
+    assert_eq!(stats["stats"]["reapi"]["action_cache_lookups"], 0);
+    assert_eq!(stats["stats"]["reapi"]["action_cache_misses"], 0);
+    assert_eq!(stats["stats"]["reapi"]["action_cache_hits"], 0);
     Ok(())
 }
 

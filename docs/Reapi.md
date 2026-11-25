@@ -25,6 +25,12 @@ OSFamily = "linux"
 
 The `platform` properties pick the workers, and the server's documentation lists the ones it matches on. Each action carries them and the `salt`, so clients with a different salt or platform don't share action cache entries. In a pool with workers of more than one CPU architecture, add the property that tells them apart, such as `Arch` or `ISA`: otherwise an arm64 client's actions can land on amd64 workers, fail there, and then compile locally at every miss.
 
+Run `sccache --show-stats` after a build to see REAPI lookups, cache misses,
+cache hits, worker executions, and local fallback reasons. These counts are
+cumulative. A local sccache hit does not require a remote lookup. Cargo’s
+incremental compilation can also bypass sccache. Use `CARGO_INCREMENTAL=0`
+when testing which Rust compiles reach REAPI.
+
 ## What runs through REAPI
 
 An rlib compile runs through REAPI when:
