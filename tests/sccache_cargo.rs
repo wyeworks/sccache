@@ -88,6 +88,7 @@ fn main() {
             ready_wait_secs: 120,
             salt: String::new(),
             platform: Default::default(),
+            on_miss: Default::default(),
         }),
         client_side_mode: true,
         ..Default::default()

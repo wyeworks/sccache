@@ -191,11 +191,13 @@ instance_name = ""                         # optional
 # cache_dir = "/path/to/reapi-cache"         # optional
 # auth_token_file = "/path/to/token"        # optional bearer-token file
 ready_wait_secs = 0                        # readiness wait; 0 does not wait, max 3600
+on_miss = "execute"                        # use "local" for cache-only access
 ```
 
 REAPI support is under development. Eligible Rust compiles can reuse results
-from the farm's Action Cache and CAS. Cache misses and remote failures compile
-locally. Uploading inputs and executing on workers are not wired in yet.
+from the farm's Action Cache and CAS. On a miss, eligible Linux clients upload
+inputs and execute on workers when the server supports execution. Remote failures
+fall back to local compilation.
 `SCCACHE_RECACHE` and `SCCACHE_NO_CACHE` bypass the remote cache.
 
 `ready_wait_secs` covers connection and toolchain hashing, which run in the

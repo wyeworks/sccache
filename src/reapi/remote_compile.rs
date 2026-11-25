@@ -199,7 +199,6 @@ fn build_action(
 /// its input root, its command and itself.
 pub(super) struct ActionBlobs {
     pub(super) action_digest: remexec::Digest,
-    #[cfg_attr(not(test), expect(dead_code, reason = "compiles don't execute yet"))]
     pub(super) blobs: Vec<(remexec::Digest, Blob)>,
 }
 

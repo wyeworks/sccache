@@ -803,6 +803,16 @@ pub struct ReapiConfig {
     pub salt: String,
     #[serde(default)]
     pub platform: BTreeMap<String, String>,
+    #[serde(default)]
+    pub on_miss: ReapiOnMiss,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReapiOnMiss {
+    #[default]
+    Execute,
+    Local,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3133,6 +3143,7 @@ key_prefix = "cosprefix"
                 ready_wait_secs: 5,
                 salt: "v1".into(),
                 platform: [("OSFamily".into(), "linux".into())].into(),
+                on_miss: Default::default(),
             }),
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3691,6 +3702,7 @@ endpoint = "grpcs://farm.example.com:443"
             ready_wait_secs: 0,
             salt: String::new(),
             platform: Default::default(),
+            on_miss: Default::default(),
         }),
         config.reapi
     );

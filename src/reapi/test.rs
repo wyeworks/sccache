@@ -48,6 +48,7 @@ type RpcResult<T> = std::result::Result<Response<T>, Status>;
 #[derive(Default)]
 pub(crate) struct FakeServer {
     /// The files each execution writes, by output path; only declared ones count.
+    pub(crate) executes_actions: bool,
     pub(crate) worker_outputs: HashMap<String, Vec<u8>>,
     pub(crate) execute_calls: AtomicUsize,
     pub(crate) actions_run: AtomicUsize,
@@ -318,6 +319,13 @@ impl Capabilities for FakeServer {
             vec![]
         };
         Ok(Response::new(remexec::ServerCapabilities {
+            execution_capabilities: self
+                .executes_actions
+                .then(|| remexec::ExecutionCapabilities {
+                    exec_enabled: true,
+                    digest_functions: vec![remexec::digest_function::Value::Sha256 as i32],
+                    ..Default::default()
+                }),
             cache_capabilities: (!self.without_caching).then(|| remexec::CacheCapabilities {
                 supported_compressors,
                 max_batch_total_size_bytes: self.max_batch_bytes,
@@ -752,6 +760,7 @@ impl FakeServer {
             .collect();
         remexec::ActionResult {
             output_files,
+            stderr_raw: b"sccache-reapi-pwd:/worker\n".to_vec(),
             ..Default::default()
         }
     }

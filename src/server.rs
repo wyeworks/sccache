@@ -1915,6 +1915,8 @@ pub struct ServerStats {
 pub struct ReapiStats {
     #[serde(default)]
     pub action_cache_hits: u64,
+    #[serde(default)]
+    pub executions: u64,
     /// Compilations that ran locally, by reason.
     pub local_compilations: HashMap<String, usize>,
 }
@@ -1922,6 +1924,7 @@ pub struct ReapiStats {
 impl std::ops::AddAssign for ReapiStats {
     fn add_assign(&mut self, rhs: ReapiStats) {
         self.action_cache_hits += rhs.action_cache_hits;
+        self.executions += rhs.executions;
         for (k, v) in rhs.local_compilations {
             *self.local_compilations.entry(k).or_default() += v;
         }
@@ -2052,6 +2055,9 @@ impl ServerStats {
             DistType::Error => self.dist_errors += 1,
             DistType::Reapi(ReapiOutcome::ActionCacheHit) => {
                 self.reapi.get_or_insert_default().action_cache_hits += 1;
+            }
+            DistType::Reapi(ReapiOutcome::Executed) => {
+                self.reapi.get_or_insert_default().executions += 1;
             }
             DistType::Reapi(ReapiOutcome::CompiledLocally(reason)) => {
                 *self
@@ -2194,6 +2200,7 @@ impl ServerStats {
             "Failed distributed compilations"
         );
         if let Some(reapi) = &self.reapi {
+            set_stat!(stats_vec, reapi.executions, "REAPI executions");
             set_stat!(
                 stats_vec,
                 reapi.action_cache_hits,
@@ -2768,6 +2775,7 @@ mod tests {
                 ready_wait_secs: 0,
                 salt: String::new(),
                 platform: Default::default(),
+                on_miss: Default::default(),
             }),
             ..Default::default()
         }

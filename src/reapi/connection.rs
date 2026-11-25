@@ -31,7 +31,6 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 pub(super) struct ServerApis {
     pub(super) cas: Cas,
     pub(super) action_cache: ActionCache,
-    #[expect(dead_code, reason = "compiles do not execute yet")]
     pub(super) execution: Option<Execution>,
 }
 

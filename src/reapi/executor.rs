@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Remote cache lookup with local compilation on a miss or an unusable result.
+//! Remote cache lookup and execution with local fallback.
 
 use super::client::{ConnectOptions, check_connect_options};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
+use super::execution::MissingActionBlobs;
 use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
 use super::remote_compile::{
@@ -27,7 +28,7 @@ use crate::compiler::{
     CacheControl, Cacheable, Compilation, CompileExecutor, CompileOutcome, CompileRequest,
     DistType, PreparedCompile, ReapiOutcome,
 };
-use crate::config::ReapiConfig;
+use crate::config::{ReapiConfig, ReapiOnMiss};
 use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
@@ -49,6 +50,9 @@ pub(crate) struct ReapiExecutor {
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
     lookup_pause: LookupPause,
+    execution_pause: LookupPause,
+    on_miss: ReapiOnMiss,
+    linux_toolchain: bool,
     action_options: Arc<ActionOptions>,
 }
 
@@ -77,6 +81,9 @@ impl ReapiExecutor {
             ready_wait,
             sysroot_copies_dir: config.cache_dir.join(SYSROOT_COPIES_DIR),
             lookup_pause: LookupPause::default(),
+            execution_pause: LookupPause::default(),
+            on_miss: config.on_miss,
+            linux_toolchain: cfg!(target_os = "linux"),
             action_options: Arc::new(ActionOptions::new(config)),
         }
     }
@@ -105,17 +112,16 @@ impl ReapiExecutor {
         apis: Arc<ServerApis>,
         toolchain: ToolchainFiles,
         out_pretty: &str,
-    ) -> std::result::Result<process::Output, CompileLocallyReason> {
+    ) -> std::result::Result<(ReapiOutcome, process::Output), CompileLocallyReason> {
         let digest_cache = self.digest_cache.clone();
         let action_options = self.action_options.clone();
         let digested = tokio::task::spawn_blocking(move || {
             let files = digest_input_root_files(&reapi_compile, &digest_cache)?;
-            let digest =
-                action_blobs(&reapi_compile, &files, &toolchain, &action_options)?.action_digest;
-            Ok::<_, Error>((reapi_compile, digest))
+            let action = action_blobs(&reapi_compile, &files, &toolchain, &action_options)?;
+            Ok::<_, Error>((reapi_compile, action))
         })
         .await;
-        let (reapi_compile, action_digest) = match digested.map_err(Error::from).flatten() {
+        let (reapi_compile, action) = match digested.map_err(Error::from).flatten() {
             Ok(digested) => digested,
             Err(e) => {
                 warn!(
@@ -125,12 +131,13 @@ impl ReapiExecutor {
                 return Err(CompileLocallyReason::HashingInputsFailed);
             }
         };
+        let action_digest = &action.action_digest;
         // Reserve a probe only once hashing and connection setup have finished.
         let permit = self
             .lookup_pause
             .try_lookup()
             .ok_or(CompileLocallyReason::ActionCacheLookupsPaused)?;
-        let cached = match apis.action_cache.get_action_result(&action_digest).await {
+        let cached = match apis.action_cache.get_action_result(action_digest).await {
             Ok(cached) => {
                 permit.succeeded();
                 cached
@@ -145,18 +152,80 @@ impl ReapiExecutor {
                 return Err(CompileLocallyReason::ActionCacheLookupFailed);
             }
         };
-        let result = match cached {
-            Some(result) if result.exit_code == 0 => result,
-            // Treat cached failures as misses; worker failures may be transient.
-            _ => return Err(CompileLocallyReason::NotInActionCache),
+        let (outcome, result) = match cached {
+            Some(result) if result.exit_code == 0 => (ReapiOutcome::ActionCacheHit, result),
+            cached => {
+                let Some(execution) = &apis.execution else {
+                    return Err(CompileLocallyReason::NotInActionCache);
+                };
+                if self.on_miss == ReapiOnMiss::Local {
+                    return Err(CompileLocallyReason::NotInActionCache);
+                }
+                if !self.linux_toolchain {
+                    return Err(CompileLocallyReason::NonLinuxToolchain);
+                }
+                let permit = self
+                    .execution_pause
+                    .try_lookup()
+                    .ok_or(CompileLocallyReason::ExecutionsPaused)?;
+                let skip_cache_lookup = cached.is_some();
+                let deadline = Instant::now() + Duration::from_secs(600);
+                let mut retried = false;
+                let response = loop {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        apis.cas.ensure_uploaded(action.blobs.clone()),
+                    )
+                    .await
+                    {
+                        Err(_) => return Err(CompileLocallyReason::ExecutionTimedOut),
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            warn!("[{out_pretty}]: REAPI input upload failed: {error:#}");
+                            if !error.is::<super::cas::UnreadableBlob>() {
+                                permit.failed();
+                            }
+                            return Err(CompileLocallyReason::UploadFailed);
+                        }
+                    }
+                    match tokio::time::timeout_at(
+                        deadline,
+                        execution.execute_action(action_digest, skip_cache_lookup),
+                    )
+                    .await
+                    {
+                        Err(_) => return Err(CompileLocallyReason::ExecutionTimedOut),
+                        Ok(Err(error)) if !retried && error.is::<MissingActionBlobs>() => {
+                            apis.cas.forget_present_blobs();
+                            retried = true;
+                        }
+                        Ok(Err(error)) => {
+                            warn!("[{out_pretty}]: REAPI execution failed: {error:#}");
+                            permit.failed();
+                            return Err(CompileLocallyReason::ExecutionFailed);
+                        }
+                        Ok(Ok(response)) => break response,
+                    }
+                };
+                permit.succeeded();
+                let result = response
+                    .result
+                    .ok_or(CompileLocallyReason::ExecutionFailed)?;
+                if result.exit_code != 0 {
+                    return Err(CompileLocallyReason::CompileFailedOnWorker);
+                }
+                let outcome = if response.cached_result {
+                    ReapiOutcome::ActionCacheHit
+                } else {
+                    ReapiOutcome::Executed
+                };
+                (outcome, result)
+            }
         };
         match materialize(&apis.cas, &reapi_compile, &result).await {
             Ok(output) => {
-                debug!(
-                    "[{}]: REAPI action cache hit {}",
-                    out_pretty, action_digest.hash
-                );
-                Ok(output)
+                debug!("[{}]: REAPI {outcome:?} {}", out_pretty, action_digest.hash);
+                Ok((outcome, output))
             }
             Err(e) => {
                 let reason = materialize_failure_reason(&e);
@@ -274,9 +343,9 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
             }
         };
         match looked_up {
-            Ok(output) => Ok(CompileOutcome {
+            Ok((outcome, output)) => Ok(CompileOutcome {
                 cacheable: Cacheable::Yes,
-                execution: DistType::Reapi(ReapiOutcome::ActionCacheHit),
+                execution: DistType::Reapi(outcome),
                 output,
             }),
             Err(reason) => compile_locally(request, reason).await,
@@ -407,6 +476,7 @@ mod test {
             ready_wait_secs,
             salt: String::new(),
             platform: Default::default(),
+            on_miss: Default::default(),
         }
     }
 
@@ -438,7 +508,15 @@ mod test {
         }
 
         fn with_runtime(eligibility: Eligibility, runtime: tokio::runtime::Runtime) -> Self {
-            let server = Arc::new(FakeServer::default());
+            Self::with_server(eligibility, runtime, FakeServer::default())
+        }
+
+        fn with_server(
+            eligibility: Eligibility,
+            runtime: tokio::runtime::Runtime,
+            server: FakeServer,
+        ) -> Self {
+            let server = Arc::new(server);
             let mut config = config(runtime.block_on(server.serve()), 10);
             let dir = tempfile::tempdir().unwrap();
             fake_sysroot(dir.path());
@@ -652,6 +730,34 @@ mod test {
             fixture.compile().0,
             compiled_locally("not in the action cache")
         );
+    }
+
+    #[test]
+    fn test_a_cache_miss_uploads_and_executes() {
+        let fixture = Fixture::with_server(
+            Eligibility::Eligible,
+            tokio::runtime::Runtime::new().unwrap(),
+            FakeServer {
+                executes_actions: true,
+                worker_outputs: [(
+                    ".sccache-build/debug/deps/libfoo.rlib".to_owned(),
+                    b"remote rlib".to_vec(),
+                )]
+                .into(),
+                ..Default::default()
+            },
+        );
+        let mut executor = ReapiExecutor::new(&fixture.config);
+        executor.linux_toolchain = true;
+        let (outcome, _) = fixture.compile_with(&executor);
+        assert_eq!(outcome, DistType::Reapi(ReapiOutcome::Executed));
+        assert!(fixture.server.has_blob(b"pub fn f() {}"));
+        assert_eq!(
+            std::fs::read(fixture.dir.path().join("ws").join(RLIB)).unwrap(),
+            b"remote rlib"
+        );
+        let (outcome, _) = fixture.compile_with(&executor);
+        assert_eq!(outcome, DistType::Reapi(ReapiOutcome::ActionCacheHit));
     }
 
     #[test]
