@@ -58,7 +58,7 @@ pub(crate) use bazel_remote_apis as proto;
 pub(crate) use executor::ReapiExecutor;
 
 pub(crate) use mapping::{
-    ActionEnv, CToolchainKey, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile,
-    ToolchainKey, WorkerProgram, normalize_absolute,
+    ActionEnv, CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper,
+    ReapiCompile, ToolchainKey, WorkerProgram, normalize_absolute,
 };
 pub(crate) use sysroot::sysroot_copy;

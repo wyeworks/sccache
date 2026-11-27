@@ -17,7 +17,7 @@
 use super::digest::DigestCache;
 use super::input_root::InputRootFile;
 use super::mapping::{CompileLocallyReason, RustcToolchainKey, ToolchainKey};
-use super::remote_compile::{UnusableToolchain, toolchain_files};
+use super::remote_compile::{UnusableToolchain, c_toolchain_files, toolchain_files};
 use crate::errors::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -112,7 +112,7 @@ impl Toolchains {
         tokio::spawn(async move {
             let settling_time = match &key {
                 ToolchainKey::Rustc(key) => this.digest_cache.settling_time(key.stamps()),
-                ToolchainKey::C(_) => Duration::ZERO,
+                ToolchainKey::C(key) => this.digest_cache.settling_time(key.stamps()),
             };
             if !settling_time.is_zero() {
                 tokio::time::sleep(settling_time).await;
@@ -120,20 +120,27 @@ impl Toolchains {
             let digest_cache = this.digest_cache.clone();
             let expected_key = key.clone();
             let hashed = tokio::task::spawn_blocking(move || {
-                let ToolchainKey::Rustc(expected_key) = expected_key else {
-                    return Err(
-                        UnusableToolchain(CompileLocallyReason::CToolchainUnsupported).into(),
-                    );
+                let files = match &expected_key {
+                    ToolchainKey::Rustc(key) => {
+                        let files = toolchain_files(key, &digest_cache)?;
+                        if RustcToolchainKey::new(
+                            key.commit_hash.clone(),
+                            key.sysroot.clone(),
+                            key.target_triple.clone(),
+                        ) != *key
+                        {
+                            bail!("toolchain changed while hashing");
+                        }
+                        files
+                    }
+                    ToolchainKey::C(key) => {
+                        let files = c_toolchain_files(key, &digest_cache)?;
+                        if !key.stamps_match() {
+                            bail!("toolchain changed while hashing");
+                        }
+                        files
+                    }
                 };
-                let files = toolchain_files(&expected_key, &digest_cache)?;
-                if RustcToolchainKey::new(
-                    expected_key.commit_hash.clone(),
-                    expected_key.sysroot.clone(),
-                    expected_key.target_triple.clone(),
-                ) != expected_key
-                {
-                    bail!("toolchain changed while hashing");
-                }
                 if let Err(e) = digest_cache.save() {
                     warn!("REAPI: failed to save the digest cache: {e:#}");
                 }
@@ -205,16 +212,21 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_c_toolchains_stay_local_until_packaging_is_supported() {
+    async fn test_a_c_toolchain_is_hashed() {
         let dir = tempfile::tempdir().unwrap();
+        let driver = dir.path().join("gcc");
+        std::fs::write(&driver, "#!/bin/sh\n").unwrap();
         let toolchains = toolchains(dir.path(), RETRY_AFTER);
-        let key = ToolchainKey::C(super::super::mapping::CToolchainKey::new(
-            dir.path().join("cc"),
-        ));
-        assert_eq!(
-            Some(CompileLocallyReason::CToolchainUnsupported),
-            toolchains.files(&key, in_secs(10)).await.err()
+        let key = ToolchainKey::C(
+            super::super::mapping::CToolchainKey::new(
+                crate::compiler::CCompilerKind::Gcc,
+                driver,
+                vec![],
+            )
+            .unwrap(),
         );
+        let files = toolchains.files(&key, in_secs(10)).await.unwrap();
+        assert_eq!(1, files.len(), "{files:?}");
     }
 
     #[tokio::test]

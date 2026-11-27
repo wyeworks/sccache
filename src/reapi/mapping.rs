@@ -18,7 +18,9 @@
 //! Paths under a compile's cwd keep their relative path in the input root, and paths
 //! under its build root (cargo's target dir) go under [`BUILD_ROOT_DIR`].
 
+use super::client::{CPP_COMPILE_MNEMONIC, RUSTC_MNEMONIC};
 use super::digest::FileStamp;
+use crate::compiler::CCompilerKind;
 use crate::dist::simplify_path::simplify_path_and_dirs;
 use crate::errors::*;
 use std::ffi::OsString;
@@ -47,6 +49,15 @@ pub(crate) enum WorkerProgram {
         mapped_crate_root: Option<String>,
     },
     C,
+}
+
+impl WorkerProgram {
+    pub(super) fn action_mnemonic(&self) -> &'static str {
+        match self {
+            WorkerProgram::Rustc { .. } => RUSTC_MNEMONIC,
+            WorkerProgram::C => CPP_COMPILE_MNEMONIC,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -78,17 +89,127 @@ impl std::fmt::Display for ToolchainKey {
     }
 }
 
+/// A local gcc or clang: its driver's canonical path, the files besides the driver that it
+/// runs or reads to compile, and the shared libraries they load other than glibc's. The key
+/// includes their stamps, which change when one of them is updated in place.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CToolchainKey {
+    pub(crate) kind: CCompilerKind,
     pub(crate) driver: PathBuf,
-    stamp: Option<FileStamp>,
+    pub(crate) internal_files: Vec<InternalFile>,
+    pub(crate) libraries: Vec<PathBuf>,
+    stamps: Vec<Option<FileStamp>>,
 }
 
 impl CToolchainKey {
-    pub(crate) fn new(driver: PathBuf) -> Self {
-        let stamp = FileStamp::of(&driver).ok();
-        Self { driver, stamp }
+    /// Lists the libraries and reads the stamps, so call it from a blocking thread.
+    pub(crate) fn new(
+        kind: CCompilerKind,
+        driver: PathBuf,
+        internal_files: Vec<InternalFile>,
+    ) -> Result<Self> {
+        let programs = std::iter::once(&driver).chain(
+            (internal_files.iter())
+                .filter(|file| file.is_program())
+                .map(|file| &file.path),
+        );
+        let mut libraries = std::collections::BTreeSet::new();
+        for program in programs {
+            libraries.extend(shared_libraries(program)?);
+        }
+        Ok(Self::with_libraries(
+            kind,
+            driver,
+            internal_files,
+            libraries.into_iter().collect(),
+        ))
     }
+
+    /// Reads the stamps, so call it from a blocking thread.
+    pub(crate) fn with_libraries(
+        kind: CCompilerKind,
+        driver: PathBuf,
+        internal_files: Vec<InternalFile>,
+        libraries: Vec<PathBuf>,
+    ) -> Self {
+        let stamps = std::iter::once(&driver)
+            .chain(internal_files.iter().map(|file| &file.path))
+            .chain(&libraries)
+            .map(|path| FileStamp::of(path).ok())
+            .collect();
+        CToolchainKey {
+            kind,
+            driver,
+            internal_files,
+            libraries,
+            stamps,
+        }
+    }
+    pub(super) fn stamps(&self) -> impl Iterator<Item = &FileStamp> {
+        self.stamps.iter().flatten()
+    }
+
+    pub(super) fn stamps_match(&self) -> bool {
+        std::iter::once(&self.driver)
+            .chain(self.internal_files.iter().map(|file| &file.path))
+            .chain(&self.libraries)
+            .map(|path| FileStamp::of(path).ok())
+            .eq(self.stamps.iter().cloned())
+    }
+}
+
+/// A file that gcc runs or reads to compile.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct InternalFile {
+    /// The driver option that prints its path, such as `-print-prog-name=cc1`.
+    pub(crate) option: String,
+    pub(crate) path: PathBuf,
+}
+
+impl InternalFile {
+    /// Whether the driver runs the file, rather than reading it.
+    pub(crate) fn is_program(&self) -> bool {
+        self.option.starts_with("-print-prog-name=")
+    }
+}
+
+/// Shared libraries of glibc, which must come from the worker: each works only with the loader
+/// and the other libraries of its own glibc.
+#[cfg(target_os = "linux")]
+pub(super) const GLIBC_LIBRARIES: &[&str] = &[
+    "libc.so",
+    "libm.so",
+    "ld-linux",
+    "libpthread.so",
+    "libdl.so",
+    "librt.so",
+];
+
+/// The shared libraries that `program` loads, other than glibc's. A script loads none.
+#[cfg(target_os = "linux")]
+fn shared_libraries(program: &Path) -> Result<Vec<PathBuf>> {
+    let mut magic = [0; 4];
+    let is_elf = std::fs::File::open(program)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+        .is_ok_and(|()| magic == *b"\x7fELF");
+    if !is_elf {
+        return Ok(vec![]);
+    }
+    let libraries = crate::dist::ldd::find_ldd_libraries(program)
+        .with_context(|| format!("failed to list the libraries of {}", program.display()))?;
+    Ok(libraries
+        .into_iter()
+        .filter(|library| {
+            let name = library.file_name().unwrap_or_default().to_string_lossy();
+            !GLIBC_LIBRARIES.iter().any(|glibc| name.starts_with(glibc))
+        })
+        .collect())
+}
+
+/// Workers run Linux, so another OS's compiler never runs there.
+#[cfg(not(target_os = "linux"))]
+fn shared_libraries(_program: &Path) -> Result<Vec<PathBuf>> {
+    Ok(vec![])
 }
 
 /// Identifies a local toolchain for in-memory reuse. File metadata detects updates
@@ -177,6 +298,11 @@ pub(crate) enum CompileLocallyReason {
     RecordedCommandLine,
     ExtraOutput,
     NonUtf8Argument,
+    ColonOrEqualsInPath,
+    MissingGccProgram,
+    SharedLibrariesNotListed,
+    ClangConfigFile,
+    SideOutputOption,
     CToolchainUnsupported,
     RustcDriver,
     WindowsClient,
@@ -253,6 +379,11 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::RecordedCommandLine => "option that records the command line",
             Self::ExtraOutput => "output besides the object and the depfile",
             Self::NonUtf8Argument => "non-UTF-8 argument",
+            Self::ColonOrEqualsInPath => "`:` or `=` in a toolchain dir or the worker root",
+            Self::MissingGccProgram => "gcc without its cc1, cc1plus or as",
+            Self::SharedLibrariesNotListed => "failed to list the compiler's shared libraries",
+            Self::ClangConfigFile => "clang config file",
+            Self::SideOutputOption => "option that writes a file besides the object",
             Self::CToolchainUnsupported => "C toolchain unsupported on workers",
             Self::UnsupportedCompiler => "unsupported compiler",
             Self::WindowsPaths => "Windows paths",

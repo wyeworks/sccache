@@ -21,14 +21,14 @@ use super::mapping::{
     BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR, input_root_path,
     normalize_absolute,
 };
-use super::mapping::{RustcToolchainKey, StampedFile, ToolchainKey, WorkerProgram};
+use super::mapping::{CToolchainKey, RustcToolchainKey, StampedFile, ToolchainKey, WorkerProgram};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::config::ReapiConfig;
 use crate::errors::*;
 use crate::mock_command::exit_status;
 use memchr::memmem;
 use prost::Message;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
@@ -38,6 +38,11 @@ use walkdir::WalkDir;
 
 /// Starts the stderr line where the worker reports the worker root.
 const WORKER_ROOT_MARKER: &str = "sccache-reapi-pwd:";
+
+/// Fails a C script in a worker root with a `:`, which would split `LD_LIBRARY_PATH` and
+/// `COMPILER_PATH`, or a `=`, which would end the old prefix of `-ffile-prefix-map`.
+const EXIT_IF_WORKER_ROOT_HAS_COLON_OR_EQUALS: &str =
+    "case \"$PWD\" in *[:=]*) echo 'sccache: the worker root has a : or =' >&2; exit 1 ;; esac\n";
 
 /// Uses a shell wrapper to expand paths under the worker's physical execution root.
 pub(super) fn build_command(compile: &ReapiCompile) -> Result<remexec::Command> {
@@ -88,6 +93,8 @@ pub(super) fn build_command(compile: &ReapiCompile) -> Result<remexec::Command> 
             "rustc"
         }
         (WorkerProgram::C, ToolchainKey::C(toolchain)) => {
+            script.push_str(EXIT_IF_WORKER_ROOT_HAS_COLON_OR_EQUALS);
+            script.push_str(&c_toolchain_exports(toolchain));
             let driver = toolchain
                 .driver
                 .to_str()
@@ -122,6 +129,42 @@ pub(super) fn build_command(compile: &ReapiCompile) -> Result<remexec::Command> 
         output_paths,
         ..Default::default()
     })
+}
+
+/// The dirs under [`TOOLCHAIN_DIR`] that a worker's `LD_LIBRARY_PATH` and `COMPILER_PATH`
+/// hold for `key`: those of its libraries and of the programs gcc runs.
+fn c_toolchain_path_vars(key: &CToolchainKey) -> [(&'static str, BTreeSet<String>); 2] {
+    let dirs = |paths: &mut dyn Iterator<Item = &PathBuf>| {
+        paths
+            .filter_map(|path| {
+                Some(format!(
+                    "{TOOLCHAIN_DIR}{}",
+                    path.parent()?.to_string_lossy()
+                ))
+            })
+            .collect()
+    };
+    let programs = key.internal_files.iter().filter(|file| file.is_program());
+    [
+        ("LD_LIBRARY_PATH", dirs(&mut key.libraries.iter())),
+        ("COMPILER_PATH", dirs(&mut programs.map(|file| &file.path))),
+    ]
+}
+
+/// Exports that make the input root's copy of the `key` toolchain load its own libraries and
+/// run its own internal programs. gcc finds `as` on `PATH` otherwise, and the worker's would
+/// run.
+fn c_toolchain_exports(key: &CToolchainKey) -> String {
+    let mut exports = "unset GCC_EXEC_PREFIX COMPILER_PATH\n".to_owned();
+    for (name, dirs) in c_toolchain_path_vars(key) {
+        if !dirs.is_empty() {
+            let dirs: Vec<String> = (dirs.iter())
+                .map(|dir| format!("\"$PWD\"/{}", sh_quote(dir)))
+                .collect();
+            exports.push_str(&format!("export {name}={}\n", dirs.join(":")));
+        }
+    }
+    exports
 }
 
 fn command_output_paths(compile: &ReapiCompile) -> Result<Vec<String>> {
@@ -441,6 +484,55 @@ pub(super) fn toolchain_files(
                 is_executable: file.is_executable,
             };
             Ok((entry, file.path.clone()))
+        })
+        .collect()
+}
+
+fn unusable(reason: CompileLocallyReason, detail: String) -> Error {
+    Error::new(UnusableToolchain(reason)).context(detail)
+}
+
+/// `toolchain`'s driver, internal files and libraries, as input root files under
+/// [`TOOLCHAIN_DIR`] at their local absolute paths, paired with those paths. Fails with
+/// [`UnusableToolchain`] for a non-UTF-8 path, or a dir that a worker's path var can't hold.
+pub(super) fn c_toolchain_files(
+    toolchain: &CToolchainKey,
+    digest_cache: &DigestCache,
+) -> Result<Vec<(InputRootFile, PathBuf)>> {
+    for (name, dirs) in c_toolchain_path_vars(toolchain) {
+        if let Some(dir) = dirs.iter().find(|dir| dir.contains([':', '='])) {
+            return Err(unusable(
+                CompileLocallyReason::ColonOrEqualsInPath,
+                format!("{name} would hold {dir}"),
+            ));
+        }
+    }
+    let executables: HashSet<&PathBuf> = std::iter::once(&toolchain.driver)
+        .chain(
+            (toolchain.internal_files.iter())
+                .filter(|file| file.is_program())
+                .map(|file| &file.path),
+        )
+        .collect();
+    let files = toolchain.internal_files.iter().map(|file| &file.path);
+    std::iter::once(&toolchain.driver)
+        .chain(files)
+        .chain(&toolchain.libraries)
+        .map(|local_path| {
+            let path = normalize_absolute(local_path)
+                .and_then(|path| input_root_path(path.strip_prefix("/").ok()?))
+                .ok_or_else(|| {
+                    unusable(
+                        CompileLocallyReason::NonUtf8ToolchainPath,
+                        format!("non-UTF-8 toolchain path {}", local_path.display()),
+                    )
+                })?;
+            let file = InputRootFile {
+                path: format!("{TOOLCHAIN_DIR}/{path}"),
+                digest: digest_cache.digest_and_pin(local_path)?,
+                is_executable: executables.contains(local_path),
+            };
+            Ok((file, local_path.clone()))
         })
         .collect()
 }
@@ -1322,8 +1414,11 @@ Arch = "amd64"
         let compile = ReapiCompile {
             arguments: vec!["-c".to_owned(), "src/x.c".to_owned()],
             program: WorkerProgram::C,
-            toolchain: ToolchainKey::C(super::super::mapping::CToolchainKey::new(
+            toolchain: ToolchainKey::C(CToolchainKey::with_libraries(
+                crate::compiler::CCompilerKind::Gcc,
                 "/usr/bin/gcc".into(),
+                vec![],
+                vec![],
             )),
             ..reapi_compile_in("/home/a/ws")
         };
@@ -1341,6 +1436,70 @@ Arch = "amd64"
             ),
             String::from_utf8(output.stdout).unwrap()
         );
+    }
+
+    fn c_internal_file(option: &str, path: &str) -> crate::reapi::InternalFile {
+        crate::reapi::InternalFile {
+            option: option.to_owned(),
+            path: path.into(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_c_toolchain_files_are_the_driver_its_internal_files_and_libraries() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        for name in ["gcc", "cc1", "specs", "libgmp.so.10"] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        let in_dir = |name: &str| dir.join(name).to_str().unwrap().to_owned();
+        let toolchain = CToolchainKey::with_libraries(
+            crate::compiler::CCompilerKind::Gcc,
+            dir.join("gcc"),
+            vec![
+                c_internal_file("-print-prog-name=cc1", &in_dir("cc1")),
+                c_internal_file("-print-file-name=specs", &in_dir("specs")),
+            ],
+            vec![dir.join("libgmp.so.10")],
+        );
+        let digest_cache = DigestCache::load(dir.join("digests"));
+        let files = c_toolchain_files(&toolchain, &digest_cache).unwrap();
+        let files: Vec<_> = (files.iter())
+            .map(|(file, local_path)| (file.path.clone(), file.is_executable, local_path))
+            .collect();
+        let in_toolchain_dir = |name| format!("{TOOLCHAIN_DIR}{}", in_dir(name));
+        assert_eq!(
+            vec![
+                (in_toolchain_dir("gcc"), true, &dir.join("gcc")),
+                (in_toolchain_dir("cc1"), true, &dir.join("cc1")),
+                (in_toolchain_dir("specs"), false, &dir.join("specs")),
+                (
+                    in_toolchain_dir("libgmp.so.10"),
+                    false,
+                    &dir.join("libgmp.so.10")
+                ),
+            ],
+            files
+        );
+    }
+
+    #[test_case("/opt/a:b/libgmp.so.10", "/usr/bin/cc1" ; "colon in a library dir")]
+    #[test_case("/usr/lib/libgmp.so.10", "/opt/a=b/cc1" ; "equals in a program dir")]
+    fn test_a_c_toolchain_whose_path_var_cant_hold_a_dir_is_unusable(library: &str, cc1: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let toolchain = CToolchainKey::with_libraries(
+            crate::compiler::CCompilerKind::Gcc,
+            "/usr/bin/gcc".into(),
+            vec![c_internal_file("-print-prog-name=cc1", cc1)],
+            vec![library.into()],
+        );
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+        let e = c_toolchain_files(&toolchain, &digest_cache).unwrap_err();
+        assert!(matches!(
+            e.downcast_ref(),
+            Some(UnusableToolchain(CompileLocallyReason::ColonOrEqualsInPath))
+        ));
     }
 
     #[test]
@@ -1898,7 +2057,7 @@ Arch = "amd64"
         let action_digest = digest::of_bytes(b"compile action");
         assert!(
             action_cache
-                .get_action_result(&action_digest)
+                .get_action_result(&action_digest, crate::reapi::client::RUSTC_MNEMONIC)
                 .await
                 .unwrap()
                 .is_none()
@@ -1908,7 +2067,7 @@ Arch = "amd64"
         server.insert_blob(b"rmeta");
         server.insert_action_result(&action_digest, rlib_and_rmeta_result());
         let result = action_cache
-            .get_action_result(&action_digest)
+            .get_action_result(&action_digest, crate::reapi::client::RUSTC_MNEMONIC)
             .await
             .unwrap()
             .unwrap();

@@ -399,7 +399,10 @@ impl ReapiExecutor {
             .lookup_pause
             .try_lookup()
             .ok_or(CompileLocallyReason::ActionCacheLookupsPaused)?;
-        let lookup = apis.action_cache.get_action_result(action_digest).await;
+        let lookup = apis
+            .action_cache
+            .get_action_result(action_digest, reapi_compile.program.action_mnemonic())
+            .await;
         {
             let mut counts = self.action_cache_counts.lock().unwrap();
             counts.lookups += 1;
@@ -470,7 +473,7 @@ impl ReapiExecutor {
                         &apis,
                         execution,
                         &action,
-                        super::client::RUSTC_MNEMONIC,
+                        reapi_compile.program.action_mnemonic(),
                         cached.is_some(),
                         out_pretty,
                     )

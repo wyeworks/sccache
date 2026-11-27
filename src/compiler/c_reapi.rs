@@ -20,8 +20,8 @@
 use crate::compiler::Language;
 use crate::compiler::c::{CCompilerKind, ParsedArguments};
 use crate::reapi::{
-    CToolchainKey, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
-    WorkerProgram, normalize_absolute,
+    CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper, ReapiCompile,
+    ToolchainKey, WorkerProgram, normalize_absolute,
 };
 use anyhow::anyhow;
 use std::ffi::OsString;
@@ -40,6 +40,33 @@ const COMPILER_ENV_VARS: &[&str] = &[
     "GCC_COMPARE_DEBUG",
 ];
 
+/// Prefixes of the options that write files besides the object and the depfile.
+const SIDE_OUTPUT_PREFIXES: &[&str] = &[
+    "-fdump-",
+    "-save-temps",
+    "--save-temps",
+    "-ftime-trace",
+    "-fcallgraph-info",
+    "-fdiagnostics-add-output",
+    "-fdiagnostics-set-output",
+    "-fsave-optimization-record",
+    "-foptimization-record-file",
+];
+
+/// Options that print the path of a file gcc runs or reads to compile: its compilers proper,
+/// its assembler, and its specs file if it has one.
+const GCC_INTERNAL_FILES: &[&str] = &[
+    "-print-prog-name=cc1",
+    "-print-prog-name=cc1plus",
+    "-print-prog-name=as",
+    "-print-file-name=specs",
+];
+
+/// Off while workers can't run a C toolchain, which keeps every C compile local.
+const WORKERS_RUN_C_COMPILES: bool = false;
+
+/// The compile of `parsed_args` by `executable` in `cwd`, mapped for REAPI, or why it runs
+/// locally. Runs the compiler, so call it from a blocking thread.
 pub(super) fn map_for_reapi(
     kind: &CCompilerKind,
     parsed_args: &ParsedArguments,
@@ -47,20 +74,58 @@ pub(super) fn map_for_reapi(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
 ) -> Result<ReapiCompile, NotEligible> {
-    map_compile(kind, parsed_args, executable, cwd, env_vars)?;
-    // Workers can't run gcc or clang without their toolchain in the input root.
-    Err(CompileLocallyReason::CToolchainUnsupported.into())
+    let mapped = map_compile(kind, parsed_args, cwd, env_vars)?;
+    if !WORKERS_RUN_C_COMPILES {
+        return Err(CompileLocallyReason::CToolchainUnsupported.into());
+    }
+    reapi_compile(mapped, kind, parsed_args, executable, cwd, env_vars)
 }
 
-/// The compile of `parsed_args` by `executable` in `cwd`, mapped for REAPI, or why it runs
-/// locally. Reads the driver's stamp, so call it from a blocking thread.
-fn map_compile(
+/// The `ReapiCompile` of `mapped`, with its toolchain.
+fn reapi_compile(
+    mapped: MappedCompile,
     kind: &CCompilerKind,
     parsed_args: &ParsedArguments,
     executable: &Path,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
 ) -> Result<ReapiCompile, NotEligible> {
+    let MappedCompile {
+        path_mapper,
+        arguments,
+        object,
+    } = mapped;
+    let toolchain = toolchain_key(kind, executable, &parsed_args.language, cwd, env_vars)?;
+    if *kind == CCompilerKind::Clang {
+        check_clang_config(executable, &toolchain.driver, cwd, env_vars)?;
+    }
+    Ok(ReapiCompile {
+        path_mapper,
+        arguments,
+        program: WorkerProgram::C,
+        toolchain: ToolchainKey::C(toolchain),
+        env: Default::default(),
+        input_root_files: vec![],
+        input_root_directories: vec![],
+        outputs: vec![object],
+    })
+}
+
+/// A compile's arguments and paths mapped for REAPI.
+struct MappedCompile {
+    path_mapper: PathMapper,
+    arguments: Vec<String>,
+    object: PathBuf,
+}
+
+/// The arguments and paths of the compile of `parsed_args` in `cwd`, mapped for REAPI, or why
+/// it runs locally.
+fn map_compile(
+    kind: &CCompilerKind,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<MappedCompile, NotEligible> {
     // PathMapper doesn't convert Windows paths to the /-separated paths REAPI uses.
     if cfg!(windows) {
         return Err(CompileLocallyReason::WindowsPaths.into());
@@ -120,13 +185,6 @@ fn map_compile(
             anyhow!("{}", object.display()),
         )
     })?;
-    // The worker's command names the driver by its path.
-    if executable.to_str().is_none() {
-        return Err(NotEligible::new(
-            CompileLocallyReason::NonUtf8ToolchainPath,
-            anyhow!("{}", executable.display()),
-        ));
-    }
 
     let mut arguments = vec![
         "-x".to_owned(),
@@ -150,16 +208,121 @@ fn map_compile(
             arguments.push(map_option(arg, &path_mapper)?);
         }
     }
-    Ok(ReapiCompile {
+    Ok(MappedCompile {
         path_mapper,
         arguments,
-        program: WorkerProgram::C,
-        toolchain: ToolchainKey::C(CToolchainKey::new(executable.to_owned())),
-        env: Default::default(),
-        input_root_files: vec![],
-        input_root_directories: vec![],
-        outputs: vec![object],
+        object,
     })
+}
+
+/// The key of `executable`'s toolchain for a `language` compile, or why it runs locally. Runs
+/// the compiler, so call it from a blocking thread.
+pub(crate) fn toolchain_key(
+    kind: &CCompilerKind,
+    executable: &Path,
+    language: &Language,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<CToolchainKey, NotEligible> {
+    // gcc finds its internal programs relative to its canonical path, so a worker runs the
+    // driver from there too.
+    let driver = executable
+        .canonicalize()
+        .unwrap_or_else(|_| executable.to_owned());
+    // The worker's command names the driver by its path.
+    if driver.to_str().is_none() {
+        return Err(NotEligible::new(
+            CompileLocallyReason::NonUtf8ToolchainPath,
+            anyhow!("{}", driver.display()),
+        ));
+    }
+    let mut internal_files = vec![];
+    // clang assembles and compiles in its own process.
+    if *kind == CCompilerKind::Gcc {
+        let compiler_proper = match language {
+            Language::Cxx => "-print-prog-name=cc1plus",
+            _ => "-print-prog-name=cc1",
+        };
+        for option in GCC_INTERNAL_FILES {
+            match internal_file(&driver, option, cwd, env_vars) {
+                Some(file) => internal_files.push(file),
+                // Without its own, a worker would run its gcc's or the one on its `PATH`.
+                None if [compiler_proper, "-print-prog-name=as"].contains(option) => {
+                    return Err(NotEligible::new(
+                        CompileLocallyReason::MissingGccProgram,
+                        anyhow!("{option}"),
+                    ));
+                }
+                None => {}
+            }
+        }
+    }
+    CToolchainKey::new(kind.clone(), driver, internal_files)
+        .map_err(|e| NotEligible::new(CompileLocallyReason::SharedLibrariesNotListed, e))
+}
+
+/// The file `driver` prints for `option`, or `None` if it prints none. gcc prints a bare name
+/// for a program it doesn't find in its own directories, and then runs the one on `PATH`.
+fn internal_file(
+    driver: &Path,
+    option: &str,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Option<InternalFile> {
+    let output = std::process::Command::new(driver)
+        .arg(option)
+        .env_clear()
+        .envs(env_vars.iter().cloned())
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let printed = std::str::from_utf8(&output.stdout).ok()?.trim_end();
+    let mut file = InternalFile {
+        option: option.to_owned(),
+        path: cwd.join(printed),
+    };
+    if !printed.contains('/') {
+        if !file.is_program() {
+            return None;
+        }
+        let path_var = env_vars.iter().find(|(name, _)| name == "PATH")?;
+        file.path = which::which_in(printed, Some(&path_var.1), cwd).ok()?;
+    }
+    if normalize_absolute(&file.path).is_none() {
+        file.path = file.path.canonicalize().ok()?;
+    }
+    file.path.is_file().then_some(file)
+}
+
+/// Fails for a clang that reads a config file when run as `executable` or as `driver`. The
+/// toolchain dir holds none, so a worker's clang wouldn't read it.
+fn check_clang_config(
+    executable: &Path,
+    driver: &Path,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<(), NotEligible> {
+    for program in [executable, driver] {
+        let output = std::process::Command::new(program)
+            .args(["-###", "-c", "-x", "c", "/dev/null", "-o", "/dev/null"])
+            .env_clear()
+            .envs(env_vars.iter().cloned())
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| NotEligible::new(CompileLocallyReason::ClangConfigFile, e.into()))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(line) = stderr
+            .lines()
+            .find(|line| line.starts_with("Configuration file:"))
+        {
+            return Err(NotEligible::new(
+                CompileLocallyReason::ClangConfigFile,
+                anyhow!("{line}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The `PathMapper` of a build script's compile, whose cwd is the package's manifest dir, and
@@ -212,8 +375,8 @@ fn path_mapper(cwd: &Path, env_vars: &[(OsString, OsString)]) -> Result<PathMapp
 }
 
 /// Fails for an option whose compile a worker can't match: one that builds for the client's
-/// CPU, reads files besides the source, records local paths, macros or the command line, or
-/// changes the programs the compiler runs.
+/// CPU, reads files besides the source, writes files besides the object, records local paths,
+/// macros or the command line, or changes the programs the compiler runs.
 fn check_options(parsed_args: &ParsedArguments) -> Result<(), NotEligible> {
     if !parsed_args.arch_args.is_empty() {
         return Err(CompileLocallyReason::ArchOption.into());
@@ -253,9 +416,21 @@ fn check_options(parsed_args: &ParsedArguments) -> Result<(), NotEligible> {
             _ if option.starts_with("-fplugin")
                 || option.starts_with("-fpass-plugin")
                 || option.starts_with("-specs")
+                || option.starts_with("-fauto-profile")
                 || (option.starts_with("-fsanitize") && option.contains("list=")) =>
             {
                 CompileLocallyReason::OptionReadsFile
+            }
+            // A worker's action declares only the object as an output.
+            "-fstack-usage" | "-aux-info" | "-MJ" | "-fdiagnostics-format=sarif-file" => {
+                CompileLocallyReason::SideOutputOption
+            }
+            _ if SIDE_OUTPUT_PREFIXES
+                .iter()
+                .any(|prefix| option.starts_with(prefix))
+                || (option.starts_with("-fopt-info") && option.contains('=')) =>
+            {
+                CompileLocallyReason::SideOutputOption
             }
             "-Xclang" | "-fno-integrated-as" | "-no-integrated-as" | "-wrapper" => {
                 CompileLocallyReason::CompilerInternalsOption
@@ -321,6 +496,7 @@ mod test {
     use super::*;
     use crate::compiler::CompilerArguments;
     use crate::compiler::{clang, gcc};
+    use crate::test::utils::write_executable;
     use CCompilerKind::{Clang, Diab, Gcc};
     use CompileLocallyReason as R;
     use test_case::test_case;
@@ -358,10 +534,9 @@ mod test {
         cwd: &str,
         args: &[&str],
         env: &[(&str, &str)],
-    ) -> Result<ReapiCompile, NotEligible> {
+    ) -> Result<MappedCompile, NotEligible> {
         let parsed_args = parse(kind, Path::new(cwd), args);
-        let (cc, cwd) = (Path::new(CC), Path::new(cwd));
-        map_compile(kind, &parsed_args, cc, cwd, &env_vars(env))
+        map_compile(kind, &parsed_args, Path::new(cwd), &env_vars(env))
     }
 
     /// A `kind` compile in `ws` of `src/x.c` into `out_dir`, with `args` added.
@@ -371,7 +546,7 @@ mod test {
         out_dir: &str,
         args: &[&str],
         env: &[(&str, &str)],
-    ) -> Result<ReapiCompile, NotEligible> {
+    ) -> Result<MappedCompile, NotEligible> {
         let object = format!("{out_dir}/x.o");
         let mut all_args = args.to_vec();
         all_args.extend(["-c", "src/x.c", "-o", object.as_str()]);
@@ -379,12 +554,12 @@ mod test {
     }
 
     /// A `kind` compile of `src/x.c` by a build script, with `args` added.
-    fn map(kind: &CCompilerKind, args: &[&str]) -> Result<ReapiCompile, NotEligible> {
+    fn map(kind: &CCompilerKind, args: &[&str]) -> Result<MappedCompile, NotEligible> {
         map_in(kind, WS, OUT_DIR, args, BUILD_SCRIPT_ENV)
     }
 
-    fn reason(mapped: Result<ReapiCompile, NotEligible>) -> CompileLocallyReason {
-        mapped.map(|compile| compile.arguments).unwrap_err().reason
+    fn reason<T>(mapped: Result<T, NotEligible>) -> CompileLocallyReason {
+        mapped.err().expect("the compile mapped").reason
     }
 
     #[test_case(Diab, &[], R::UnsupportedCompiler ; "other compiler")]
@@ -406,6 +581,12 @@ mod test {
     #[test_case(Clang, &["-include-pch", "x.pch"], R::PrecompiledHeader ; "pch")]
     #[test_case(Clang, &["-fplugin=x.so"], R::OptionReadsFile ; "plugin")]
     #[test_case(Clang, &["-fsanitize-ignorelist=x.txt"], R::OptionReadsFile ; "sanitizer list")]
+    #[test_case(Gcc, &["-fauto-profile=x.afdo"], R::OptionReadsFile ; "auto profile")]
+    #[test_case(Gcc, &["-fdump-tree-all"], R::SideOutputOption ; "dump")]
+    #[test_case(Gcc, &["-aux-info", "x.h"], R::SideOutputOption ; "aux info")]
+    #[test_case(Gcc, &["-fopt-info-vec=x.txt"], R::SideOutputOption ; "opt info file")]
+    #[test_case(Gcc, &["-fdiagnostics-format=sarif-file"], R::SideOutputOption ; "sarif file")]
+    #[test_case(Gcc, &["-fdiagnostics-add-output=sarif"], R::SideOutputOption ; "added output")]
     #[test_case(Gcc, &["-B/opt/bin"], R::CompilerInternalsOption ; "B")]
     #[test_case(Gcc, &["-fno-integrated-as"], R::CompilerInternalsOption ; "no as")]
     #[test_case(Clang, &["-Xclang", "-fno-pch-timestamp"], R::CompilerInternalsOption ; "xclang")]
@@ -506,13 +687,7 @@ mod test {
             ],
             compile.arguments.as_slice()
         );
-        assert_eq!([PathBuf::from(OBJECT)], compile.outputs.as_slice());
-        assert!(matches!(compile.program, WorkerProgram::C));
-        assert!(
-            matches!(&compile.toolchain, ToolchainKey::C(toolchain) if toolchain.driver == Path::new(CC)),
-            "{:?}",
-            compile.toolchain
-        );
+        assert_eq!(Path::new(OBJECT), compile.object);
     }
 
     #[test_case(&["--sysroot", "/opt/x"] ; "separate")]
@@ -544,6 +719,96 @@ mod test {
         let (cc, ws) = (Path::new(CC), Path::new(WS));
         let mapped = map_for_reapi(kind, &parsed_args, cc, ws, &env_vars(BUILD_SCRIPT_ENV));
         assert_eq!(CompileLocallyReason::CToolchainUnsupported, reason(mapped));
+    }
+
+    /// A directory holding a gcc driver that prints `<dir>/cc1` for cc1 and only the name of
+    /// the other programs, of which `as` is in `<dir>/bin`, and the env vars with that dir on
+    /// `PATH`.
+    fn fake_gcc(dir: &Path) -> (PathBuf, Vec<(OsString, OsString)>) {
+        let dir = dir.canonicalize().unwrap();
+        let driver = dir.join("gcc-12");
+        let script = format!(
+            "case \"$1\" in\n-print-prog-name=cc1) echo {}/cc1 ;;\n\
+             *) echo \"${{1#*=}}\" ;;\nesac\n",
+            dir.display()
+        );
+        write_executable(&driver, &script);
+        write_executable(&dir.join("cc1"), "");
+        write_executable(&dir.join("bin/as"), "");
+        std::os::unix::fs::symlink(&driver, dir.join("cc")).unwrap();
+        let env = vec![("PATH".into(), dir.join("bin").into_os_string())];
+        (dir, env)
+    }
+
+    fn internal_file(option: &str, path: PathBuf) -> InternalFile {
+        InternalFile {
+            option: option.to_owned(),
+            path,
+        }
+    }
+
+    #[test]
+    fn test_gcc_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir, env) = fake_gcc(dir.path());
+        let key = || toolchain_key(&Gcc, &dir.join("cc"), &Language::C, &dir, &env).unwrap();
+        let original = key();
+        assert_eq!(dir.join("gcc-12"), original.driver);
+        assert_eq!(
+            [
+                internal_file("-print-prog-name=cc1", dir.join("cc1")),
+                internal_file("-print-prog-name=as", dir.join("bin/as")),
+            ],
+            original.internal_files.as_slice()
+        );
+        assert_eq!(original, key());
+
+        std::fs::write(dir.join("bin/as"), "a newer as").unwrap();
+        assert_ne!(original, key(), "as changed");
+    }
+
+    #[test_case(Language::C, "bin/as", "-print-prog-name=as" ; "assembler")]
+    #[test_case(Language::C, "cc1", "-print-prog-name=cc1" ; "cc1")]
+    #[test_case(Language::Cxx, "", "-print-prog-name=cc1plus" ; "cc1plus")]
+    fn test_a_gcc_without_the_programs_it_runs_stays_local(
+        language: Language,
+        removed: &str,
+        option: &str,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir, env) = fake_gcc(dir.path());
+        if !removed.is_empty() {
+            std::fs::remove_file(dir.join(removed)).unwrap();
+        }
+        let not_eligible = toolchain_key(&Gcc, &dir.join("cc"), &language, &dir, &env).unwrap_err();
+        assert_eq!(R::MissingGccProgram, not_eligible.reason);
+        assert_eq!(option, not_eligible.detail.unwrap().to_string());
+    }
+
+    #[test]
+    fn test_a_clang_key_has_no_internal_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir, env) = fake_gcc(dir.path());
+        let key = toolchain_key(&Clang, &dir.join("cc"), &Language::C, &dir, &env).unwrap();
+        assert!(key.internal_files.is_empty(), "{key:?}");
+    }
+
+    #[test_case("*/cc", true ; "as the executable")]
+    #[test_case("*/clang-18", true ; "as the driver")]
+    #[test_case("*/other", false ; "neither")]
+    fn test_a_clang_that_reads_a_config_file_stays_local(reads_config_as: &str, local: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let script = format!(
+            "case \"$0\" in {reads_config_as}) echo 'Configuration file: /x.cfg' >&2 ;; esac\n"
+        );
+        write_executable(&dir.join("clang-18"), &script);
+        std::os::unix::fs::symlink(dir.join("clang-18"), dir.join("cc")).unwrap();
+        let checked = check_clang_config(&dir.join("cc"), &dir.join("clang-18"), &dir, &[]);
+        assert_eq!(local, checked.is_err(), "{checked:?}");
+        if let Err(not_eligible) = checked {
+            assert_eq!(R::ClangConfigFile, not_eligible.reason);
+        }
     }
 
     #[test]
