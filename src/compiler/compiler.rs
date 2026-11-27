@@ -967,7 +967,7 @@ where
     /// Maps compilation paths for REAPI, or returns why the compile must stay local.
     #[cfg(feature = "reapi")]
     fn map_for_reapi(&self) -> StdResult<ReapiCompile, NotEligible> {
-        Err(CompileLocallyReason::NotRust.into())
+        Err(CompileLocallyReason::UnsupportedCompiler.into())
     }
 
     /// May create a trimmed sysroot, call from a blocking thread.
@@ -3794,7 +3794,7 @@ LLVM version: 6.0",
             #[cfg(feature = "reapi")]
             {
                 let error = request.compilation.map_for_reapi().unwrap_err();
-                assert_eq!(CompileLocallyReason::NotRust, error.reason);
+                assert_eq!(CompileLocallyReason::UnsupportedCompiler, error.reason);
                 assert!(error.detail.is_none());
             }
             request.execute_locally().await

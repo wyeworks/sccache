@@ -46,20 +46,12 @@ pub(crate) enum WorkerProgram {
         /// rustc preserves the spelling of absolute crate-root arguments in its outputs.
         mapped_crate_root: Option<String>,
     },
-    #[cfg_attr(
-        not(all(test, unix)),
-        expect(dead_code, reason = "C compiles are not mapped to REAPI yet")
-    )]
     C,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ToolchainKey {
     Rustc(RustcToolchainKey),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "C compiles are not mapped to REAPI yet")
-    )]
     C(CToolchainKey),
 }
 
@@ -93,8 +85,7 @@ pub(crate) struct CToolchainKey {
 }
 
 impl CToolchainKey {
-    #[cfg(test)]
-    pub(super) fn new(driver: PathBuf) -> Self {
+    pub(crate) fn new(driver: PathBuf) -> Self {
         let stamp = FileStamp::of(&driver).ok();
         Self { driver, stamp }
     }
@@ -169,7 +160,23 @@ impl From<CompileLocallyReason> for NotEligible {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompileLocallyReason {
-    NotRust,
+    UnsupportedCompiler,
+    WindowsPaths,
+    UnsupportedLanguage,
+    LanguageAfterInput,
+    NotFromBuildScript,
+    CompilerEnvVar,
+    ArchOption,
+    PrecompiledHeader,
+    ProfilingOrCoverage,
+    MacroDebugInfo,
+    PrefixMapOption,
+    OptionReadsFile,
+    CompilerInternalsOption,
+    VerboseOutput,
+    RecordedCommandLine,
+    ExtraOutput,
+    NonUtf8Argument,
     CToolchainUnsupported,
     RustcDriver,
     WindowsClient,
@@ -231,8 +238,24 @@ pub(crate) enum CompileLocallyReason {
 impl std::fmt::Display for CompileLocallyReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::UnsupportedLanguage => "language other than C or C++",
+            Self::LanguageAfterInput => "-x after the input",
+            Self::NotFromBuildScript => "not run by a cargo build script",
+            Self::CompilerEnvVar => "env var that changes what the compiler runs",
+            Self::ArchOption => "-arch option",
+            Self::PrecompiledHeader => "precompiled header",
+            Self::ProfilingOrCoverage => "profiling or coverage option",
+            Self::MacroDebugInfo => "debug info with macros",
+            Self::PrefixMapOption => "the compile's own -f*-prefix-map",
+            Self::OptionReadsFile => "option that reads a file besides the source",
+            Self::CompilerInternalsOption => "option passed to the compiler's internal programs",
+            Self::VerboseOutput => "verbose compiler output",
+            Self::RecordedCommandLine => "option that records the command line",
+            Self::ExtraOutput => "output besides the object and the depfile",
+            Self::NonUtf8Argument => "non-UTF-8 argument",
             Self::CToolchainUnsupported => "C toolchain unsupported on workers",
-            Self::NotRust => "not a Rust compile",
+            Self::UnsupportedCompiler => "unsupported compiler",
+            Self::WindowsPaths => "Windows paths",
             Self::RustcDriver => "not rustc",
             Self::WindowsClient => "Windows client",
             Self::Staticlib => "staticlib crate type",
@@ -240,9 +263,9 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::PathOutsideInputRoot => "path outside the cwd and build root",
             Self::SourceOutsideInputRoot => "source file outside the cwd and build root",
             Self::DotDotOutOfSymlink => "input path that steps out of a symlink with `..`",
-            Self::AbsolutePathInOption => "absolute path in a -C or -Z option",
+            Self::AbsolutePathInOption => "absolute path in an option",
             Self::CustomTargetSpec => "custom target spec",
-            Self::NativeCpu => "-C target-cpu=native or -Z tune-cpu=native",
+            Self::NativeCpu => "native CPU option",
             Self::ProfileUse => "-C profile-use or -C profile-sample-use",
             Self::RemapPathPrefix => "--remap-path-prefix",
             Self::NonUtf8EnvVar => "non-UTF-8 env var",
