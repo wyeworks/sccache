@@ -548,7 +548,9 @@ impl PathMapper {
                 error.context(path.display().to_string()),
             )
         })?;
-        self.to_input_root(&normalized).ok_or_else(outside)?;
+        if self.to_input_root(&normalized).is_none() {
+            return Ok(None);
+        }
         let in_build_root = normalized.starts_with(&self.build_root);
         let mut mapped_dirs = Vec::with_capacity(traversed.len());
         for directory in traversed {

@@ -6526,6 +6526,33 @@ foo.rs:
         }
 
         #[test]
+        fn test_external_dependency_sources_with_parent_components_are_skipped() {
+            let (_tempdir, root, deps) = deps_dir_with(&["libfoo-0.rmeta", "foo-0.d"]);
+            let external = tempfile::tempdir().unwrap();
+            fs::create_dir(external.path().join("bits")).unwrap();
+            let source = create_file(external.path(), "lib.rs", |_| Ok(())).unwrap();
+            let traversed = external.path().join("bits/../lib.rs");
+            fs::write(
+                deps.join("foo-0.d"),
+                format!("output: {}\n", traversed.display()),
+            )
+            .unwrap();
+            let foo = deps.join("libfoo-0.rmeta");
+            let mut compilation = compilation_with_externs(&root, &[&foo]);
+            compilation.rlib_dep_reader = Some(rlib_dep_reader(&[(&foo, vec![])]));
+            let mapped = map_for_reapi(&compilation).unwrap();
+            assert!(mapped.input_root_files.contains(&foo));
+            assert!(!mapped.input_root_files.contains(&source));
+            assert!(mapped.input_root_directories.is_empty());
+
+            compilation.inputs.push(traversed);
+            assert_eq!(
+                CompileLocallyReason::SourceOutsideInputRoot,
+                map_for_reapi(&compilation).unwrap_err().reason
+            );
+        }
+
+        #[test]
         fn test_source_paths_keep_traversed_directories() {
             let (_tempdir, root, _) = deps_dir_with(&[]);
             let source = create_file(&root, "src/foo.rs", |_| Ok(())).unwrap();
