@@ -1,6 +1,6 @@
 # REAPI (experimental)
 
-sccache can use a [Remote Execution API](https://github.com/bazelbuild/remote-apis) (REAPI) v2.1 server, such as Buildbarn or NativeLink, for Rust compiles. A compile that misses sccache's cache is looked up in the server's action cache, and on a miss it runs on the server's workers, so that every client gets its result.
+sccache can use a [Remote Execution API](https://github.com/bazelbuild/remote-apis) (REAPI) v2.1 server, such as Buildbarn or NativeLink, for Rust compiles and eligible C and C++ compiles from Cargo build scripts. A compile that misses sccache's cache is looked up in the server's action cache, and on a miss it runs on the server's workers, so that every client gets its result.
 
 ## Build
 
@@ -69,6 +69,29 @@ With it, that rustc's lookups and executions use the Linux toolchain, unless the
 ## Slots
 
 `local_slots` is the most compiles sccache runs locally at once, C and C++ ones included, and also while the server can't be reached. A miss that could execute compiles locally while fewer run, so it never reaches the server's action cache: for other clients to get hits, keep `local_slots` below cargo's `-j`. A miss that finds no free local slot executes once one of `remote_slots` is free, or compiles locally if a local slot frees first, or after `queue_timeout_secs` without a free slot. Without `local_slots`, a miss executes whenever it can, and local compiles run as cargo starts them. Without `remote_slots`, executions aren't limited.
+
+## C and C++ build scripts
+
+Eligible C and C++ compiles from Cargo build scripts, such as those using the
+`cc` crate, can run remotely. They must use GCC or Clang on a Linux client and
+compile one source file to an object. The source and object must be under the
+package directory or Cargo’s build directory. Standalone assembly, archiving,
+and linking run locally.
+
+GCC must be able to find `cc1`, `as`, and `cc1plus` for C++. Clang compiles that
+load a config file stay local. The same applies to options the worker cannot
+reproduce, such as `-march=native`, precompiled headers, coverage, and options
+that read extra files or produce outputs other than an object and a depfile.
+
+The client preprocesses the source and ships the compiler, its helper programs,
+and their shared libraries. Workers need the same CPU architecture and a glibc
+at least as new as the client's. Before executing compiles, sccache checks the
+compiler's target, version, and helper programs on a worker.
+
+On local fallback, sccache tries to produce the same object from the
+preprocessed source. If that fails, it runs the original compiler command.
+Archive tools that record timestamps can reduce remote cache hits for Rust
+crates that bundle the resulting objects.
 
 ## Credentials
 

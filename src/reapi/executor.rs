@@ -16,7 +16,8 @@
 
 use super::auth_token::{self, AuthToken};
 use super::client::{
-    ConnectOptions, check_connect_options, credential_helper_server_uri, rpc_code,
+    CPP_COMPILER_CHECK_MNEMONIC, ConnectOptions, RUSTC_VERSION_MNEMONIC, check_connect_options,
+    credential_helper_server_uri, rpc_code,
 };
 use super::compile_as_worker::CompileAsWorker;
 use super::connection::{Connection, ServerApis};
@@ -27,6 +28,10 @@ use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile, ToolchainKey};
 use super::remote_compile::{
     ActionOptions, action_blobs, digest_input_root_files, materialize, materialize_failure_reason,
+};
+use super::remote_compile::{
+    c_compiler_check_action_blobs, download_stdout_or_stderr, local_c_compiler_answers,
+    rustc_version_action_blobs, worker_c_compiler_answers,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
 use super::worker_toolchains::WorkerToolchains;
@@ -225,9 +230,6 @@ impl ReapiExecutor {
         toolchain: &ToolchainFiles,
         out_pretty: &str,
     ) -> std::result::Result<(), CompileLocallyReason> {
-        let ToolchainKey::Rustc(rustc) = key else {
-            return Err(CompileLocallyReason::CToolchainUnsupported);
-        };
         let check = self
             .toolchain_checks
             .lock()
@@ -239,54 +241,63 @@ impl ReapiExecutor {
             .get_or_try_init(|| async {
                 let files = toolchain.clone();
                 let options = self.action_options.clone();
-                let action = tokio::task::spawn_blocking(move || {
-                    super::remote_compile::rustc_version_action_blobs(&files, &options)
-                })
-                .await
-                .map_err(Error::from)
-                .flatten()
-                .map_err(|error| {
-                    warn!("[{out_pretty}]: failed to prepare the worker rustc check: {error:#}");
+                let (mnemonic, failed, action) = match key {
+                    ToolchainKey::Rustc(_) => (
+                        RUSTC_VERSION_MNEMONIC,
+                        CompileLocallyReason::RustcFailsOnWorkers,
+                        tokio::task::spawn_blocking(move || rustc_version_action_blobs(&files, &options)),
+                    ),
+                    ToolchainKey::C(key) => {
+                        let key = key.clone();
+                        (
+                            CPP_COMPILER_CHECK_MNEMONIC,
+                            CompileLocallyReason::CCompilerFailsOnWorkers,
+                            tokio::task::spawn_blocking(move || c_compiler_check_action_blobs(&key, &files, &options)),
+                        )
+                    }
+                };
+                let action = action.await.map_err(Error::from).flatten().map_err(|error| {
+                    warn!("[{out_pretty}]: failed to prepare the worker toolchain check: {error:#}");
                     CompileLocallyReason::HashingInputsFailed
                 })?;
-                let response = self
-                    .upload_and_execute(
-                        apis,
-                        execution,
-                        &action,
-                        super::client::RUSTC_VERSION_MNEMONIC,
-                        false,
-                        out_pretty,
-                    )
-                    .await?;
-                let result = response
-                    .result
-                    .ok_or(CompileLocallyReason::ExecutionFailed)?;
+                let response = self.upload_and_execute(apis, execution, &action, mnemonic, false, out_pretty).await?;
+                let result = response.result.ok_or(CompileLocallyReason::ExecutionFailed)?;
                 if result.exit_code != 0 {
-                    return Ok(Err(CompileLocallyReason::RustcFailsOnWorkers));
+                    debug!("[{out_pretty}]: worker toolchain check for {key} failed: {}", super::client::loggable(&result.stderr_raw));
+                    return Ok(Err(failed));
                 }
-                let stdout = super::remote_compile::download_stdout_or_stderr(
-                    &apis.cas,
-                    &result.stdout_raw,
-                    result.stdout_digest.as_ref(),
-                )
-                .await
-                .map_err(|error| {
-                    warn!("[{out_pretty}]: failed to download worker rustc version: {error:#}");
-                    if is_refused_read(&error) {
-                        CompileLocallyReason::CredentialsRefused
-                    } else {
-                        CompileLocallyReason::DownloadingOutputsFailed
-                    }
-                })?;
+                let stdout = download_stdout_or_stderr(&apis.cas, &result.stdout_raw, result.stdout_digest.as_ref())
+                    .await
+                    .map_err(|error| {
+                        warn!("[{out_pretty}]: failed to download the worker toolchain check: {error:#}");
+                        if is_refused_read(&error) {
+                            CompileLocallyReason::CredentialsRefused
+                        } else {
+                            CompileLocallyReason::DownloadingOutputsFailed
+                        }
+                    })?;
                 let stdout = String::from_utf8_lossy(&stdout);
-                let commit = stdout
-                    .lines()
-                    .find_map(|line| line.strip_prefix("commit-hash: "));
-                Ok(if commit == Some(rustc.commit_hash.as_str()) {
-                    Ok(())
-                } else {
-                    Err(CompileLocallyReason::RustcCommitDiffersOnWorkers)
+                Ok(match key {
+                    ToolchainKey::Rustc(key) => {
+                        let commit = stdout.lines().find_map(|line| line.strip_prefix("commit-hash: "));
+                        if commit == Some(key.commit_hash.as_str()) {
+                            Ok(())
+                        } else {
+                            Err(CompileLocallyReason::RustcCommitDiffersOnWorkers)
+                        }
+                    }
+                    ToolchainKey::C(key) => {
+                        let local_key = key.clone();
+                        match tokio::task::spawn_blocking(move || local_c_compiler_answers(&local_key)).await {
+                            Ok(Ok(local)) => worker_c_compiler_answers(key, &stdout).and_then(|worker| {
+                                if worker == local { Ok(()) } else { Err(CompileLocallyReason::CCompilerDiffersOnWorkers) }
+                            }),
+                            other => {
+                                debug!("[{out_pretty}]: local C compiler check failed: {other:?}");
+                                Err(CompileLocallyReason::CCompilerFailsLocally)
+                            }
+                        }
+                    }
                 })
             })
             .await?

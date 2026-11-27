@@ -39,6 +39,8 @@ use walkdir::WalkDir;
 /// Starts the stderr line where the worker reports the worker root.
 const WORKER_ROOT_MARKER: &str = "sccache-reapi-pwd:";
 
+const ENTER_WORKER_ROOT: &str = "set -e\ncd -P .\nPWD=$(pwd -P)\n";
+
 /// Fails a C script in a worker root with a `:`, which would split `LD_LIBRARY_PATH` and
 /// `COMPILER_PATH`, or a `=`, which would end the old prefix of `-ffile-prefix-map`.
 const EXIT_IF_WORKER_ROOT_HAS_COLON_OR_EQUALS: &str =
@@ -165,6 +167,118 @@ fn c_toolchain_exports(key: &CToolchainKey) -> String {
         }
     }
     exports
+}
+
+fn c_compiler_check_options(key: &CToolchainKey) -> Vec<&str> {
+    let mut options = vec!["-dumpmachine"];
+    options.extend(key.internal_files.iter().map(|file| file.option.as_str()));
+    options.push("--version");
+    options
+}
+
+/// The [`ActionBlobs`] of [`c_compiler_check_command`]'s action. Servers neither answer it
+/// from their action cache nor cache its result, so it runs on a worker each time.
+pub(super) fn c_compiler_check_action_blobs(
+    key: &CToolchainKey,
+    toolchain: &[(InputRootFile, PathBuf)],
+    options: &ActionOptions,
+) -> Result<ActionBlobs> {
+    command_action_blobs(
+        c_compiler_check_command(key),
+        toolchain.iter(),
+        &[],
+        options,
+        true,
+    )
+}
+
+/// The command that prints the worker root, then, in a root without a `:` or `=`, the answers
+/// of the input root's copy of the `key` toolchain to [`c_compiler_check_options`]. It fails
+/// unless that copy also compiles a preprocessed source, which runs gcc's `cc1` and `as`.
+fn c_compiler_check_command(key: &CToolchainKey) -> remexec::Command {
+    let mut script = format!(
+        "{ENTER_WORKER_ROOT}printf '%s\\n' \"$PWD\"\n\
+         case \"$PWD\" in *[:=]*) exit 0 ;; esac\n{}",
+        c_toolchain_exports(key)
+    );
+    let driver = format!(
+        "\"$PWD\"/{TOOLCHAIN_DIR}{}",
+        sh_quote(&key.driver.to_string_lossy())
+    );
+    for option in c_compiler_check_options(key) {
+        script.push_str(&format!("{driver} {}\n", sh_quote(option)));
+    }
+    // A gcc without `cc1plus` compiles only C.
+    let has_cc1plus = (key.internal_files.iter()).any(|file| file.option.ends_with("=cc1plus"));
+    let languages = match key.kind {
+        crate::compiler::CCompilerKind::Gcc if !has_cc1plus => &["cpp-output"][..],
+        _ => &["cpp-output", "c++-cpp-output"],
+    };
+    for language in languages {
+        script.push_str(&format!(
+            "printf 'int sccache_check;\\n' | {driver} -x {language} -c -o /dev/null -\n"
+        ));
+    }
+    remexec::Command {
+        arguments: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+        ..Default::default()
+    }
+}
+
+/// The local `key` toolchain's answers to [`c_compiler_check_options`], one line each, with
+/// the paths of its internal files from `key`. Runs the compiler, so call it from a blocking
+/// thread.
+pub(super) fn local_c_compiler_answers(key: &CToolchainKey) -> Result<Vec<String>> {
+    (c_compiler_check_options(key).into_iter())
+        .map(|option| {
+            if let Some(file) = key.internal_files.iter().find(|f| f.option == option) {
+                return Ok(file.path.to_string_lossy().into_owned());
+            }
+            let output = std::process::Command::new(&key.driver)
+                .arg(option)
+                .env_clear()
+                .output()?;
+            if !output.status.success() {
+                bail!("{option} exits with {}", output.status);
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(stdout.lines().next().unwrap_or_default().to_owned())
+        })
+        .collect()
+}
+
+/// The answers in the `stdout` of [`c_compiler_check_action_blobs`]'s action, as
+/// [`local_c_compiler_answers`] has them. Fails for a worker root with a `:` or `=`, and for
+/// an internal file outside the toolchain dir.
+pub(super) fn worker_c_compiler_answers(
+    key: &CToolchainKey,
+    stdout: &str,
+) -> std::result::Result<Vec<String>, CompileLocallyReason> {
+    let differs = CompileLocallyReason::CCompilerDiffersOnWorkers;
+    let mut lines = stdout.lines();
+    let worker_root = lines.next().ok_or(differs)?;
+    if worker_root.contains([':', '=']) {
+        return Err(CompileLocallyReason::ColonOrEqualsInPath);
+    }
+    let toolchain_dir = normalize_absolute(Path::new(worker_root))
+        .ok_or(differs)?
+        .join(TOOLCHAIN_DIR);
+    (c_compiler_check_options(key).into_iter())
+        .map(|option| {
+            let line = lines.next().ok_or(differs)?;
+            if !key.internal_files.iter().any(|file| file.option == option) {
+                return Ok(line.to_owned());
+            }
+            let path = crate::dist::simplify_path::simplify_path_and_dirs(
+                Path::new(line),
+                &mut Vec::new(),
+            )
+            .map_err(|_| differs)?;
+            let path_in_toolchain_dir = path.strip_prefix(&toolchain_dir).map_err(|_| differs)?;
+            let local_path = Path::new("/").join(path_in_toolchain_dir);
+            Ok(local_path.to_string_lossy().into_owned())
+        })
+        .collect()
 }
 
 fn command_output_paths(compile: &ReapiCompile) -> Result<Vec<String>> {
@@ -1506,6 +1620,27 @@ Arch = "amd64"
             e.downcast_ref(),
             Some(UnusableToolchain(CompileLocallyReason::ColonOrEqualsInPath))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_worker_compiler_answers_must_name_the_shipped_programs() {
+        let toolchain = CToolchainKey::with_libraries(
+            crate::compiler::CCompilerKind::Gcc,
+            "/usr/bin/gcc".into(),
+            vec![c_internal_file("-print-prog-name=as", "/usr/bin/as")],
+            vec![],
+        );
+        let stdout = "/worker\nx86_64-linux-gnu\n/worker/.sccache-toolchain/usr/bin/as\ngcc 13\n";
+        assert_eq!(
+            worker_c_compiler_answers(&toolchain, stdout).unwrap(),
+            ["x86_64-linux-gnu", "/usr/bin/as", "gcc 13"],
+        );
+        let outside = stdout.replace("/worker/.sccache-toolchain/usr/bin/as", "/usr/bin/as");
+        assert_eq!(
+            worker_c_compiler_answers(&toolchain, &outside),
+            Err(CompileLocallyReason::CCompilerDiffersOnWorkers),
+        );
     }
 
     #[test]

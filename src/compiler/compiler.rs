@@ -3797,7 +3797,12 @@ LLVM version: 6.0",
                     .compilation
                     .map_for_reapi(Path::new(""))
                     .unwrap_err();
-                assert_eq!(CompileLocallyReason::UnsupportedCompiler, error.reason);
+                let expected = if cfg!(windows) {
+                    CompileLocallyReason::WindowsPaths
+                } else {
+                    CompileLocallyReason::NotFromBuildScript
+                };
+                assert_eq!(expected, error.reason);
                 assert!(error.detail.is_none());
             }
             request.execute_locally().await

@@ -327,7 +327,9 @@ pub(crate) enum CompileLocallyReason {
     SharedLibrariesNotListed,
     ClangConfigFile,
     SideOutputOption,
-    CToolchainUnsupported,
+    CCompilerFailsLocally,
+    CCompilerFailsOnWorkers,
+    CCompilerDiffersOnWorkers,
     PreprocessingFailed,
     PreprocessedSourceNotWritten,
     RustcDriver,
@@ -412,7 +414,11 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::SideOutputOption => "option that writes a file besides the object",
             Self::PreprocessingFailed => "preprocessing for REAPI failed",
             Self::PreprocessedSourceNotWritten => "failed to write the preprocessed source",
-            Self::CToolchainUnsupported => "C toolchain unsupported on workers",
+            Self::CCompilerFailsLocally => "gcc or clang fails its check locally",
+            Self::CCompilerFailsOnWorkers => "gcc or clang fails its check on the workers",
+            Self::CCompilerDiffersOnWorkers => {
+                "gcc or clang on the workers differs from the local one"
+            }
             Self::UnsupportedCompiler => "unsupported compiler",
             Self::WindowsPaths => "Windows paths",
             Self::RustcDriver => "not rustc",
