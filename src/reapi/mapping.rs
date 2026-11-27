@@ -32,9 +32,7 @@ pub(super) const TOOLCHAIN_DIR: &str = ".sccache-toolchain";
 pub struct ReapiCompile {
     pub(crate) path_mapper: PathMapper,
     pub(crate) arguments: Vec<String>,
-    /// Absolute crate-root arguments must remain absolute on the worker: rustc
-    /// preserves their spelling in its outputs. These are passed separately.
-    pub(crate) mapped_crate_root: Option<String>,
+    pub(crate) program: WorkerProgram,
     pub(crate) toolchain: ToolchainKey,
     pub(crate) env: ActionEnv,
     pub(crate) input_root_files: Vec<PathBuf>,
@@ -42,10 +40,70 @@ pub struct ReapiCompile {
     pub(crate) outputs: Vec<PathBuf>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WorkerProgram {
+    Rustc {
+        /// rustc preserves the spelling of absolute crate-root arguments in its outputs.
+        mapped_crate_root: Option<String>,
+    },
+    #[cfg_attr(
+        not(all(test, unix)),
+        expect(dead_code, reason = "C compiles are not mapped to REAPI yet")
+    )]
+    C,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ToolchainKey {
+    Rustc(RustcToolchainKey),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "C compiles are not mapped to REAPI yet")
+    )]
+    C(CToolchainKey),
+}
+
+impl ToolchainKey {
+    pub(crate) fn rustc(commit_hash: String, sysroot: PathBuf, target_triple: String) -> Self {
+        Self::Rustc(RustcToolchainKey::new(commit_hash, sysroot, target_triple))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_rustc(&self) -> &RustcToolchainKey {
+        match self {
+            Self::Rustc(key) => key,
+            Self::C(key) => panic!("expected a Rust toolchain, got {key:?}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolchainKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rustc(key) => write!(f, "the toolchain in {}", key.sysroot.display()),
+            Self::C(key) => write!(f, "the toolchain of {}", key.driver.display()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CToolchainKey {
+    pub(crate) driver: PathBuf,
+    stamp: Option<FileStamp>,
+}
+
+impl CToolchainKey {
+    #[cfg(test)]
+    pub(super) fn new(driver: PathBuf) -> Self {
+        let stamp = FileStamp::of(&driver).ok();
+        Self { driver, stamp }
+    }
+}
+
 /// Identifies a local toolchain for in-memory reuse. File metadata detects updates
 /// without hashing the toolchain for every compile; content digests identify it remotely.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ToolchainKey {
+pub(crate) struct RustcToolchainKey {
     pub(crate) commit_hash: String,
     pub(crate) sysroot: PathBuf,
     pub(crate) target_triple: String,
@@ -59,7 +117,7 @@ pub(super) struct StampedFile {
     pub(super) is_executable: bool,
 }
 
-impl ToolchainKey {
+impl RustcToolchainKey {
     /// Reads the stamps, so call it from a blocking thread.
     pub(crate) fn new(commit_hash: String, sysroot: PathBuf, target_triple: String) -> Self {
         let files = super::remote_compile::list_toolchain_files(&sysroot, &target_triple).ok();
@@ -112,6 +170,7 @@ impl From<CompileLocallyReason> for NotEligible {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompileLocallyReason {
     NotRust,
+    CToolchainUnsupported,
     RustcDriver,
     WindowsClient,
     Staticlib,
@@ -172,6 +231,7 @@ pub(crate) enum CompileLocallyReason {
 impl std::fmt::Display for CompileLocallyReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::CToolchainUnsupported => "C toolchain unsupported on workers",
             Self::NotRust => "not a Rust compile",
             Self::RustcDriver => "not rustc",
             Self::WindowsClient => "Windows client",
@@ -465,7 +525,7 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let sysroot = crate::reapi::remote_compile::test::fake_sysroot(dir.path());
         let key = || {
-            ToolchainKey::new(
+            ToolchainKey::rustc(
                 "abc123".into(),
                 sysroot.clone(),
                 "x86_64-unknown-linux-gnu".into(),
@@ -491,7 +551,7 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let sysroot = crate::reapi::remote_compile::test::fake_sysroot(dir.path());
         let key = |commit: &str, target: &str| {
-            ToolchainKey::new(commit.into(), sysroot.clone(), target.into())
+            ToolchainKey::rustc(commit.into(), sysroot.clone(), target.into())
         };
         let original = key("abc123", "target");
         assert_ne!(original, key("new-commit", "target"));
@@ -994,8 +1054,10 @@ mod test {
             .into_iter()
             .map(str::to_owned)
             .collect(),
-            mapped_crate_root: None,
-            toolchain: ToolchainKey::new("abc123".into(), copy.clone(), String::new()),
+            program: WorkerProgram::Rustc {
+                mapped_crate_root: None,
+            },
+            toolchain: ToolchainKey::rustc("abc123".into(), copy.clone(), String::new()),
             env: ActionEnv {
                 path_vars: vec![(
                     "OUT_DIR".into(),

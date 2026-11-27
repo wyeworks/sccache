@@ -59,6 +59,6 @@ pub(crate) use executor::ReapiExecutor;
 
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
-    normalize_absolute,
+    WorkerProgram, normalize_absolute,
 };
 pub(crate) use sysroot::sysroot_copy;

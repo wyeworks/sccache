@@ -16,7 +16,7 @@
 
 use super::digest::DigestCache;
 use super::input_root::InputRootFile;
-use super::mapping::{CompileLocallyReason, ToolchainKey};
+use super::mapping::{CompileLocallyReason, RustcToolchainKey, ToolchainKey};
 use super::remote_compile::{UnusableToolchain, toolchain_files};
 use crate::errors::*;
 use std::collections::HashMap;
@@ -110,15 +110,23 @@ impl Toolchains {
     fn spawn_hash(self: &Arc<Self>, key: ToolchainKey) {
         let this = self.clone();
         tokio::spawn(async move {
-            let settling_time = this.digest_cache.settling_time(key.stamps());
+            let settling_time = match &key {
+                ToolchainKey::Rustc(key) => this.digest_cache.settling_time(key.stamps()),
+                ToolchainKey::C(_) => Duration::ZERO,
+            };
             if !settling_time.is_zero() {
                 tokio::time::sleep(settling_time).await;
             }
             let digest_cache = this.digest_cache.clone();
             let expected_key = key.clone();
             let hashed = tokio::task::spawn_blocking(move || {
+                let ToolchainKey::Rustc(expected_key) = expected_key else {
+                    return Err(
+                        UnusableToolchain(CompileLocallyReason::CToolchainUnsupported).into(),
+                    );
+                };
                 let files = toolchain_files(&expected_key, &digest_cache)?;
-                if ToolchainKey::new(
+                if RustcToolchainKey::new(
                     expected_key.commit_hash.clone(),
                     expected_key.sysroot.clone(),
                     expected_key.target_triple.clone(),
@@ -132,27 +140,24 @@ impl Toolchains {
                 Ok::<_, Error>(files)
             })
             .await;
-            let sysroot = key.sysroot.display();
             let state = match hashed {
                 Ok(Ok(files)) => {
-                    info!("REAPI: hashed the toolchain in {sysroot}");
+                    info!("REAPI: hashed {key}");
                     State::Hashed(Arc::new(files))
                 }
                 Ok(Err(e)) => match e.downcast_ref::<UnusableToolchain>() {
                     Some(UnusableToolchain(reason)) => {
-                        warn!(
-                            "REAPI: compiles with the toolchain in {sysroot} run locally until it changes: {e:#}"
-                        );
+                        warn!("REAPI: compiles with {key} run locally until it changes: {e:#}");
                         State::Unusable(*reason)
                     }
                     None => {
-                        warn!("REAPI: failed to hash the toolchain in {sysroot}: {e:#}");
+                        warn!("REAPI: failed to hash {key}: {e:#}");
                         this.hashing_failed()
                     }
                 },
                 Err(e) => {
                     if e.is_panic() {
-                        warn!("REAPI: hashing the toolchain in {sysroot} panicked: {e}");
+                        warn!("REAPI: hashing {key} panicked: {e}");
                     }
                     this.hashing_failed()
                 }
@@ -188,7 +193,7 @@ mod test {
     }
 
     fn key(sysroot: &Path) -> ToolchainKey {
-        ToolchainKey::new(
+        ToolchainKey::rustc(
             "abc123".to_owned(),
             sysroot.to_owned(),
             TARGET_TRIPLE.to_owned(),
@@ -197,6 +202,19 @@ mod test {
 
     fn in_secs(secs: u64) -> Instant {
         Instant::now() + Duration::from_secs(secs)
+    }
+
+    #[tokio::test]
+    async fn test_c_toolchains_stay_local_until_packaging_is_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let toolchains = toolchains(dir.path(), RETRY_AFTER);
+        let key = ToolchainKey::C(super::super::mapping::CToolchainKey::new(
+            dir.path().join("cc"),
+        ));
+        assert_eq!(
+            Some(CompileLocallyReason::CToolchainUnsupported),
+            toolchains.files(&key, in_secs(10)).await.err()
+        );
     }
 
     #[tokio::test]

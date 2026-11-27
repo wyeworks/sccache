@@ -52,7 +52,7 @@ const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
 const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 
-type RustcCheck = OnceCell<std::result::Result<(), CompileLocallyReason>>;
+type ToolchainCheck = OnceCell<std::result::Result<(), CompileLocallyReason>>;
 
 #[derive(Clone, Copy, Default)]
 struct ActionCacheCounts {
@@ -76,7 +76,7 @@ pub(crate) struct ReapiExecutor {
     remote_slots: Option<Arc<Semaphore>>,
     queue_timeout: Duration,
     executions_refused: AtomicBool,
-    rustc_checks: Mutex<HashMap<ToolchainKey, Arc<RustcCheck>>>,
+    toolchain_checks: Mutex<HashMap<ToolchainKey, Arc<ToolchainCheck>>>,
     action_options: Arc<ActionOptions>,
 }
 
@@ -127,7 +127,7 @@ impl ReapiExecutor {
                 .map(|slots| Arc::new(Semaphore::new(slots.get().min(Semaphore::MAX_PERMITS)))),
             queue_timeout: Duration::from_secs(config.queue_timeout_secs.unwrap_or(60).min(3600)),
             executions_refused: AtomicBool::new(false),
-            rustc_checks: Mutex::default(),
+            toolchain_checks: Mutex::default(),
             action_options: Arc::new(ActionOptions::new(config)),
         }
     }
@@ -214,7 +214,7 @@ impl ReapiExecutor {
         Some(local_slots.acquire_owned().await.expect(SLOTS_NEVER_CLOSE))
     }
 
-    async fn check_rustc(
+    async fn check_toolchain(
         &self,
         apis: &ServerApis,
         execution: &Execution,
@@ -222,8 +222,11 @@ impl ReapiExecutor {
         toolchain: &ToolchainFiles,
         out_pretty: &str,
     ) -> std::result::Result<(), CompileLocallyReason> {
+        let ToolchainKey::Rustc(rustc) = key else {
+            return Err(CompileLocallyReason::CToolchainUnsupported);
+        };
         let check = self
-            .rustc_checks
+            .toolchain_checks
             .lock()
             .unwrap()
             .entry(key.clone())
@@ -277,7 +280,7 @@ impl ReapiExecutor {
                 let commit = stdout
                     .lines()
                     .find_map(|line| line.strip_prefix("commit-hash: "));
-                Ok(if commit == Some(key.commit_hash.as_str()) {
+                Ok(if commit == Some(rustc.commit_hash.as_str()) {
                     Ok(())
                 } else {
                     Err(CompileLocallyReason::RustcCommitDiffersOnWorkers)
@@ -455,7 +458,7 @@ impl ReapiExecutor {
                     .try_lookup()
                     .ok_or(CompileLocallyReason::ExecutionsPaused)?;
                 let response = async {
-                    self.check_rustc(
+                    self.check_toolchain(
                         &apis,
                         execution,
                         &reapi_compile.toolchain,
@@ -806,8 +809,10 @@ mod test {
             Ok(ReapiCompile {
                 path_mapper: PathMapper::new(ws.clone(), ws.join("target")),
                 arguments: vec![],
-                mapped_crate_root: None,
-                toolchain: ToolchainKey::new(
+                program: crate::reapi::WorkerProgram::Rustc {
+                    mapped_crate_root: None,
+                },
+                toolchain: ToolchainKey::rustc(
                     "abc123".to_owned(),
                     self.dir.join("sysroot"),
                     TARGET_TRIPLE.to_owned(),
@@ -931,9 +936,11 @@ mod test {
             let compile = self.compilation().map_for_reapi().unwrap();
             let digest_cache = DigestCache::load(self.dir.path().join("digests.json"));
             let files = digest_input_root_files(&compile, &digest_cache).unwrap();
-            let toolchain =
-                crate::reapi::remote_compile::toolchain_files(&compile.toolchain, &digest_cache)
-                    .unwrap();
+            let toolchain = crate::reapi::remote_compile::toolchain_files(
+                compile.toolchain.as_rustc(),
+                &digest_cache,
+            )
+            .unwrap();
             let action_digest = action_blobs(
                 &compile,
                 &files,

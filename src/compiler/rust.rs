@@ -2366,7 +2366,8 @@ mod reapi_mapping {
     use super::*;
     use crate::compiler::remote::LocalArg;
     use crate::reapi::{
-        ActionEnv, CompileLocallyReason, PathMapper, ToolchainKey, normalize_absolute, sysroot_copy,
+        ActionEnv, CompileLocallyReason, PathMapper, ToolchainKey, WorkerProgram,
+        normalize_absolute, sysroot_copy,
     };
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2714,8 +2715,8 @@ mod reapi_mapping {
         Ok(ReapiCompile {
             path_mapper,
             arguments,
-            mapped_crate_root,
-            toolchain: ToolchainKey::new(commit_hash, compilation.sysroot.clone(), target_triple),
+            program: WorkerProgram::Rustc { mapped_crate_root },
+            toolchain: ToolchainKey::rustc(commit_hash, compilation.sysroot.clone(), target_triple),
             env,
             input_root_files,
             input_root_directories,
@@ -5700,7 +5701,9 @@ foo.rs:
         use crate::compiler::rust::reapi_mapping::{
             deps_dir_base, map_for_reapi, parse_commit_hash, reapi_local_compile_changes,
         };
-        use crate::reapi::{ActionEnv, CompileLocallyReason, ReapiCompile, sysroot_copy};
+        use crate::reapi::{
+            ActionEnv, CompileLocallyReason, ReapiCompile, WorkerProgram, sysroot_copy,
+        };
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::symlink;
         use test_case::test_case;
@@ -5920,7 +5923,7 @@ foo.rs:
             let compilation: Box<dyn Compilation<Arc<Mutex<MockCommandCreator>>>> =
                 Box::new(compilation(&[]));
             let mapped = compilation.map_for_reapi().unwrap();
-            assert_eq!(HOST, mapped.toolchain.target_triple);
+            assert_eq!(HOST, mapped.toolchain.as_rustc().target_triple);
             assert!(mapped.arguments.contains(&"src/lib.rs".to_owned()));
         }
 
@@ -6602,12 +6605,15 @@ foo.rs:
         #[test]
         fn test_passes_the_target_triple() {
             let compile = map_for_reapi(&compilation(&[])).unwrap();
-            assert_eq!(HOST, compile.toolchain.target_triple);
+            assert_eq!(HOST, compile.toolchain.as_rustc().target_triple);
             assert!(compile.arguments.contains(&format!("--target={HOST}")));
 
             let compile =
                 map_for_reapi(&compilation(&["--target", "aarch64-unknown-linux-gnu"])).unwrap();
-            assert_eq!("aarch64-unknown-linux-gnu", compile.toolchain.target_triple);
+            assert_eq!(
+                "aarch64-unknown-linux-gnu",
+                compile.toolchain.as_rustc().target_triple
+            );
             assert!(!compile.arguments.contains(&format!("--target={HOST}")));
             assert!(
                 compile
@@ -6623,7 +6629,12 @@ foo.rs:
         fn test_an_absolute_crate_root_is_left_out_of_the_arguments() {
             let compilation = compilation_in(CWD, "/ws/app/src/lib.rs", &[]);
             let compile = map_for_reapi(&compilation).unwrap();
-            assert_eq!(Some("src/lib.rs".to_owned()), compile.mapped_crate_root);
+            assert_eq!(
+                WorkerProgram::Rustc {
+                    mapped_crate_root: Some("src/lib.rs".to_owned())
+                },
+                compile.program
+            );
             assert!(
                 !compile.arguments.iter().any(|a| a.contains("lib.rs")),
                 "{:?}",
