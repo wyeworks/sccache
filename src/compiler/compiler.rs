@@ -966,7 +966,7 @@ where
 
     /// Maps compilation paths for REAPI, or returns why the compile must stay local.
     #[cfg(feature = "reapi")]
-    fn map_for_reapi(&self) -> StdResult<ReapiCompile, NotEligible> {
+    fn map_for_reapi(&self, _preprocessed_dir: &Path) -> StdResult<ReapiCompile, NotEligible> {
         Err(CompileLocallyReason::UnsupportedCompiler.into())
     }
 
@@ -3793,7 +3793,10 @@ LLVM version: 6.0",
             assert_eq!(self.options, request.hash_key_options);
             #[cfg(feature = "reapi")]
             {
-                let error = request.compilation.map_for_reapi().unwrap_err();
+                let error = request
+                    .compilation
+                    .map_for_reapi(Path::new(""))
+                    .unwrap_err();
                 assert_eq!(CompileLocallyReason::UnsupportedCompiler, error.reason);
                 assert!(error.detail.is_none());
             }
@@ -3949,6 +3952,7 @@ LLVM version: 6.0",
             Ok(PreparedCompile {
                 compilation,
                 local_compile_changes: LocalCompileChanges {
+                    runs_remote_command: false,
                     extra_hash_key: self.extra_hash_key.clone(),
                     args: self.args.clone(),
                     stdout_stderr_mapper: mapper,
@@ -4261,6 +4265,7 @@ LLVM version: 6.0",
                 hash_key_options: HashKeyOptions::default(),
                 cache_control: CacheControl::Default,
                 local_compile_changes: LocalCompileChanges {
+                    runs_remote_command: false,
                     extra_hash_key: vec![],
                     args: vec![],
                     stdout_stderr_mapper: Some(Box::new(|_| panic!("no process output to map"))),

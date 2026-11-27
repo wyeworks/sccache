@@ -2348,7 +2348,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
     }
 
     #[cfg(feature = "reapi")]
-    fn map_for_reapi(&self) -> StdResult<ReapiCompile, NotEligible> {
+    fn map_for_reapi(&self, _preprocessed_dir: &Path) -> StdResult<ReapiCompile, NotEligible> {
         reapi_mapping::map_for_reapi(self)
     }
 
@@ -2453,6 +2453,7 @@ mod reapi_mapping {
             hashed_as: "--sysroot=<sysroot copy>".into(),
         });
         Some(LocalCompileChanges {
+            runs_remote_command: false,
             args,
             extra_hash_key: implicit_env_cache_key(compilation),
             stdout_stderr_mapper: Some(Box::new(move |text| {
@@ -2720,6 +2721,7 @@ mod reapi_mapping {
             env,
             input_root_files,
             input_root_directories,
+            preprocessed_source: None,
             outputs,
         })
     }
@@ -5922,7 +5924,7 @@ foo.rs:
         fn test_mapping_through_the_compilation_interface() {
             let compilation: Box<dyn Compilation<Arc<Mutex<MockCommandCreator>>>> =
                 Box::new(compilation(&[]));
-            let mapped = compilation.map_for_reapi().unwrap();
+            let mapped = compilation.map_for_reapi(Path::new("")).unwrap();
             assert_eq!(HOST, mapped.toolchain.as_rustc().target_triple);
             assert!(mapped.arguments.contains(&"src/lib.rs".to_owned()));
         }
@@ -6313,7 +6315,7 @@ foo.rs:
                 )
                 .wait()
                 .unwrap();
-            let mapped = hashed.compilation.map_for_reapi().unwrap();
+            let mapped = hashed.compilation.map_for_reapi(Path::new("")).unwrap();
             assert_eq!(owned(&[("BUILD_MODE", "release")]), mapped.env.vars);
             assert_eq!(vec!["OPTIONAL".to_owned()], mapped.env.unset_vars);
         }

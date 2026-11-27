@@ -18,6 +18,7 @@ use super::auth_token::{self, AuthToken};
 use super::client::{
     ConnectOptions, check_connect_options, credential_helper_server_uri, rpc_code,
 };
+use super::compile_as_worker::CompileAsWorker;
 use super::connection::{Connection, ServerApis};
 use super::credential_helper::{self, CredentialHelper};
 use super::digest::DigestCache;
@@ -66,6 +67,7 @@ pub(crate) struct ReapiExecutor {
     digest_cache: Arc<DigestCache>,
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
+    preprocessed_dir: PathBuf,
     lookup_pause: LookupPause,
     action_cache_counts: Mutex<ActionCacheCounts>,
     execution_pause: LookupPause,
@@ -110,6 +112,7 @@ impl ReapiExecutor {
             digest_cache,
             ready_wait,
             sysroot_copies_dir: config.cache_dir.join(SYSROOT_COPIES_DIR),
+            preprocessed_dir: config.cache_dir.join("reapi-preprocessed"),
             lookup_pause: LookupPause::default(),
             action_cache_counts: Mutex::default(),
             execution_pause: LookupPause::default(),
@@ -674,16 +677,28 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
             return compile_locally(request, CompileLocallyReason::CacheBypassed).await;
         }
         let compilation = request.compilation;
-        let (compilation, mapped) = tokio::task::spawn_blocking(move || {
+        let preprocessed_dir = self.preprocessed_dir.clone();
+        let (compilation, mut mapped) = tokio::task::spawn_blocking(move || {
             // Preserve the compilation so an eligibility-check panic can still fall back.
-            let mapped = catch_unwind(AssertUnwindSafe(|| compilation.map_for_reapi()));
+            let mapped = catch_unwind(AssertUnwindSafe(|| {
+                compilation.map_for_reapi(&preprocessed_dir)
+            }));
             (compilation, mapped)
         })
         .await
         .context("failed to check REAPI eligibility")?;
         request.compilation = compilation;
+        let as_worker = if request.local_compile_changes.runs_remote_command {
+            mapped
+                .as_mut()
+                .ok()
+                .and_then(|r| r.as_mut().ok())
+                .and_then(CompileAsWorker::new)
+        } else {
+            None
+        };
         let looked_up = match mapped {
-            Ok(Ok(_)) if request.local_compile_changes.args.is_empty() => {
+            Ok(Ok(_)) if request.local_compile_changes.args.is_empty() && as_worker.is_none() => {
                 Err(CompileLocallyReason::LocalCompileUnchanged)
             }
             Ok(Ok(mut compile)) => match self.prepare_lookup(&mut compile).await {
@@ -732,6 +747,31 @@ impl<T: CommandCreatorSync> CompileExecutor<T> for ReapiExecutor {
                     Some(slot) => Some(slot),
                     None => self.local_slot().await,
                 };
+                if let Some(as_worker) = as_worker {
+                    let mut transformer = crate::dist::PathTransformer::new();
+                    let (command, _, cacheable) = request.compilation.generate_compile_commands(
+                        &mut transformer,
+                        request.hash_key_options.rewrite_includes_only,
+                    )?;
+                    match as_worker
+                        .run(request.service, request.creator, command.get_env_vars())
+                        .await
+                    {
+                        Ok(output) => {
+                            return Ok(CompileOutcome {
+                                cacheable,
+                                execution: DistType::Reapi(ReapiOutcome::CompiledLocally(
+                                    reason.to_string(),
+                                )),
+                                output,
+                            });
+                        }
+                        Err(error) => debug!(
+                            "[{}]: worker-style local compile failed: {error:#}",
+                            request.output_name
+                        ),
+                    }
+                }
                 compile_locally(request, reason).await
             }
         }
@@ -802,7 +842,10 @@ mod test {
             ))
         }
 
-        fn map_for_reapi(&self) -> std::result::Result<ReapiCompile, crate::reapi::NotEligible> {
+        fn map_for_reapi(
+            &self,
+            _preprocessed_dir: &Path,
+        ) -> std::result::Result<ReapiCompile, crate::reapi::NotEligible> {
             match self.eligibility {
                 Eligibility::Eligible => {}
                 Eligibility::Ineligible => return Err(CompileLocallyReason::Staticlib.into()),
@@ -823,6 +866,7 @@ mod test {
                 env: Default::default(),
                 input_root_files: vec![ws.join("src/lib.rs")],
                 input_root_directories: vec![],
+                preprocessed_source: None,
                 outputs: vec![ws.join(RLIB)],
             })
         }
@@ -834,6 +878,7 @@ mod test {
             let mut arg = OsString::from("--sysroot=");
             arg.push(sysroot_copies_dir);
             Some(LocalCompileChanges {
+                runs_remote_command: false,
                 extra_hash_key: vec![],
                 args: vec![LocalArg {
                     hashed_as: arg.clone(),
@@ -936,7 +981,7 @@ mod test {
         /// Puts a successful result that writes an rlib holding `rlib`, changed by `change`, in
         /// the fake server's action cache.
         fn put_result_in_action_cache(&self, change: fn(&mut remexec::ActionResult)) {
-            let compile = self.compilation().map_for_reapi().unwrap();
+            let compile = self.compilation().map_for_reapi(Path::new("")).unwrap();
             let digest_cache = DigestCache::load(self.dir.path().join("digests.json"));
             let files = digest_input_root_files(&compile, &digest_cache).unwrap();
             let toolchain = crate::reapi::remote_compile::toolchain_files(

@@ -187,14 +187,19 @@ pub(super) fn digest_input_root_files(
     compile: &ReapiCompile,
     digest_cache: &DigestCache,
 ) -> Result<Vec<(InputRootFile, PathBuf)>> {
-    compile
-        .input_root_files
-        .iter()
-        .map(|local_path| {
-            let path = compile
-                .path_mapper
-                .to_input_root(local_path)
-                .with_context(|| format!("{} is outside the input root", local_path.display()))?;
+    let mapped_files = compile.input_root_files.iter().map(|local_path| {
+        let path = compile
+            .path_mapper
+            .to_input_root(local_path)
+            .with_context(|| format!("{} is outside the input root", local_path.display()))?;
+        Ok((path, local_path))
+    });
+    let preprocessed_source = (compile.preprocessed_source.iter())
+        .map(|source| Ok((source.mapped_path.clone(), &source.path)));
+    mapped_files
+        .chain(preprocessed_source)
+        .map(|mapped_file: Result<(String, &PathBuf)>| {
+            let (path, local_path) = mapped_file?;
             let file = InputRootFile {
                 path,
                 digest: digest_cache.digest(local_path)?,
@@ -1040,6 +1045,7 @@ pub(super) mod test {
             },
             input_root_files: vec![],
             input_root_directories: vec![],
+            preprocessed_source: None,
             outputs: vec![
                 format!("{cwd}/target/debug/deps/libfoo.rmeta").into(),
                 format!("{cwd}/target/debug/deps/libfoo.rlib").into(),

@@ -19,13 +19,16 @@
 
 use crate::compiler::Language;
 use crate::compiler::c::{CCompilerKind, ParsedArguments};
+use crate::compiler::remote::LocalCompileChanges;
 use crate::reapi::{
-    CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper, ReapiCompile,
-    ToolchainKey, WorkerProgram, normalize_absolute,
+    CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper, PreprocessedSource,
+    ReapiCompile, ToolchainKey, WorkerProgram, normalize_absolute,
 };
 use anyhow::anyhow;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use tempfile::TempPath;
 
 /// Prefixes of the options a worker's compile leaves out: it reads a preprocessed source and
 /// doesn't link.
@@ -65,23 +68,64 @@ const GCC_INTERNAL_FILES: &[&str] = &[
 /// Off while workers can't run a C toolchain, which keeps every C compile local.
 const WORKERS_RUN_C_COMPILES: bool = false;
 
-/// The compile of `parsed_args` by `executable` in `cwd`, mapped for REAPI, or why it runs
-/// locally. Runs the compiler, so call it from a blocking thread.
+/// The compile of `parsed_args` by `executable` in `cwd`, mapped for REAPI with its
+/// preprocessed source under `preprocessed_dir`, or why it runs locally. Runs the compiler, so
+/// call it from a blocking thread.
 pub(super) fn map_for_reapi(
     kind: &CCompilerKind,
     parsed_args: &ParsedArguments,
     executable: &Path,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
+    preprocessed_dir: &Path,
 ) -> Result<ReapiCompile, NotEligible> {
+    let mapped = map_compile_for_workers(kind, parsed_args, cwd, env_vars)?;
+    reapi_compile(
+        mapped,
+        kind,
+        parsed_args,
+        executable,
+        cwd,
+        env_vars,
+        preprocessed_dir,
+    )
+}
+
+/// A local compile that REAPI could run compiles as a worker does, so that it writes the
+/// object a worker writes. `None` for the other compiles.
+pub(super) fn reapi_local_compile_changes(
+    kind: &CCompilerKind,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Option<LocalCompileChanges> {
+    map_compile_for_workers(kind, parsed_args, cwd, env_vars).ok()?;
+    Some(LocalCompileChanges {
+        extra_hash_key: b"reapi-c-worker-v1".to_vec(),
+        runs_remote_command: true,
+        ..Default::default()
+    })
+}
+
+/// [`map_compile`] for compiles a worker can run.
+fn map_compile_for_workers(
+    kind: &CCompilerKind,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<MappedCompile, NotEligible> {
     let mapped = map_compile(kind, parsed_args, cwd, env_vars)?;
     if !WORKERS_RUN_C_COMPILES {
         return Err(CompileLocallyReason::CToolchainUnsupported.into());
     }
-    reapi_compile(mapped, kind, parsed_args, executable, cwd, env_vars)
+    // A non-Linux client's compiler doesn't run on Linux workers.
+    if !cfg!(target_os = "linux") {
+        return Err(CompileLocallyReason::NonLinuxToolchain.into());
+    }
+    Ok(mapped)
 }
 
-/// The `ReapiCompile` of `mapped`, with its toolchain.
+/// The `ReapiCompile` of `mapped`, with its toolchain and preprocessed source.
 fn reapi_compile(
     mapped: MappedCompile,
     kind: &CCompilerKind,
@@ -89,16 +133,27 @@ fn reapi_compile(
     executable: &Path,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
+    preprocessed_dir: &Path,
 ) -> Result<ReapiCompile, NotEligible> {
     let MappedCompile {
         path_mapper,
         arguments,
+        mapped_input,
         object,
     } = mapped;
     let toolchain = toolchain_key(kind, executable, &parsed_args.language, cwd, env_vars)?;
     if *kind == CCompilerKind::Clang {
         check_clang_config(executable, &toolchain.driver, cwd, env_vars)?;
     }
+    let preprocessed = preprocess_for_reapi(
+        kind,
+        parsed_args,
+        executable,
+        cwd,
+        env_vars,
+        &path_mapper,
+        preprocessed_dir,
+    )?;
     Ok(ReapiCompile {
         path_mapper,
         arguments,
@@ -107,6 +162,7 @@ fn reapi_compile(
         env: Default::default(),
         input_root_files: vec![],
         input_root_directories: vec![],
+        preprocessed_source: Some(PreprocessedSource::new(preprocessed, mapped_input)),
         outputs: vec![object],
     })
 }
@@ -115,6 +171,8 @@ fn reapi_compile(
 struct MappedCompile {
     path_mapper: PathMapper,
     arguments: Vec<String>,
+    /// The source's path in the input root, where a worker reads the preprocessed source.
+    mapped_input: String,
     object: PathBuf,
 }
 
@@ -190,7 +248,7 @@ fn map_compile(
         "-x".to_owned(),
         preprocessed_language.to_owned(),
         "-c".to_owned(),
-        mapped_input,
+        mapped_input.clone(),
         "-o".to_owned(),
         mapped_object,
     ];
@@ -211,6 +269,7 @@ fn map_compile(
     Ok(MappedCompile {
         path_mapper,
         arguments,
+        mapped_input,
         object,
     })
 }
@@ -491,6 +550,135 @@ fn is_absolute_path_arg(arg: &str) -> bool {
     path.starts_with('/')
 }
 
+/// Preprocesses the compile of `parsed_args` again for a worker, into a `.i` file under `dir`,
+/// and writes its depfile. sccache's own preprocessing can't be sent: it leaves out line
+/// markers and keeps local paths in `__FILE__`. Runs the compiler, so call it from a blocking
+/// thread.
+fn preprocess_for_reapi(
+    kind: &CCompilerKind,
+    parsed_args: &ParsedArguments,
+    executable: &Path,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+    path_mapper: &PathMapper,
+    dir: &Path,
+) -> Result<TempPath, NotEligible> {
+    let output = std::process::Command::new(executable)
+        .args(preprocess_args(kind, parsed_args, path_mapper))
+        .env_clear()
+        .envs(env_vars.iter().cloned())
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| NotEligible::new(CompileLocallyReason::PreprocessingFailed, e.into()))?;
+    if !output.status.success() {
+        return Err(NotEligible::new(
+            CompileLocallyReason::PreprocessingFailed,
+            anyhow!(
+                "{}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    let preprocessed = rewrite_line_markers(&output.stdout, path_mapper, kind);
+    let written = std::fs::create_dir_all(dir).and_then(|()| {
+        let mut file = tempfile::Builder::new().suffix(".i").tempfile_in(dir)?;
+        file.write_all(&preprocessed)?;
+        Ok(file.into_temp_path())
+    });
+    written
+        .map_err(|e| NotEligible::new(CompileLocallyReason::PreprocessedSourceNotWritten, e.into()))
+}
+
+/// The arguments that preprocess the compile of `parsed_args` to stdout, with `__FILE__`
+/// naming paths as a worker's compile does.
+fn preprocess_args(
+    kind: &CCompilerKind,
+    parsed_args: &ParsedArguments,
+    path_mapper: &PathMapper,
+) -> Vec<OsString> {
+    let mut args = super::gcc::preprocess_args(
+        parsed_args,
+        &parsed_args.arch_args,
+        true,
+        kind.clone(),
+        false,
+        &[],
+        Language::to_gcc_arg,
+    );
+    // After a `--`, the prefix maps would be inputs.
+    let input_at = args.len() - 1 - usize::from(parsed_args.double_dash_input);
+    let prefix_maps = path_mapper.prefix_map_args("-fmacro-prefix-map=");
+    args.splice(input_at..input_at, prefix_maps);
+    args
+}
+
+/// `preprocessed` with the paths under the cwd and build root in its line markers written as
+/// a worker's compile names them. A path that `kind` escapes differently from
+/// [`escape_line_marker_path`] stays local, which costs only cache hits across checkouts.
+fn rewrite_line_markers(
+    preprocessed: &[u8],
+    path_mapper: &PathMapper,
+    kind: &CCompilerKind,
+) -> Vec<u8> {
+    // The build root, often inside the cwd, is matched first.
+    let prefixes: Vec<(Vec<u8>, &str)> = path_mapper
+        .input_root_prefixes()
+        .into_iter()
+        .rev()
+        .map(|(local, mapped)| {
+            let local = escape_line_marker_path(local.as_os_str().as_encoded_bytes(), kind);
+            (local, mapped)
+        })
+        .collect();
+    let mut rewritten = Vec::with_capacity(preprocessed.len());
+    let mut start = 0;
+    while start < preprocessed.len() {
+        let end = memchr::memchr(b'\n', &preprocessed[start..])
+            .map_or(preprocessed.len(), |newline| start + newline + 1);
+        let line = &preprocessed[start..end];
+        let path_start = super::c::is_line_marker_at(preprocessed, start)
+            .then(|| memchr::memchr(b'"', line))
+            .flatten()
+            .map(|quote| quote + 1);
+        let mapped = path_start.and_then(|path_start| {
+            prefixes.iter().find_map(|(local, mapped)| {
+                let rest = line[path_start..].strip_prefix(local.as_slice())?;
+                matches!(rest.first(), Some(b'/' | b'"')).then_some((path_start, *mapped, rest))
+            })
+        });
+        match mapped {
+            Some((path_start, mapped, rest)) => {
+                rewritten.extend_from_slice(&line[..path_start]);
+                rewritten.extend_from_slice(mapped.as_bytes());
+                rewritten.extend_from_slice(rest);
+            }
+            None => rewritten.extend_from_slice(line),
+        }
+        start = end;
+    }
+    rewritten
+}
+
+/// `path` as `kind`'s preprocessor writes it between the quotes of a line marker.
+fn escape_line_marker_path(path: &[u8], kind: &CCompilerKind) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(path.len());
+    for &byte in path {
+        match byte {
+            b'\\' | b'"' => escaped.extend_from_slice(&[b'\\', byte]),
+            b'\n' => escaped.extend_from_slice(b"\\n"),
+            b'\t' if *kind == CCompilerKind::Clang => escaped.extend_from_slice(b"\\t"),
+            // clang writes every other byte that isn't printable ASCII, UTF-8 included, in
+            // octal.
+            _ if *kind == CCompilerKind::Clang && !(b' '..=b'~').contains(&byte) => {
+                escaped.extend_from_slice(format!("\\{byte:03o}").as_bytes());
+            }
+            _ => escaped.push(byte),
+        }
+    }
+    escaped
+}
+
 #[cfg(all(test, unix))]
 mod test {
     use super::*;
@@ -505,7 +693,6 @@ mod test {
     const OUT_DIR: &str = "/ws/target/debug/build/foo-1/out";
     const OBJECT: &str = "/ws/target/debug/build/foo-1/out/x.o";
     const BUILD_SCRIPT_ENV: &[(&str, &str)] = &[("OUT_DIR", OUT_DIR), ("CARGO_MANIFEST_DIR", WS)];
-    const CC: &str = "/usr/bin/cc";
 
     fn parse(kind: &CCompilerKind, cwd: &Path, args: &[&str]) -> ParsedArguments {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
@@ -560,6 +747,21 @@ mod test {
 
     fn reason<T>(mapped: Result<T, NotEligible>) -> CompileLocallyReason {
         mapped.err().expect("the compile mapped").reason
+    }
+
+    #[test_case(&[] ; "eligible")]
+    #[test_case(&["-march=native"] ; "ineligible")]
+    fn test_local_compile_changes_of_eligible_compiles(args: &[&str]) {
+        let mut all_args = args.to_vec();
+        all_args.extend(["-c", "src/x.c", "-o", OBJECT]);
+        let parsed_args = parse(&Gcc, Path::new(WS), &all_args);
+        let env_vars = env_vars(BUILD_SCRIPT_ENV);
+        let changes = reapi_local_compile_changes(&Gcc, &parsed_args, Path::new(WS), &env_vars);
+        let worker_could = WORKERS_RUN_C_COMPILES && cfg!(target_os = "linux") && args.is_empty();
+        assert_eq!(
+            worker_could,
+            changes.is_some_and(|changes| changes.runs_remote_command)
+        );
     }
 
     #[test_case(Diab, &[], R::UnsupportedCompiler ; "other compiler")]
@@ -712,15 +914,6 @@ mod test {
         assert!(!compile.arguments.contains(&"-fpreprocessed".to_owned()));
     }
 
-    #[test]
-    fn test_mapped_compiles_wait_for_the_c_toolchain() {
-        let kind = &CCompilerKind::Gcc;
-        let parsed_args = parse(kind, Path::new(WS), &["-c", "src/x.c", "-o", OBJECT]);
-        let (cc, ws) = (Path::new(CC), Path::new(WS));
-        let mapped = map_for_reapi(kind, &parsed_args, cc, ws, &env_vars(BUILD_SCRIPT_ENV));
-        assert_eq!(CompileLocallyReason::CToolchainUnsupported, reason(mapped));
-    }
-
     /// A directory holding a gcc driver that prints `<dir>/cc1` for cc1 and only the name of
     /// the other programs, of which `as` is in `<dir>/bin`, and the env vars with that dir on
     /// `PATH`.
@@ -833,6 +1026,251 @@ mod test {
                 "/home/b/.cargo/registry/src/index-1/foo-1.0.0",
                 "/srv/b/target"
             )
+        );
+    }
+
+    #[test]
+    fn test_line_markers_name_paths_as_a_worker_does() {
+        let path_mapper = PathMapper::new("/w\"s".into(), "/w\"s/target".into());
+        let preprocessed = br#"# 1 "/w\"s/src/x.c"
+# 1 "/w\"s//"
+# 5 "/w\"s/target/out/gen.h" 1
+#line 2 "/w\"sx/y.h"
+const char *s = "/w\"s/src/x.c";
+# 3 "/usr/include/stdio.h" 3 4
+"#;
+        let expected = br#"# 1 "./src/x.c"
+# 1 ".//"
+# 5 ".sccache-build/out/gen.h" 1
+#line 2 "/w\"sx/y.h"
+const char *s = "/w\"s/src/x.c";
+# 3 "/usr/include/stdio.h" 3 4
+"#;
+        let rewritten = rewrite_line_markers(preprocessed, &path_mapper, &CCompilerKind::Gcc);
+        assert_eq!(
+            String::from_utf8_lossy(expected),
+            String::from_utf8_lossy(&rewritten)
+        );
+    }
+
+    #[test]
+    fn test_clang_escapes_non_ascii_paths_in_octal() {
+        assert_eq!(
+            br#"/caf\303\251/\"x\""#.as_slice(),
+            escape_line_marker_path("/caf\u{e9}/\"x\"".as_bytes(), &CCompilerKind::Clang)
+        );
+        assert_eq!(
+            "/caf\u{e9}/\\\"x\\\"".as_bytes(),
+            escape_line_marker_path("/caf\u{e9}/\"x\"".as_bytes(), &CCompilerKind::Gcc)
+        );
+    }
+
+    #[test]
+    fn test_prefix_maps_come_before_a_double_dash() {
+        let kind = &CCompilerKind::Clang;
+        let parsed_args = parse(kind, Path::new(WS), &["-c", "-o", OBJECT, "--", "src/x.c"]);
+        assert!(parsed_args.double_dash_input);
+        let path_mapper = PathMapper::new(WS.into(), "/ws/target".into());
+        let args = preprocess_args(kind, &parsed_args, &path_mapper);
+        assert_eq!(
+            [
+                "-fmacro-prefix-map=/ws/app=.",
+                "-fmacro-prefix-map=/ws/target=.sccache-build",
+                "--",
+                "src/x.c"
+            ],
+            args[args.len() - 4..]
+        );
+    }
+
+    /// `gcc` or `clang` for `kind`, or `None` when that program isn't installed or runs another
+    /// compiler, as `gcc` does on macOS.
+    fn compiler(kind: &CCompilerKind) -> Option<&'static str> {
+        let (program, version) = match kind {
+            CCompilerKind::Gcc => ("gcc", "Free Software Foundation"),
+            _ => ("clang", "clang version"),
+        };
+        let output = std::process::Command::new(program)
+            .arg("--version")
+            .output();
+        let installed =
+            output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(version));
+        if !installed {
+            eprintln!("No {kind:?} found as {program}, skipping test");
+        }
+        installed.then_some(program)
+    }
+
+    /// A compile in a checkout at `ws` of a `src/x.c` that includes `src/x.h` and an `OUT_DIR`
+    /// header, each naming `__FILE__`.
+    struct Checkout {
+        parsed_args: ParsedArguments,
+        driver: PathBuf,
+        cwd: PathBuf,
+        env_vars: Vec<(OsString, OsString)>,
+    }
+
+    impl Checkout {
+        /// The compile mapped for REAPI with its preprocessed source under `dir`, as on a
+        /// Linux client.
+        fn reapi_compile(&self, kind: &CCompilerKind, dir: &Path) -> ReapiCompile {
+            let (parsed_args, cwd, env_vars) = (&self.parsed_args, &self.cwd, &self.env_vars);
+            let mapped = map_compile(kind, parsed_args, cwd, env_vars).unwrap();
+            reapi_compile(mapped, kind, parsed_args, &self.driver, cwd, env_vars, dir).unwrap()
+        }
+
+        /// The `.i` that the compile writes under `dir`.
+        fn preprocess(&self, kind: &CCompilerKind, dir: &Path) -> Vec<u8> {
+            let compile = self.reapi_compile(kind, dir);
+            std::fs::read(&compile.preprocessed_source.unwrap().path).unwrap()
+        }
+    }
+
+    /// The [`Checkout`] at `ws` of a `kind` compile with `args` added, or `None` without
+    /// `kind`'s compiler.
+    fn checkout(kind: &CCompilerKind, ws: &Path, args: &[&str]) -> Option<Checkout> {
+        let driver = PathBuf::from(compiler(kind)?);
+        let out_dir = ws.join("target/debug/build/foo-1/out");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        // The compiler sees its cwd with symlinks resolved, as cargo does.
+        let ws = ws.canonicalize().unwrap();
+        let out_dir = out_dir.canonicalize().unwrap();
+        let file = "const char *file(void) { return __FILE__; }\n";
+        std::fs::write(
+            ws.join("src/x.c"),
+            format!("#include \"x.h\"\n#include \"gen.h\"\n#include <stddef.h>\n{file}"),
+        )
+        .unwrap();
+        std::fs::write(ws.join("src/x.h"), file.replace("file", "header")).unwrap();
+        std::fs::write(out_dir.join("gen.h"), file.replace("file", "generated")).unwrap();
+        let (source, object) = (ws.join("src/x.c"), out_dir.join("x.o"));
+        let mut all_args = vec![
+            "-c",
+            source.to_str().unwrap(),
+            "-o",
+            object.to_str().unwrap(),
+            "-I",
+            out_dir.to_str().unwrap(),
+            "-g",
+        ];
+        all_args.extend(args);
+        let parsed_args = parse(kind, &ws, &all_args);
+        let (ws_str, out_dir_str) = (ws.to_str().unwrap(), out_dir.to_str().unwrap());
+        let mut env_vars = env_vars(&[("OUT_DIR", out_dir_str), ("CARGO_MANIFEST_DIR", ws_str)]);
+        env_vars.push(("PATH".into(), std::env::var_os("PATH").unwrap()));
+        Some(Checkout {
+            parsed_args,
+            driver,
+            cwd: ws,
+            env_vars,
+        })
+    }
+
+    #[test_case(CCompilerKind::Gcc ; "gcc")]
+    #[test_case(CCompilerKind::Clang ; "clang")]
+    fn test_mapped_compiles_wait_for_the_c_toolchain(kind: CCompilerKind) {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(c) = checkout(&kind, &dir.path().join("ws"), &[]) else {
+            return;
+        };
+        let preprocessed = dir.path().join("preprocessed");
+        let mapped = map_for_reapi(
+            &kind,
+            &c.parsed_args,
+            &c.driver,
+            &c.cwd,
+            &c.env_vars,
+            &preprocessed,
+        );
+        assert_eq!(CompileLocallyReason::CToolchainUnsupported, reason(mapped));
+    }
+
+    #[test_case(CCompilerKind::Gcc ; "gcc")]
+    #[test_case(CCompilerKind::Clang ; "clang")]
+    fn test_preprocessed_source_path_and_lifetime(kind: CCompilerKind) {
+        let dir = tempfile::tempdir().unwrap();
+        let preprocessed = dir.path().join("preprocessed");
+        let Some(c) = checkout(&kind, &dir.path().join("ws"), &[]) else {
+            return;
+        };
+        let compile = c.reapi_compile(&kind, &preprocessed);
+        let source = compile.preprocessed_source.as_ref().unwrap();
+        assert_eq!("src/x.c", source.mapped_path);
+        assert!(source.path.starts_with(&preprocessed), "{source:?}");
+        assert_eq!(
+            Some("src/x.c"),
+            compile.arguments.get(3).map(String::as_str)
+        );
+        let path = source.path.clone();
+        drop(compile);
+        assert!(!path.exists(), "{path:?} outlived the compile");
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        memchr::memmem::find(haystack, needle).is_some()
+    }
+
+    #[test_case(CCompilerKind::Gcc ; "gcc")]
+    #[test_case(CCompilerKind::Clang ; "clang")]
+    fn test_two_checkouts_preprocess_to_the_same_bytes(kind: CCompilerKind) {
+        let dir = tempfile::tempdir().unwrap();
+        let preprocessed = dir.path().join("preprocessed");
+        let Some(a) = checkout(&kind, &dir.path().join("a/ws"), &[]) else {
+            return;
+        };
+        let a = a.preprocess(&kind, &preprocessed);
+        let b = checkout(&kind, &dir.path().join("b/c/ws"), &[]).unwrap();
+        let b = b.preprocess(&kind, &preprocessed);
+        assert!(a == b, "{}", String::from_utf8_lossy(&a));
+        let dir = dir.path().canonicalize().unwrap();
+        assert!(!contains(&a, dir.as_os_str().as_encoded_bytes()));
+        let generated = ".sccache-build/debug/build/foo-1/out/gen.h";
+        for path in ["./src/x.c", "./src/x.h", generated] {
+            assert!(contains(&a, format!("# 1 \"{path}\"").as_bytes()), "{path}");
+        }
+        // Under the cwd, clang's `__FILE__` drops the `./` that gcc keeps, so this checks the
+        // build root's.
+        let file = format!("generated(void) {{ return \"{generated}\"; }}");
+        assert!(contains(&a, file.as_bytes()), "{file}");
+    }
+
+    #[test_case(CCompilerKind::Gcc ; "gcc")]
+    #[test_case(CCompilerKind::Clang ; "clang")]
+    fn test_escaped_paths_are_rewritten(kind: CCompilerKind) {
+        let dir = tempfile::tempdir().unwrap();
+        let preprocessed = dir.path().join("preprocessed");
+        let escaped = dir.path().join("a \"quoted\" \\ws");
+        let Some(a) = checkout(&kind, &escaped, &[]) else {
+            return;
+        };
+        let a = a.preprocess(&kind, &preprocessed);
+        let b = checkout(&kind, &dir.path().join("ws"), &[]).unwrap();
+        let b = b.preprocess(&kind, &preprocessed);
+        assert!(a == b, "{}", String::from_utf8_lossy(&a));
+    }
+
+    #[test_case(CCompilerKind::Gcc ; "gcc")]
+    #[test_case(CCompilerKind::Clang ; "clang")]
+    fn test_preprocessing_writes_the_depfile(kind: CCompilerKind) {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap().join("ws");
+        let out_dir = ws.join("target/debug/build/foo-1/out");
+        let depfile = out_dir.join("x.d");
+        let args = ["-MD", "-MF", depfile.to_str().unwrap()];
+        let Some(c) = checkout(&kind, &ws, &args) else {
+            return;
+        };
+        c.preprocess(&kind, &dir.path().join("preprocessed"));
+        let depfile = std::fs::read_to_string(depfile).unwrap();
+        let object = out_dir.join("x.o");
+        assert!(
+            depfile.starts_with(&format!("{}:", object.display())),
+            "{depfile}"
+        );
+        assert!(
+            depfile.contains(&format!(" {}", ws.join("src/x.h").display())),
+            "{depfile}"
         );
     }
 }

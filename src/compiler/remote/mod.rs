@@ -61,6 +61,7 @@ pub struct LocalArg {
 #[derive(Default)]
 pub struct LocalCompileChanges {
     pub args: Vec<LocalArg>,
+    pub runs_remote_command: bool,
     /// Implicit inputs missing from the compiler's ordinary cache key.
     pub extra_hash_key: Vec<u8>,
     /// Executed output is mapped before caching; cache-hit diagnostics are already mapped.
@@ -92,6 +93,11 @@ impl<T: CommandCreatorSync> CompileRequest<'_, T> {
                 hash_key_options.rewrite_includes_only,
             )
             .context("Failed to generate compile commands")?;
+        let cacheable = if local_compile_changes.runs_remote_command {
+            Cacheable::No
+        } else {
+            cacheable
+        };
         debug!("[{}]: Compiling locally", output_name);
         let output = LocalCompile::new(service, creator, command, local_compile_changes)?
             .run()

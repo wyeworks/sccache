@@ -25,6 +25,7 @@ use crate::dist::simplify_path::simplify_path_and_dirs;
 use crate::errors::*;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use tempfile::TempPath;
 
 /// The input root's directory for files under the local build root.
 pub(super) const BUILD_ROOT_DIR: &str = ".sccache-build";
@@ -39,7 +40,30 @@ pub struct ReapiCompile {
     pub(crate) env: ActionEnv,
     pub(crate) input_root_files: Vec<PathBuf>,
     pub(crate) input_root_directories: Vec<String>,
+    pub(crate) preprocessed_source: Option<PreprocessedSource>,
     pub(crate) outputs: Vec<PathBuf>,
+}
+
+/// A C or C++ source preprocessed for a worker, which the input root holds at the source's
+/// own path.
+#[derive(Debug)]
+pub(crate) struct PreprocessedSource {
+    /// The local file.
+    pub(crate) path: PathBuf,
+    /// The source's path in the input root.
+    pub(crate) mapped_path: String,
+    // Keeps the file alive through lookup, upload and fallback.
+    pub(super) temp_path: Option<TempPath>,
+}
+
+impl PreprocessedSource {
+    pub(crate) fn new(temp_path: TempPath, mapped_path: String) -> Self {
+        PreprocessedSource {
+            path: temp_path.to_path_buf(),
+            mapped_path,
+            temp_path: Some(temp_path),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -304,6 +328,8 @@ pub(crate) enum CompileLocallyReason {
     ClangConfigFile,
     SideOutputOption,
     CToolchainUnsupported,
+    PreprocessingFailed,
+    PreprocessedSourceNotWritten,
     RustcDriver,
     WindowsClient,
     Staticlib,
@@ -384,6 +410,8 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::SharedLibrariesNotListed => "failed to list the compiler's shared libraries",
             Self::ClangConfigFile => "clang config file",
             Self::SideOutputOption => "option that writes a file besides the object",
+            Self::PreprocessingFailed => "preprocessing for REAPI failed",
+            Self::PreprocessedSourceNotWritten => "failed to write the preprocessed source",
             Self::CToolchainUnsupported => "C toolchain unsupported on workers",
             Self::UnsupportedCompiler => "unsupported compiler",
             Self::WindowsPaths => "Windows paths",
@@ -447,7 +475,7 @@ impl std::fmt::Display for CompileLocallyReason {
 }
 
 /// Maps local paths under the cwd and build root to input-root-relative paths.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PathMapper {
     cwd: PathBuf,
     build_root: PathBuf,
@@ -547,19 +575,32 @@ impl PathMapper {
         (self.to_input_root(&local).as_deref() == Some(path)).then_some(local)
     }
 
-    /// rustc uses the last matching remap, the nested build root must come last.
+    /// The cwd and the build root, each with the path a worker's compile names it by. The
+    /// build root, often inside the cwd, comes last.
+    pub(crate) fn input_root_prefixes(&self) -> [(&Path, &str); 2] {
+        [(&self.cwd, "."), (&self.build_root, BUILD_ROOT_DIR)]
+    }
+
+    /// `<option><local path>=<path in the input root>` arguments for
+    /// [`Self::input_root_prefixes`], in their order, for compilers that apply the last
+    /// matching mapping.
+    pub(crate) fn prefix_map_args(&self, option: &str) -> Vec<OsString> {
+        self.input_root_prefixes()
+            .into_iter()
+            .map(|(from, to)| {
+                let mut arg = OsString::from(option);
+                arg.push(from);
+                arg.push("=");
+                arg.push(to);
+                arg
+            })
+            .collect()
+    }
+
+    /// `--remap-path-prefix` arguments that make a local compile name its paths as a
+    /// worker's compile does.
     pub(crate) fn input_root_remap_args(&self) -> Vec<OsString> {
-        let remap = |from: &Path, to: &str| {
-            let mut arg = OsString::from("--remap-path-prefix=");
-            arg.push(from);
-            arg.push("=");
-            arg.push(to);
-            arg
-        };
-        vec![
-            remap(&self.cwd, "."),
-            remap(&self.build_root, BUILD_ROOT_DIR),
-        ]
+        self.prefix_map_args("--remap-path-prefix=")
     }
 
     pub(crate) fn input_root_paths_to_local(&self, text: &[u8]) -> Vec<u8> {
@@ -1221,6 +1262,7 @@ mod test {
             },
             input_root_files: vec![],
             input_root_directories: vec![],
+            preprocessed_source: None,
             outputs: vec![local.join("target/debug/deps/libfoo.rlib")],
         };
         let command = build_command(&compile).unwrap();

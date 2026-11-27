@@ -24,6 +24,7 @@ mod cas;
 mod client;
 
 mod auth_token;
+mod compile_as_worker;
 mod connection;
 mod credential_helper;
 mod terminal_output;
@@ -59,6 +60,6 @@ pub(crate) use executor::ReapiExecutor;
 
 pub(crate) use mapping::{
     ActionEnv, CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper,
-    ReapiCompile, ToolchainKey, WorkerProgram, normalize_absolute,
+    PreprocessedSource, ReapiCompile, ToolchainKey, WorkerProgram, normalize_absolute,
 };
 pub(crate) use sysroot::sysroot_copy;
